@@ -1,10 +1,73 @@
 @import "tailwindcss";
 
 @theme {
-  --color-background: #0b0f19;
-  --color-surface: #111827;
-  --color-surface-2: #0f172a;
-  --color-accent: #f8fafc;
-  --color-muted: #94a3b8;
-  --color-border: rgba(255, 255, 255, 0.10);
+  /* Page palette (cream / O'Reilly) */
+  --color-page: #faf7f0;
+  --color-ink: #1c1917;
+  --color-ink-soft: #57534e;
+  --color-rule: #d6d3c4;
+  --color-accent: #b45309;
+  --color-accent-soft: #fef3c7;
+  --color-code-bg: #f1ede2;
+
+  --color-callout-note: #eef4f8;
+  --color-callout-tip: #effaf0;
+  --color-callout-warning: #fdf6e3;
+  --color-callout-danger: #fdecea;
+
+  /* Figure (dark) palette — 3B1B-flavor */
+  --color-fig-bg: #0e1116;
+  --color-fig-fg: #e6e6e6;
+  --color-fig-muted: #8a8f99;
+  --color-fig-blue: #5b9dff;
+  --color-fig-orange: #ffae5b;
+  --color-fig-green: #7ad99a;
+  --color-fig-red: #ff7a7a;
+
+  /* Typography */
+  --font-serif: 'Source Serif 4', 'Charter', 'Iowan Old Style', 'Source Serif Pro', Georgia, serif;
+  --font-sans: 'Inter Tight', 'Inter', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  html {
+    background: var(--color-page);
+    color: var(--color-ink);
+    font-family: var(--font-serif);
+    font-size: 18px;
+    line-height: 1.7;
+    text-rendering: optimizeLegibility;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    background: var(--color-page);
+    color: var(--color-ink);
+  }
+  h1, h2, h3, h4 {
+    font-family: var(--font-sans);
+    color: var(--color-ink);
+    letter-spacing: -0.015em;
+    line-height: 1.2;
+  }
+  code, pre {
+    font-family: var(--font-mono);
+  }
+  :where(p, ul, ol) code {
+    background: var(--color-code-bg);
+    padding: 0.05em 0.35em;
+    border-radius: 3px;
+    font-size: 0.92em;
+  }
+  a {
+    color: var(--color-accent);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 2px;
+  }
+  a:hover { text-decoration: underline; }
+
+  /* Reading rhythm */
+  .prose-column { max-width: 660px; margin-inline: auto; }
+  .figure-column { max-width: 880px; margin-inline: auto; }
+  .page-column   { max-width: 1080px; margin-inline: auto; }
 }
