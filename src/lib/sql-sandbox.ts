@@ -1,8 +1,22 @@
-export class SqlSandbox {
-  #db = null;
-  #el = null;
+import type initSqlJs from 'sql.js';
 
-  mount(el) {
+type SqlJsDatabase = InstanceType<Awaited<ReturnType<typeof initSqlJs>>['Database']>;
+
+interface SqlResult {
+  columns: string[];
+  rows: Record<string, string | number | null>[];
+  durationMs: number;
+}
+
+interface SqlError extends Error {
+  durationMs?: number;
+}
+
+export class SqlSandbox {
+  #db: SqlJsDatabase | null = null;
+  #el: Element | null = null;
+
+  mount(el: Element): void {
     this.#el = el;
     this.#el.innerHTML = `
       <div class="space-y-3">
@@ -26,10 +40,10 @@ export class SqlSandbox {
       </div>
     `;
 
-    const ta = this.#el.querySelector('textarea');
-    const status = this.#el.querySelector('.status');
-    const results = this.#el.querySelector('.results');
-    const runBtn = this.#el.querySelector('button');
+    const ta = this.#el.querySelector('textarea')!;
+    const status = this.#el.querySelector('.status')!;
+    const results = this.#el.querySelector('.results')!;
+    const runBtn = this.#el.querySelector('button')!;
 
     const run = async () => {
       results.innerHTML = '';
@@ -79,13 +93,14 @@ export class SqlSandbox {
         results.appendChild(table);
       } catch (err) {
         status.textContent = 'Error';
-        results.innerHTML = `<pre class="text-sm text-red-400 whitespace-pre-wrap">${this.#escapeHtml(err.message)}</pre>`;
+        const msg = err instanceof Error ? err.message : String(err);
+        results.innerHTML = `<pre class="text-sm text-red-400 whitespace-pre-wrap">${this.#escapeHtml(msg)}</pre>`;
         console.error(err);
       }
     };
 
     runBtn.addEventListener('click', run);
-    ta.addEventListener('keydown', (e) => {
+    ta.addEventListener('keydown', (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key === 'Enter') run();
     });
 
@@ -95,7 +110,7 @@ export class SqlSandbox {
     });
   }
 
-  async runSql(sql) {
+  async runSql(sql: string): Promise<SqlResult> {
     if (typeof window === 'undefined') {
       throw new Error('SQL sandbox is only available in the browser');
     }
@@ -107,13 +122,14 @@ export class SqlSandbox {
     }
 
     try {
-      this.#db.exec(sql);
-      const result = this.#db.exec('SELECT * FROM sqlite_master WHERE type IN (\'table\',\'view\')');
-      const tableStats = {};
+      this.#db!.exec(sql);
+      const result = this.#db!.exec('SELECT * FROM sqlite_master WHERE type IN (\'table\',\'view\')');
+      const tableStats: Record<string, number | string | null> = {};
       for (const r of result) {
-        const name = r.values[0][2];
-        const count = this.#db.exec(`SELECT COUNT(*) AS n FROM "${name}"`)[0].values[0][0];
-        tableStats[name] = count;
+        const name = r.values[0][2] as string;
+        const countResult = this.#db!.exec(`SELECT COUNT(*) AS n FROM "${name}"`);
+        const rawCount = countResult[0]?.values[0][0];
+        tableStats[name] = typeof rawCount === 'number' ? rawCount : Number(rawCount ?? 0);
       }
 
       return {
@@ -124,13 +140,13 @@ export class SqlSandbox {
     } catch (err) {
       const durationMs = Math.round(performance.now() - start);
       const message = this.#normalizeSqliteError(err, sql);
-      const error = new Error(message);
+      const error: SqlError = new Error(message);
       error.durationMs = durationMs;
       throw error;
     }
   }
 
-  #escapeHtml(str) {
+  #escapeHtml(str: string): string {
     return String(str)
       .replace(/&/g, '&amp;')
       .replace(/</g, '&lt;')
@@ -139,23 +155,22 @@ export class SqlSandbox {
       .replace(/'/g, '&#039;');
   }
 
-  #normalizeSqliteError(err, sql) {
+  #normalizeSqliteError(err: unknown, sql: string): string {
     if (typeof err === 'string') return err;
-    if (err?.message) {
-      if (err.message.toLowerCase().includes('syntax error')) {
+    if (err && typeof err === 'object' && 'message' in err) {
+      const message = (err as { message: string }).message;
+      if (message.toLowerCase().includes('syntax error')) {
         return `Syntax error:\n${sql}`;
       }
-      return err.message;
+      return message;
     }
     return String(err);
   }
 
-  async #initDb() {
-    const init = async () => {
-      const SQL = await import('sql.js');
-      const sqlJs = SQL.default || SQL;
-      return new sqlJs.Database();
-    };
-    this.#db = await init();
+  async #initDb(): Promise<void> {
+    const SQL = await import('sql.js');
+    const sqlJs = typeof SQL.default === 'function' ? SQL.default : (SQL as unknown as typeof initSqlJs);
+    const instance = await sqlJs();
+    this.#db = new instance.Database();
   }
 }
