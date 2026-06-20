@@ -1,0 +1,70 @@
+---
+import Layout from '@/layouts/Layout.astro';
+
+const chapters = [
+  { slug: '01-why-databases-are-special', title: 'Why Databases Are Special' },
+  { slug: '02-relational-model-revisited', title: 'The Relational Model Revisited' },
+  { slug: '03-page-oriented-storage', title: 'Page-Oriented Storage' },
+  { slug: '04-b-trees-and-lsm-trees', title: 'B-Trees and LSM-Trees' },
+  { slug: '05-indexes-beyond-the-basics', title: 'Indexes Beyond the Basics' },
+  { slug: '06-query-processing-and-optimizer', title: 'Query Processing and the Optimizer' },
+  { slug: '07-locking-and-latching', title: 'Locking and Latching' },
+  { slug: '08-mvcc', title: 'MVCC' },
+  { slug: '09-write-ahead-logging', title: 'Write-Ahead Logging' },
+  { slug: '10-checkpoints-and-buffer-management', title: 'Checkpoints and Buffer Management' },
+  { slug: '11-replication-internals', title: 'Replication Internals' },
+  { slug: '12-distributed-transactions', title: 'Distributed Transactions' },
+  { slug: '13-consensus-and-distributed-state', title: 'Consensus and Distributed State' },
+  { slug: '14-document-wide-column-and-graph', title: 'Document, Wide-Column, and Graph Stores' },
+  { slug: '15-caching-and-in-memory-stores', title: 'Caching and In-Memory Stores' },
+  { slug: '16-vector-databases-and-embedding-stores', title: 'Vector Databases and Embeddings Stores' },
+  { slug: '17-observability-internals', title: 'Observability Internals' },
+  { slug: '18-capacity-and-sizing', title: 'Capacity and Sizing' },
+  { slug: '19-failure-modes', title: 'Failure Modes' },
+];
+---
+
+<Layout title="Chapters">
+  <section class="space-y-4">
+    <h1 class="text-2xl font-bold">Chapters</h1>
+    <ul class="grid gap-2">
+      {chapters.map((c, i) => (
+        <li>
+          <a
+            class="flex items-center justify-between rounded-lg border border-white/10 px-3 py-2 hover:bg-white/5"
+            href={`/chapters/${c.slug}`}
+          >
+            <span>
+              <span class="text-gray-500 text-xs font-mono mr-2">{String(i + 1).padStart(2, '0')}</span>
+              {c.title}
+            </span>
+            <span class="text-xs text-gray-400">
+              {i === 0 ? 'First' : i === chapters.length - 1 ? 'Last' : ''}
+            </span>
+          </a>
+        </li>
+      ))}
+    </ul>
+  </section>
+
+  <script is:inline>
+    (function markActiveChapter() {
+      const path = window.location.pathname || '';
+      const from = path.startsWith('/chapters/') ? path.lastIndexOf('/') : -1;
+      if (!from || from < 0) return;
+      const slug = path.slice(from + 1);
+      document.querySelectorAll('a[href$="/' + slug + '"]').forEach((a) => {
+        a.classList.add('bg-white/5');
+      });
+      try {
+        const data = JSON.parse(localStorage.getItem('course-progress') || '{}');
+        const key = slug;
+        const done = data[key];
+        if (!done) return;
+        const label = (document.querySelector('a[href$="/' + slug + '"] span:last-child') || { textContent: '' });
+        if (label.textContent.startsWith('✓')) return;
+        label.textContent = (label.textContent ? label.textContent.split('\n')[0] + ' - ' : '') + '✓ done';
+      } catch {}
+    })();
+  </script>
+</Layout>

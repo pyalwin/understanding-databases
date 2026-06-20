@@ -1,0 +1,57 @@
+---
+import Layout from '@/layouts/Layout.astro';
+import { SqlSandbox } from '@/lib/sql-sandbox';
+---
+
+<Layout title="Why Databases Are Special">
+  <section class="mx-auto max-w-6xl px-4 py-8 space-y-10">
+    <header class="space-y-2">
+      <p class="text-xs font-mono text-muted">Chapter 01</p>
+      <h1 class="text-3xl font-bold tracking-tight">Why Databases Are Special</h1>
+      <p class="text-muted text-lg">
+        Files, caches, object stores, and databases all "store data."
+        The difference is in the contract they enforce: consistency,
+        access patterns, and recovery.
+      </p>
+    </header>
+
+    <div class="space-y-4">
+      <h2 class="text-lg font-semibold">1. Files Are Not Databases</h2>
+      <p class="text-muted">
+        Try two processes writing the same JSON file. You’ll get torn writes or last-write-wins chaos.
+        Databases solve this with page-level locking, write-ahead logging, and buffer management.
+      </p>
+    </div>
+
+    <div class="space-y-4">
+      <h2 class="text-lg font-semibold">2. ACID as an Engineering Contract</h2>
+      <p class="text-muted">
+        Atomicity: all-or-nothing. Consistency: invariants hold at boundaries.
+        Isolation: concurrent work doesn’t break invariants. Durability: committed work survives power loss.
+      </p>
+    </div>
+
+    <div class="space-y-4">
+      <h2 class="text-lg font-semibold">3. Exercise: Observe Behavior</h2>
+      <p class="text-muted">Run SQL in the sandbox and observe what persists.</p>
+      <div id="sandbox" class="rounded-2xl border border-border bg-surface/80 p-4"></div>
+    </div>
+
+    <footer class="flex items-center justify-between pt-6 text-sm">
+      <a class="text-muted hover:text-accent" href="/">← Home</a>
+      <a class="text-muted hover:text-accent" href="/chapters">Chapters →</a>
+    </footer>
+  </section>
+
+  <script is:inline>
+    (function() {
+      const el = document.getElementById('sandbox');
+      if (!el) return;
+      const sandbox = new SqlSandbox();
+      sandbox.mount(el);
+      window.addEventListener('DOMContentLoaded', () => {
+        window.dispatchEvent(new Event('sandbox-run-default'));
+      });
+    })();
+  </script>
+</Layout>
