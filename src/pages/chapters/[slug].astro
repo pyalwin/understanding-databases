@@ -1,0 +1,30 @@
+---
+import Layout from '@/layouts/Layout.astro';
+import { getCollection, render } from 'astro:content';
+
+export async function getStaticPaths() {
+  const entries = await getCollection('chapters');
+  return entries.map((entry) => ({ params: { slug: entry.id }, props: { entry } }));
+}
+
+const { entry } = Astro.props;
+const { Content } = await render(entry);
+const num = String(entry.data.chapterNumber).padStart(2, '0');
+---
+
+<Layout title={entry.data.title}>
+  <article class="page-column px-6 pt-12 pb-24">
+    <header class="prose-column mb-12">
+      <p class="font-sans text-xs tracking-[0.18em] uppercase text-[color:var(--color-accent)] mb-3">
+        Chapter {num}
+      </p>
+      <h1 class="text-[44px] font-semibold leading-[1.05] mb-4">{entry.data.title}</h1>
+      <p class="text-[color:var(--color-ink-soft)] text-[19px] leading-relaxed italic">
+        {entry.data.summary}
+      </p>
+    </header>
+    <div class="prose-column space-y-5 text-[18px]">
+      <Content />
+    </div>
+  </article>
+</Layout>
