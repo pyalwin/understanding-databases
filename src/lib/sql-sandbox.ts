@@ -151,7 +151,7 @@ export class SqlSandbox {
   }
 
   async #initDb() {
-    const init = () => {
+    const init = async () => {
       const SQL = await import('sql.js');
       const sqlJs = SQL.default || SQL;
       return new sqlJs.Database();

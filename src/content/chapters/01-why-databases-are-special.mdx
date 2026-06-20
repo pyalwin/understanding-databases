@@ -1,0 +1,306 @@
+---
+title: "Why Databases Are Special"
+chapterNumber: 1
+summary: "A file stores data. A database stores guarantees. This chapter is a guided tour of the four failures a database promises to prevent — by trying to use a JSON file as a database and watching it break."
+readingTime: "32 min"
+status: published
+---
+
+import { RaceScene, TearScene, InvariantScene, LieScene, ContractSynthesis } from '@/components/chapter-01';
+import { Callout, Footnote } from '@/components/scene';
+import { SqlSandboxReact } from '@/components/SqlSandboxReact';
+
+## The premise
+
+Open your editor and create a file called `users.json`. Drop in two users. Save. Congratulations — you've made a database.
+
+Not really. But it's worth taking that joke seriously for a moment, because the difference between a JSON file and an actual database is not as obvious as it sounds. Both store data. Both let you read it back. Both, in some sense, *work*. If we're going to spend the rest of this book on pages and B-trees and write-ahead logs, we should be honest about what we're paying for.
+
+So let's not start with definitions. Let's start by trying to use a file as a database, and seeing where it breaks.
+
+The experiment is simple: write a small Node.js script that reads `users.json`, appends a new user, and writes the file back. Ship it to production. Congratulations again — you now have a real user registration system backed by a flat file, exactly as many early web apps were built. It will work fine in a demo. It will work fine the first week. Then two users will hit "Register" at the same moment, and you will discover the first failure.
+
+There are four failures waiting in that file. They are not bugs in your script. They are properties of files — of filesystems and operating systems — that are simply absent from the interface `open()`, `read()`, `write()`, `close()` gives you. A database is not a smarter file. It is a machine specifically designed to close four specific gaps, and understanding those gaps is understanding what a database is *for*.
+
+We're going to watch each failure happen. We'll use interactive diagrams to make the timing visible. And at the end, we'll run the canonical bank-transfer example in an in-browser SQL sandbox and see the difference that four decades of database engineering makes.
+
+The names of those four failures will emerge as we go. You may already know the acronym. Wait for it.
+
+---
+
+## The race
+
+Picture two terminals on your laptop. In each one, you run the same script:
+
+```js
+const fs   = require('fs');
+const data = JSON.parse(fs.readFileSync('users.json', 'utf8'));
+data.users.push({ id: Date.now(), name: process.argv[2] });
+fs.writeFileSync('users.json', JSON.stringify(data, null, 2));
+```
+
+In terminal one you type `node add-user.js Ada`. In terminal two, a half-second later, you type `node add-user.js Bob`. You'd expect `users.json` to end up with three records: Eve (who was already there), Ada, and Bob.
+
+Open the file. Eve and Bob are there. Ada is gone.
+
+The diagram below makes the timing visible. Click through it slowly.
+
+<RaceScene client:visible />
+
+Here's what happened. Both processes called `readFileSync` and got the same snapshot of the file. At that moment, the file contained only Eve. Process 1 appended Ada to its in-memory copy; Process 2 appended Bob to its. Then each process called `writeFileSync`, which opens the file, truncates it to zero bytes, and writes the whole thing from memory. Whoever finishes last wins. Process 1's write survives if it writes second. Process 2's write survives if it writes second. Neither knows the other exists.
+
+To be precise about the mechanics: `writeFileSync` issues a sequence of system calls roughly equivalent to:
+
+```c
+fd = open("users.json", O_WRONLY | O_TRUNC | O_CREAT, 0644);
+write(fd, buf, len);
+close(fd);
+```
+
+The `O_TRUNC` flag is the killer. It tells the kernel to discard the existing file contents before writing. So the second process to reach `open()` throws away whatever the first process wrote. The file is well-formed JSON at every point. No error is returned. No exception is thrown. Ada just vanishes.
+
+This is not a bug in Node.js. It is not a race condition in the threading sense — neither process shares memory with the other. It is a property of the `write(2)` syscall: it operates on a file descriptor, and file descriptors are not coordinating mechanisms. Two processes can open the same file independently and the kernel has no obligation to tell either one that the other exists.
+
+Here's what's strange about this failure: it is entirely invisible at the syscall level. Both processes completed without an error. The file is syntactically valid at every point during the sequence. If you were logging the write calls, both would show success. The only way to detect the lost update is to compare the before-and-after at the application level and realize that Ada's record never made it.
+
+This is the pattern that makes lost updates particularly dangerous in production: they don't produce errors. You need to be looking for them, or have an assertion that checks record counts, or have a user file a support ticket asking why they can't log in. In a system with millions of writes per day, a handful of lost updates can easily go unnoticed until the downstream effects accumulate.
+
+<Callout type="note" title="Aside: file locks exist, sort of">
+  `flock(2)` and `fcntl(2)` provide advisory locking on files. Advisory means that both processes must cooperate — they must each call `flock()` before writing, or the lock is simply ignored. There is no mandatory enforcement in standard POSIX semantics. NFS historically ignores `flock()` entirely. `fcntl()` byte-range locks are per-process and are released when *any* file descriptor to that file is closed, including ones the process didn't intend to close. In practice, advisory file locking is error-prone enough that most production systems do not rely on it.
+</Callout>
+
+You might wonder: couldn't you use a lock file? Create a `users.json.lock` file before writing, delete it after. This is an old and respectable pattern, and it works — most of the time. It fails when a process crashes while holding the lock and doesn't clean up. It fails on NFS because lock-file creation is not atomic across client and server. It fails under high concurrency because processes waiting to acquire the lock must poll rather than sleep. Each of these failure modes is the seed of a future bug. Implementing a correct, deadlock-free, crash-safe locking protocol on top of a raw filesystem is not simple — it's essentially re-implementing the locking subsystem that a database already provides.
+
+The problem you just watched is, in database terms, a *lost update*. Two writers each read the same state, compute a new state, and write it back. One write clobbers the other. The second writer's view of the world was stale at the moment of writing, but nothing told it that.
+
+Notice that the problem is not unique to "two processes." One process with two concurrent async callbacks, two goroutines, two threads — the same failure mode appears whenever two writers share a single read-modify-write cycle with no coordination between the read and the write. The shape of the bug is: (1) read a value, (2) compute something based on that value, (3) write the result back, without any guarantee that the value hasn't changed between steps 1 and 3. That pattern — sometimes called a *check-then-act* — is a lost update waiting to happen.
+
+Real databases solve this with layers of coordination that we'll examine in Chapter 7 (locking and latching) and Chapter 8 (multiversion concurrency control). The short version is that a database processes writes through a transaction manager that serializes conflicting operations. If two writers conflict on the same row, one of them will wait, or one of them will be rolled back and retried, depending on the isolation level. The key insight is that this coordination happens *inside* the database, using data structures the database controls — not via advisory hints that callers might forget to set.
+
+But the cost of serialization is the cost of locks, and Chapter 7 exists because choosing the right lock granularity is surprisingly hard. Lock too coarsely and you serialize operations that don't actually conflict, throttling throughput. Lock too finely and the overhead of managing thousands of individual row locks can exceed the work the locks are protecting.
+
+For now: this is what *Isolation* buys you. The word will mean more when we've seen all four failures. Hold it in mind.
+
+---
+
+## The tear
+
+The race was about *who* writes. Now consider a different question: what does it mean for a write to *succeed*?
+
+You call `write(fd, buf, 75)`. The syscall returns 75. That's success — the kernel says 75 bytes were written. But where? And when? Is "75 bytes appearing on disk" a single act, or a sequence of steps that could be interrupted at any point?
+
+The answer is: it is a sequence. And the question of what's on disk if you interrupt that sequence mid-way is not theoretical.
+
+Set a crash point with the slider below and press Start. Watch what happens to the 75-byte JSON record.
+
+<TearScene client:visible />
+
+The record in the scene is a JSON object for Ada Lovelace — 75 bytes long. If you crash at byte 37, the file contains `{"id":42,"name":"Ada Lovelace","email"`. That is not valid JSON. Any attempt to parse it throws a syntax error. The record is not partially saved; it is corrupted in a way that can prevent reading *any* record that shares the same file, because a JSON parser reading the file will fail at byte 37 and give up.
+
+Here's why this happens at the hardware level. Modern storage devices — spinning disks and SSDs alike — operate at *page granularity*. An SSD page is typically 4 KB or 16 KB. A spinning disk sector was historically 512 bytes but modern drives use 4 KB sectors. When you write fewer bytes than a full page, the device cannot simply update those bytes in place. It must perform a *read-modify-write*: read the entire 4 KB page containing your bytes into a buffer, update the relevant bytes in that buffer, and write the whole page back. If power is interrupted between the read and the write-back, the page on disk may contain bytes from *both* the old and new versions of the data. This is a *torn page* — sometimes also called a *partial write*.
+
+The exact bytes that survive depend on which part of the read-modify-write cycle was interrupted and what your storage controller's write cache looks like. Capacitor-backed write caches in enterprise SSDs can complete in-flight writes after power loss. Consumer drives often cannot. The filesystem buffer cache complicates things further — your "disk write" might have only reached RAM.
+
+It's tempting to think that journaling filesystems like ext4 or XFS protect against this. They do protect filesystem *metadata* — the directory entries, inode tables, and extent trees that the filesystem uses internally. Journaling ensures that the filesystem itself remains consistent after a crash. But your application's data records are payload from the filesystem's perspective. Journaling says nothing about whether `{"id":42,"name":"Ada Lovelace","email` is a valid JSON fragment. The filesystem delivered the bytes you asked it to deliver, up to the crash point, and considers its job done.
+
+This is the forward reference that Chapter 3 will make concrete: storage engines organize data into fixed-size *pages* (typically 8 KB in PostgreSQL, 16 KB in MySQL) precisely because the device is already operating at page granularity. Understanding that data lives in pages explains why so many database decisions — index structures, buffer pool management, vacuum strategies — are ultimately page-management decisions. Once you see it, the page becomes the fundamental unit of analysis: a read fetches pages, a write flushes pages, an index is a tree of pages, a vacuum reclaims pages.
+
+Real databases solve the torn-write problem with a *write-ahead log* (WAL): before modifying a data page, the database writes a record describing the change to an append-only log file. The log record is small and sequential and designed to be written atomically (log blocks are sized to match sector or write-unit boundaries on the storage device). If the crash happens between writing the log and modifying the data page, recovery replays the log and finishes the work. If the crash happens during the log write itself, recovery finds an incomplete log record — it can detect this because WAL records include a checksum and a length field — ignores it, and leaves the data page untouched. The write simply never happened from the application's perspective.<Footnote n={1} />
+
+Notice the elegance of this approach: the log is append-only, so writing it is sequential. Sequential writes are faster than random writes on both spinning disks (no seek time) and SSDs (less write amplification). The log is small per-write — a few hundred bytes describing what changed, not a whole page. And recovery is deterministic: you replay the log forward from the last checkpoint, and the resulting data pages are consistent by construction. The database never has to guess what state it was in when it crashed.
+
+One sentence on the cost: WAL makes every write more expensive because it doubles the I/O path. You'll see in Chapter 9 how databases amortize this cost through techniques like group commit and log-structured storage.
+
+This is what *Atomicity* buys you. "The write" becomes a single act — either the whole thing happened or none of it did — even though physically it is a sequence of operations that can be interrupted at any point.
+
+---
+
+## The invariant
+
+The first two failures are about physical storage. The third failure is about meaning.
+
+Here is a fact about bank accounts: the total amount of money in a closed system should not change. If you transfer $50 from Account A to Account B, A's balance goes down by $50 and B's balance goes up by $50, and the sum stays the same. This sounds obvious. What's less obvious is that maintaining this property requires two separate write operations, and there is a window of time between them.
+
+The rule — that the total must remain constant — is called an *invariant*. Before we watch it break, look at the diagram below.
+
+<InvariantScene client:visible />
+
+Drag the slider to crash after step 3. Account A has been debited $50, but Account B has not yet been credited. The system total is $150, not $200. $50 has vanished. The invariant is broken.
+
+Notice that this is a different problem from the race in Section 1. There's only one writer here. There's no concurrency. The invariant breaks because the logical operation — "transfer $50" — requires two separate physical writes, and if anything interrupts between them, the system ends up in a state that was never supposed to exist.
+
+In a flat-file system, this is simply your problem to manage. You can try to be careful about write ordering, or you can implement your own two-phase protocol, or you can reach for a library like SQLite that handles it for you. What you cannot do is express the invariant to the storage layer and have it enforced automatically.
+
+Atomicity — the property we found in the last section — is the tool that prevents the torn invariant. If the two writes are wrapped in a transaction, the database guarantees that either both happen or neither does. There is no half-finished state that's ever visible to any reader.
+
+Consistency is what you get to *have* because you have Atomicity. It's the property that says: "after every completed transaction, every declared invariant still holds." The constraints, foreign keys, and `CHECK` clauses you define in a schema are all expressions of invariants. The database enforces them because it has Atomicity to build on.
+
+There is a terminological trap worth addressing directly here. "Consistency" appears in two famous acronyms: ACID and CAP. In ACID, Consistency means "application-defined invariants are maintained." In CAP, Consistency means something entirely different — it's about whether all replicas in a distributed system see the same data at the same time. These two meanings are completely orthogonal. Mixing them up produces plausible-sounding but false reasoning about distributed systems.<Footnote n={2} /> When this book uses "Consistency" without qualification, it always means ACID Consistency.
+
+One more point on responsibility. The database enforces what you declare. If you define a `CHECK (balance >= 0)` constraint, the database will reject any transaction that would produce a negative balance. But if you never declare that constraint, the database will happily store `-$5000`. The invariant lives in the application's understanding of the world; the database is the enforcement mechanism. Getting that allocation right — what the app declares, what the database enforces — is a large part of what schema design is about.
+
+Atomicity is the tool. Consistency is the property it protects.
+
+---
+
+## The lie
+
+You build a form. A user clicks Save. Your application calls `write(fd, "balance=200", 11)`. The syscall returns 11. You print "Your changes have been saved." to the screen.
+
+Are you lying?
+
+Probably, a little. Here is the full story of where those 11 bytes go.
+
+**Step 1: Application buffer.** If you're using standard C-library I/O (`fopen` / `fwrite` / `fclose`), writes first land in a libc buffer in your process's address space. They don't even reach the kernel until you call `fflush()` or close the file descriptor. If your process is killed at this point, the bytes are gone.
+
+**Step 2: Kernel page cache.** Once the write reaches the kernel (via the `write(2)` syscall), it lands in the *page cache* — a region of physical RAM managed by the kernel for filesystem I/O. The page cache is a write-back cache: the kernel marks the page "dirty" and returns control to your process immediately. The write is not on disk. It is in RAM, under the kernel's management. If power fails at this point, the bytes are gone.
+
+**Step 3: Storage device buffer.** Eventually — on a schedule managed by the kernel's writeback daemon, or when you call `fsync(2)`, or when memory pressure forces it — the dirty pages are flushed to the storage device. But many storage devices have their own internal DRAM caches. The kernel's write to the device may land in the device's cache before hitting persistent media. If power fails at this point, with a device that lacks a capacitor-backed cache, the bytes may still be gone.
+
+**Step 4: Physical media.** Finally, the bytes reach non-volatile storage — NAND flash, spinning platters, or similar. At this point, a power failure cannot take them.
+
+Step 2 is where most application bugs live. The kernel page cache is invisible from userspace. Your `write()` call returns success. The process runs on. Nothing is wrong — until it is.
+
+<LieScene client:visible />
+
+Toggle "fsync after write" off, click `write("balance=200")`, then pull the plug. The app said "saved!" The disk shows the old value. The page cache — which had your data — is gone.
+
+Now toggle fsync on and repeat. The write call blocks until the kernel has confirmed that the data reached durable storage, and the crash leaves the disk consistent.
+
+The syscall that bridges the gap is `fsync(2)`. When you call `fsync(fd)`, the kernel flushes all dirty pages for that file descriptor to the device and waits for the device to confirm they've been written to non-volatile storage. The call returns only when it's safe to tell the user "your data is persisted."
+
+<Callout type="warning" title="macOS lies a little differently">
+  On macOS, `fsync(2)` only guarantees that data has been flushed from the kernel page cache to the storage device's internal cache. It does *not* issue a drive-level cache flush command. If the drive has a volatile write cache (which most consumer drives do), a power failure after `fsync()` but before the drive drains its cache can still lose data. To get true persistence on macOS, you need `fcntl(fd, F_FULLFSYNC)`, which issues the drive-level flush. PostgreSQL on macOS uses `F_FULLFSYNC` for this reason. SQLite does too.
+</Callout>
+
+The cost of `fsync` is real and non-trivial. On a consumer NVMe SSD, a single `fsync` call takes roughly 100 microseconds to a few milliseconds, depending on drive model, queue depth, and write pattern. On a spinning disk, it's 5–10 ms — because the disk must wait for the platter to complete a full rotation to confirm the write. These numbers seem small, but they dominate write-heavy workloads. A database doing 1,000 transactions per second, with one `fsync` per transaction, needs to complete 1,000 fsyncs per second — that's a 100 µs budget per fsync just to keep up on an NVMe drive. In practice, databases use *group commit* (one `fsync` per batch of transactions, not per transaction) to amortize the cost. Chapter 9 covers this in detail.
+
+There is a darker chapter in `fsync` history worth knowing. In April 2018, a developer discovered that on Linux, when `fsync()` fails — due to a device error — the kernel had been silently discarding the dirty page from the page cache without retrying the write. This meant that on the *next* call to `fsync()`, the kernel reported success, even though the data was gone. The kernel believed there was nothing to flush; the dirty page had been dropped. PostgreSQL, which depended on fsync error reporting to make durability decisions, was potentially vulnerable to silent data loss for years before this was diagnosed and fixed. The fix required redesigning PostgreSQL's I/O error handling from the ground up, and the discussion in the PostgreSQL community and the Linux kernel community ran for months.<Footnote n={3} />
+
+The point is not to make you fear `fsync`. The point is that "persisted" is a contract with a specific cost, and that contract is harder to enforce correctly than it looks. Every layer of the write path — libc, kernel, device driver, device firmware — has opinions about what "written" means. A database's durability guarantee is a promise to navigate all of those layers correctly on your behalf.
+
+This is what *Durability* buys you. The gap between "acknowledged" and "persisted" is closed by someone paying `fsync`'s price at the right moment.
+
+---
+
+## The contract
+
+Look back at what you've watched.
+
+You saw a file where two concurrent writers clobbered each other's work, and one user's registration vanished into thin air. You saw a file where a crash mid-write left a record with half its bytes on disk and the other half missing, corrupting the entire file. You saw a bank transfer where the crash-window between two writes left the system with $50 fewer than it started with. You saw a write that returned success, printed "saved!" to the screen, and still lost the data when the power went out.
+
+Four different failure modes. Four different layers of the system. Four different ways that a file used as a database lets you down.
+
+<ContractSynthesis client:visible />
+
+Here is what's important about the diagram above. The letters A, C, I, D are not acronym-first jargon invented in a conference room. They are *names* given to the four failure modes you just watched. Atomicity is the property that prevents the torn write and the broken invariant. Isolation is the property that prevents the lost update. Durability is the property that prevents the silent loss after a crash. Consistency is the property that *exists* because Atomicity prevents the half-done transaction from persisting.
+
+When you see ACID written down now, you can read it as a checklist of failures:
+
+- **A** — The system won't leave a write half-done.
+- **C** — The system won't leave a declared invariant violated.
+- **I** — The system won't let concurrent writers clobber each other's work.
+- **D** — The system won't acknowledge a write it hasn't persisted.
+
+This framing — ACID as a checklist of failures the system *promises to prevent* — is more useful than the standard textbook definitions because it tells you what goes wrong when you don't have it. The standard definitions tell you what a property means in the happy path; this framing tells you what breaks in the unhappy path.
+
+It's also worth noticing the relationship between the four properties. Atomicity and Durability are, in some sense, the foundational ones — they're the properties about individual writes. Atomicity says a write is indivisible. Durability says a committed write is permanent. Isolation and Consistency are built on top of them. Isolation uses Atomicity as its building block: the reason a transaction can be aborted and rolled back without leaving a mess is that the individual writes within it are tracked atomically. Consistency uses both: it's the property that holds because every transaction that commits is atomic (so invariants don't get broken mid-transaction) and durable (so the invariants are still true after a crash).
+
+Each of those promises has a cost. That cost is what the rest of this book is about. Think of it as a ledger: on the left side is the guarantee, on the right side is what you pay to get it.
+
+**Isolation's price: coordination.** Preventing lost updates requires coordinating writers, and coordinating writers means someone waits. Locks are the traditional mechanism; Chapter 7 covers them in enough detail that you'll understand why choosing the wrong lock granularity can make your database slower than the flat-file solution it replaced. A table-level lock is simple and safe but serializes every write to every row in the table. A row-level lock lets unrelated writes proceed in parallel, but tracking thousands of individual row locks has overhead that adds up. The right answer depends on your access patterns, and getting it wrong has real performance consequences.
+
+Multiversion concurrency control — Chapter 8 — is the technique most modern databases use to give readers a consistent view without blocking writers at all. Instead of locking a row while a transaction reads it, the database keeps multiple versions of each row and gives each reader the version that was current at the start of their transaction. This sounds almost magical, but it has a cost: those old versions accumulate, and someone has to eventually clean them up. PostgreSQL calls that process vacuum. Getting vacuuming wrong is one of the most common causes of production performance problems in large PostgreSQL deployments.
+
+**Durability's price: `fsync`.** Every transaction that commits must wait for its log records to reach non-volatile storage before the database can tell the client "committed." The physics of persistent writes set a floor that no amount of software engineering can eliminate — you're paying for rotational latency, or NAND write cycles, or capacitor charge times, depending on what hardware sits at the bottom of your storage stack. Group commit (Chapter 9) amortizes that cost across multiple transactions, but the physics don't disappear. They're just spread across more work.
+
+**Atomicity's price: double writing.** WAL means every write touches storage twice — once for the log, once for the data page. This is not a theoretical inefficiency; it's a real factor in storage I/O accounting. A write-heavy workload that would saturate a device at X transactions per second might saturate it at X/2 if WAL overhead doubles the byte throughput. Log-structured storage engines (also Chapter 9) flip the model and make the log *be* the database, accepting that data lives in sorted runs rather than in-place pages, and trading off sequential write performance against the read overhead of merging those runs.
+
+**Consistency's price: design work.** Consistency is the cheapest of the four because it is enforced at commit time by the transaction manager, which is already running. A `CHECK` constraint or a foreign key check adds CPU work but no additional I/O. The cost of Consistency is mostly the cost of declaring your invariants precisely and keeping those declarations accurate as the application evolves. A `CHECK (balance >= 0)` constraint that made sense in version 1.0 of your app might need to change in version 2.0 when you introduce overdraft protection. Migrating constraints in a live database without blocking reads or writes is its own art form — but that's a problem of application design, not database internals.
+
+A database, then, is a machine for paying these costs on your behalf, in exchange for a precise set of guarantees. The rest of this book opens up the machine and shows you how it works: what data structures it uses, how those data structures enable the guarantees, and what the trade-offs are when you push the machine in different directions.
+
+---
+
+## Do it yourself
+
+The bank transfer is the canonical example because it makes the invariant-breaking tangible and the fix obvious. Let's run it.
+
+The sandbox below speaks standard SQL. It runs entirely in your browser using a WebAssembly build of SQLite. Nothing is sent to a server.
+
+Start by running the script as written. The two `UPDATE` statements are not wrapped in a transaction. Between the two updates, the `SELECT SUM(balance)` will show $150 — the invariant is broken. That is the moment the InvariantScene in Figure 1.3 was showing you, made concrete in SQL.
+
+Then wrap the two `UPDATE` statements in `BEGIN` and `COMMIT`. Run it again. Observe that no intermediate state is queryable — the `SELECT SUM(balance)` between the two updates now always returns $200, because both updates either happened together or neither did.
+
+<SqlSandboxReact client:visible initialSql={`-- Try this first, then re-run with BEGIN/COMMIT around the two UPDATEs.
+CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER);
+INSERT INTO accounts VALUES ('A', 100), ('B', 100);
+
+UPDATE accounts SET balance = balance - 50 WHERE id = 'A';
+-- Imagine a crash here. Check totals:
+SELECT SUM(balance) FROM accounts;
+
+UPDATE accounts SET balance = balance + 50 WHERE id = 'B';
+SELECT SUM(balance) FROM accounts;`} />
+
+Notice a few things as you experiment:
+
+The `BEGIN ... COMMIT` block isn't magic. Under the hood, SQLite is doing exactly the WAL write we described in the TearScene: before modifying the account rows, it writes log records describing the changes. If you could interrupt execution between the two `UPDATE` statements and ask the database "what's in the accounts table?", you'd see $100 in both accounts — the state before the transaction began — because the uncommitted changes are not visible to other connections. When `COMMIT` runs, SQLite flushes the WAL records, makes the changes visible atomically, and only then returns control.
+
+The fact that you can *see* the intermediate broken state in the no-transaction version — $150 total — is exactly the failure that Isolation prevents when two separate connections are involved. Here you're the only connection, so you can observe your own mid-transaction state. A second connection running concurrently would not be able to see it, if you'd wrapped the work in a transaction.
+
+Try one more experiment: after the `BEGIN`, run just the first `UPDATE`, then type `ROLLBACK` instead of `COMMIT`. Account A is back to $100, Account B is still $100, total is $200. The half-done transfer was unwound completely. That rollback is Atomicity in action — the undo half of the same guarantee that prevents torn writes.
+
+If you want to see a constraint violation, recreate the table with the constraint built in:
+
+```sql
+DROP TABLE accounts;
+CREATE TABLE accounts (
+  id TEXT PRIMARY KEY,
+  balance INTEGER CHECK (balance >= 0)
+);
+INSERT INTO accounts VALUES ('A', 100), ('B', 100);
+BEGIN;
+  UPDATE accounts SET balance = balance - 200 WHERE id = 'A';
+  UPDATE accounts SET balance = balance + 200 WHERE id = 'B';
+COMMIT;
+-- What happens? Check A's balance after the rollback.
+SELECT * FROM accounts;
+```
+
+The transaction aborts. The invariant — "no negative balances" — was declared to the database, and the database enforced it. Both `UPDATE` statements are rolled back together: A still has $100, B still has $100, total is still $200. That's ACID in one experiment: Atomicity (both or neither), Consistency (invariant enforced), Isolation (no other connection saw the broken state), Durability (if we'd committed, it would have been permanent).
+
+---
+
+## What's next
+
+ACID describes what a database *promises*. It doesn't describe how those promises are implemented, or what your data looks like at rest, or how the database finds a specific row among millions without scanning everything.
+
+Chapter 2 starts at the schema layer: the relational model, tables, keys, and the question of how you organize information so that it can be queried efficiently. It's worth spending time there because the relational model is not the only data model — document stores, graph databases, and column-oriented engines each make different trade-offs — and understanding what problem the relational model solves makes it easier to know when to reach for something else.
+
+Then Chapter 3 descends into physical storage: pages, files, and the question of how a database actually lays bytes on disk. Everything we said in the TearScene about page-granularity writes will become precise there. You'll see why databases manage their own pages rather than deferring to the filesystem, and why the buffer pool — the database's equivalent of the OS page cache — is one of the most performance-critical components in the whole system.
+
+Chapters 4 and 5 cover indexes — B-trees and their variants, hash indexes, and the specific question of how you find row 42 in a billion-row table in under a millisecond. Chapter 6 covers query execution: how the database turns SQL text into a plan and then executes it.
+
+Chapters 7 and 8 are where the I in ACID becomes engineering: locks, deadlocks, lock granularity, snapshot isolation, and MVCC. Chapter 9 is the D and the A: write-ahead logging, crash recovery, and the group-commit optimizations that make durable writes fast enough to use in production.
+
+The remaining chapters — replication, distributed transactions, and the CAP trade-offs that are distinct from the ACID ones — live at the boundary between a single database and a cluster of them.
+
+The whole book is, in a sense, an answer to a question you've now earned the right to ask: you know why databases are necessary. Now: how do they work?
+
+---
+
+## Footnotes
+
+<ol style={{ listStyle: 'none', padding: 0, marginTop: '2rem' }}>
+  <Footnote n={1}>
+    PostgreSQL documentation, "Reliability and the Write-Ahead Log."
+    [postgresql.org/docs/current/wal-intro.html](https://www.postgresql.org/docs/current/wal-intro.html)
+  </Footnote>
+  <Footnote n={2}>
+    Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 7, "Transactions" — section on the multiple, conflicting meanings of "consistency."
+  </Footnote>
+  <Footnote n={3}>
+    Craig Ringer, "PostgreSQL's handling of fsync() errors is unsafe and risks data loss at least on XFS." LWN, April 2018. [lwn.net/Articles/752063/](https://lwn.net/Articles/752063/)
+  </Footnote>
+</ol>
