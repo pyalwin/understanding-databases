@@ -221,3 +221,9 @@ The chapter is done when:
 - Each animation can be interacted with from a keyboard.
 - The page hits Lighthouse "good" on accessibility and CLS.
 - Reading the chapter on a phone is still good — figures responsive, text column doesn't get too narrow.
+
+---
+
+## Completion
+
+Chapter 01 shipped on 2026-06-20. Acceptance criteria from §7 verified via Task 21 QA pass.
