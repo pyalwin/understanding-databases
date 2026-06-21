@@ -1,0 +1,687 @@
+---
+title: The Transaction
+chapterNumber: 2
+summary: We left users.json in pieces. Now we fix it — and watch the fix break too. By the end you'll have built a write-ahead log by hand.
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote, StepThrough } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import RenameScene from '@/components/chapter-02/RenameScene';
+import MultiRowTearScene from '@/components/chapter-02/MultiRowTearScene';
+import WALScene from '@/components/chapter-02/WALScene';
+import CommitRecordToggle from '@/components/chapter-02/CommitRecordToggle';
+import TransactionSynthesis from '@/components/chapter-02/TransactionSynthesis';
+
+<ChapterReader chapterId="02-the-transaction">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 01 named four failures. What is Chapter 02 actually going to do about them?",
+    options: [
+      { text: "Describe how PostgreSQL solves each one, in order." },
+      { text: "Build the fix from scratch, in Python, in the browser — and watch each version of the fix break in a new way until we end up with a write-ahead log.", correct: true },
+      { text: "Move on to SQL, since the failures were really a SQL problem." },
+    ],
+  }}
+>
+
+We left `users.json` in pieces. Let's clean up the mess — and then we'll watch the cleanup break too.
+
+Chapter 01 named four failures: the lost update, the torn write, the broken invariant, the lie. It named them carefully and it gave them an acronym you may have already known. What it did not do — deliberately — was fix any of them. The race scene ended with a flock advisory and a forward reference. The tear scene ended with the word *write-ahead log* and a promise. The invariant scene leaned on atomicity without ever building it. The lie scene named `fsync` and stopped. Chapter 01 was a tour of the gaps. This chapter is the work of closing one of them.
+
+We are going to build, by hand, in Python, in your browser, the smallest machine that can give a single guarantee: a transaction either happened or it didn't. We will start with a one-liner — `os.rename` — and feel pretty good about it. Then we'll try to move fifty dollars between two files and watch the one-liner fall over. We'll patch it. The patch will fail differently. We'll patch the patch. By the end of the chapter you will have a write-ahead log, a commit record, and a recovery procedure that brings the machine back to a sane state after the lights come on. The pieces are small. The model they add up to is the one every relational database in production runs on.
+
+One thing before we start. We are going to keep working with JSON files, not SQL, in this chapter — and that's a deliberate choice, not a stalling tactic. Real databases don't use JSON files; they use pages, indexes, buffer pools, and the rest of the machinery chapter 04 will pull apart. But every SQL database does this same dance underneath — write the intent to a log, fsync it, apply the change, acknowledge the user — and the JSON-file version is the only version where you can *see* the dance happening. `BEGIN`, `COMMIT`, and `ROLLBACK` are coming in chapter 03; those are the syntax that lets you tell a database to start and end a transaction. We're spending this chapter on the thing those statements are talking to. Build the machine first, then learn what to type at it.
+
+</Section>
+
+<Section
+  id="rename"
+  title="The rename trick"
+  quiz={{
+    question: "You write to users.json.tmp, then os.rename it over users.json. After a crash, what's true of users.json on a POSIX filesystem?",
+    options: [
+      { text: "It might contain a mix of old and new bytes, depending on when the crash hit." },
+      { text: "It is either the entire old file or the entire new file — never a half-written carcass in between.", correct: true },
+      { text: "It will be empty, because rename truncates the destination first." },
+    ],
+  }}
+>
+
+Start with the smallest possible fix. You have `users.json` on disk. You want to add a user. The naive version — `open('users.json', 'w')`, write the new JSON, close — is the one that bit you in Chapter 01: the `O_TRUNC` flag empties the file before the new bytes land, so a crash mid-write leaves you with the carcass.
+
+So you do something cleverer. Write the new file to a *different name* — `users.json.tmp` — let it finish, then rename it on top of the old one. The reader of `users.json` either sees the file as it was, or sees the file as it now is. There is no third state where the file exists but is half-written, because the file you're publishing is `users.json.tmp` and the publishing step is a single syscall: `os.rename('users.json.tmp', 'users.json')`.
+
+<RenameScene client:visible />
+
+So you wrote to a temp file and renamed it. The file you publish is either the old one or the new one, never the half-written carcass in between. You feel pretty good about this. You should — `os.rename` on POSIX is genuinely atomic, and you just bought yourself the first real guarantee in this book. The promise comes from `rename(2)`: within a single filesystem, the rename of `A` onto an existing `B` replaces `B` in one step, with no observable intermediate state where `B` is missing or partial.<Footnote n={3} /> The kernel does the work in the directory entry, not in the file's bytes.
+
+There are two things this trick does *not* buy you, and one of them will matter in two paragraphs. The first: `rename` is only atomic *within* a filesystem. Cross a mount point — `/tmp` to `/home` is a classic example — and you get a copy-then-unlink, which is not atomic at all. The second: `rename` is atomic, but it isn't *durable*. The new directory entry can sit in the kernel's page cache for tens of seconds before the filesystem journals it to disk. If you want the rename to survive a power cut, you need an `fsync` on the new file *before* the rename and another `fsync` on the *parent directory* afterward — the parent directory is what holds the entry that points at the file.<Footnote n={3} /> Most application code skips both, which is why most application code very slowly corrupts itself over a long enough timeline.
+
+You will pay that `fsync` price later — chapter 09 is the chapter that takes the price seriously and shows how real databases amortize it. For now, the rename trick is the reason your editor's `~/.config/...` file survives an OS crash, the reason `git` can update a ref atomically, and the reason most well-behaved Unix tools write a tmp file you've probably never noticed.
+
+It's worth being precise about *why* the rename works when an in-place rewrite doesn't, because the same idea — write the new thing to a new place, then flip a single pointer to it — is the structural core of everything else in this chapter. In an in-place rewrite, the file being read by the rest of the world and the file being written by you are *the same file*. A crash mid-write leaves observable corruption on the path everyone is watching. In the rename version, the only file the world is watching is `users.json`; you build the new version somewhere it can't see, and the publishing step swaps one inode number into the directory entry. The reader never sees a half-built artifact because the half-built artifact lives at a different name. Hold that idea; the write-ahead log is the same trick at one more level of indirection.
+
+Below: the trick, in code, in your browser. `users.json` is seeded with Eve. Run it once with `SAFE = True` and watch a clean append. Then flip `SAFE = False` to skip the rename — the writer crashes mid-write, the truncated `users.json` is what you're left with, and a second run can't even parse it.
+
+<PythonSandbox
+  client:only="react"
+  initialCode={`import json, os
+
+PATH = 'users.json'
+SAFE = True       # set False to skip the rename and crash mid-write
+CRASH = False     # set True to crash after writing the tmp file but before rename
+
+def read_users():
+    with open(PATH) as f:
+        return json.load(f)
+
+def add_user_safe(name):
+    data = read_users()
+    data['users'].append({'id': max(u['id'] for u in data['users']) + 1, 'name': name})
+    tmp = PATH + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        # On a real OS you'd os.fsync(f.fileno()) here for durability.
+    if CRASH:
+        raise RuntimeError('simulated crash: tmp file written, rename never happens')
+    os.rename(tmp, PATH)
+
+def add_user_unsafe(name):
+    # Naive version: open(PATH, 'w') truncates, then we crash mid-write.
+    data = read_users()
+    data['users'].append({'id': max(u['id'] for u in data['users']) + 1, 'name': name})
+    blob = json.dumps(data, indent=2)
+    with open(PATH, 'w') as f:
+        # Pretend the kernel crashed after the first 12 bytes reached disk.
+        f.write(blob[:12])
+        raise RuntimeError('simulated crash mid-write')
+
+print('before:', read_users())
+if SAFE:
+    add_user_safe('Ada')
+else:
+    try:
+        add_user_unsafe('Ada')
+    except RuntimeError as e:
+        print('crash:', e)
+
+print('on disk now:')
+with open(PATH) as f:
+    print(f.read())
+`}
+  initialFiles={{
+    'users.json': '{\n  "users": [\n    {"id": 1, "name": "Eve"}\n  ]\n}\n',
+  }}
+  watchFiles={['users.json', 'users.json.tmp']}
+/>
+
+</Section>
+
+<Section
+  id="multi-row-tear"
+  title="The multi-row tear"
+  quiz={{
+    question: "Each of the two renames is atomic. Why does the transfer from a.json to b.json still leave the universe missing $50 if the machine dies between them?",
+    options: [
+      { text: "Because rename is only atomic on some filesystems, and a.json happened to be on the wrong one." },
+      { text: "Because per-file atomicity does not compose: each rename is atomic on its own file, but the sequence of two renames is not atomic as a whole.", correct: true },
+      { text: "Because the OS reorders the renames behind your back, so b.json is sometimes published first." },
+    ],
+  }}
+>
+
+Now do it twice.
+
+Open a second file, `b.json`. Alice has $100 in `a.json`. Bob has $50 in `b.json`. Move fifty dollars from Alice to Bob. Two reads, two writes, two renames. Your rename trick still works on each file individually — neither file will ever be half-written. But the *pair* of files can absolutely be in a state that no honest accountant would sign off on, and the operating system has no idea, because the operating system has never heard of accountants.
+
+<MultiRowTearScene client:visible />
+
+The timeline of the transfer has four steps: write `a.json.tmp`, rename `a.json.tmp → a.json`, write `b.json.tmp`, rename `b.json.tmp → b.json`. There are four places the machine can die. Two of them are fine — crash before *any* rename has landed and nothing happened; crash after the second rename and the transfer completed. The other two are the catastrophe. Crash between the two renames — at position 2 or position 3 in the scene — and Alice's file says $50, Bob's file still says $50, and the total has shrunk from $150 to $100. Fifty dollars has stopped existing.
+
+Per-file atomicity is real, and it is not enough. Each `rename` is atomic on its own file. The *sequence* of renames is not. The OS gave you a tool that protects one filesystem operation; you needed a tool that protects one *logical* operation, and there is no syscall called `rename_both_at_the_same_time`. There never will be. The kernel doesn't know that `a.json` and `b.json` are related — to the kernel, they are two independent directory entries that happen to be modified by the same process.
+
+The first fix the reader's brain reaches for is usually: *put both balances in one file*. Make `accounts.json` hold Alice and Bob. Now the transfer is one atomic rename and the whole problem dissolves. This works perfectly. It also stops working the moment your bank has a million customers, because rewriting the entire `accounts.json` file on every $50 transfer is monstrously expensive — gigabytes of IO for a write that touched 16 bytes. Real databases solve this by packing many rows per file *and* writing only the bytes that changed; we will meet that idea, called the *page*, in chapter 04. For now the point is structural: cramming everything into one file is the right idea for the wrong reason. It buys atomicity by accident, by collapsing the multi-write problem into a single write. What we need is a way to keep many files (or many pages — same problem at a different granularity) and still get one-shot atomicity across writes to several of them.
+
+Stare at the failure long enough and the shape of the bug becomes clear. There is no single point on the disk that says *the transfer is real* or *the transfer is not real*. The state of "the transfer" is spread across two files, and the only way to read it is to read both files and reason about their balances together. The crash window between the two renames is therefore a window in which the *observable* state of the system disagrees with the *intended* state, and nothing on disk distinguishes the two. The OS has no idea a transfer was in progress. The filesystem has no idea. Even your own application has no idea, because the application is the dead process whose last action was `os.rename` on the first file. When the lights come back on, the next process to read these files sees an internally consistent on-disk state that is *globally* incoherent, and has no way to know.
+
+This is the moment the whole chapter pivots. We cannot fix this by writing more carefully to two files. The pair-of-files arrangement is the bug. We need to introduce *another* file — a third place, separate from the data — that records what we *meant* to do, so that after a crash there is a single source of truth somebody can consult. Not the data files. A different file. A log.
+
+The sandbox below reproduces the bug. The transfer is two calls to the §1 `atomic_write` helper. You can pick where the crash lands. Try positions 2 and 3 — they're the ones that lose money.
+
+<PythonSandbox
+  client:only="react"
+  initialCode={`import json, os
+
+def atomic_write(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.rename(tmp, path)
+
+def read(path):
+    with open(path) as f:
+        return json.load(f)
+
+def totals():
+    return read('a.json')['balance'] + read('b.json')['balance']
+
+# Pick where the machine dies. 0 = before anything; 1 = after debit; 2 = before credit; 3 = after credit.
+CRASH_AT = 2
+
+print(f'before: Alice={read("a.json")["balance"]}  Bob={read("b.json")["balance"]}  total={totals()}')
+
+try:
+    # Debit Alice
+    a = read('a.json'); a['balance'] -= 50
+    atomic_write('a.json', a)
+    if CRASH_AT == 1:
+        raise RuntimeError('crash after debit, before credit')
+    if CRASH_AT == 2:
+        raise RuntimeError('crash between the two renames')
+    # Credit Bob
+    b = read('b.json'); b['balance'] += 50
+    atomic_write('b.json', b)
+    if CRASH_AT == 3 and False:
+        raise RuntimeError('after credit — transfer was already complete')
+except RuntimeError as e:
+    print('crash:', e)
+
+print(f'after:  Alice={read("a.json")["balance"]}  Bob={read("b.json")["balance"]}  total={totals()}')
+if totals() != 150:
+    print(f'⚠  total changed: {150 - totals()} dollars disappeared')
+`}
+  initialFiles={{
+    'a.json': '{"owner": "Alice", "balance": 100}\n',
+    'b.json': '{"owner": "Bob", "balance": 50}\n',
+  }}
+  watchFiles={['a.json', 'b.json']}
+/>
+
+</Section>
+
+<Section
+  id="log"
+  title="The log"
+  quiz={{
+    question: "Why is it called a write-ahead log?",
+    options: [
+      { text: "Because the log is written ahead of time, before the database opens for the day." },
+      { text: "Because the log record describing the change exists on disk before the data files change, so the data files are always reconstructible from the log.", correct: true },
+      { text: "Because the log is kept ahead of the buffer pool in physical memory, for speed." },
+    ],
+  }}
+>
+
+Here is the reframe.
+
+You can't write to two files atomically. But you *can* write to one file atomically — that is what the rename trick bought us, and that is what an append to the end of an open file buys us at a finer grain. So instead of trying to coordinate the two data files, you write down what you *intend* to do to them, in one place, before you do it. A single append to a single file. A line that says: *transfer 50 from a to b*. Once that line is on disk, the transfer is real, even if your machine catches fire before either `a.json` or `b.json` has been touched.
+
+That file is called a **write-ahead log**. *Write-ahead* because the log entry exists on disk *before* the data files change — the data files are downstream of the log. Whatever survives in the data files after a crash, you can always reconstruct from the log. The data files become a kind of materialized view of the log: useful for fast reads, but not the source of truth. The log is the source of truth.
+
+<WALScene client:visible />
+
+The four steps in the figure are the entire ceremony. Each one earns its place.
+
+**Append.** Serialize the intent of the transaction — *transfer 50 from a to b* — and append it to the end of the log file. Appends are cheap. They are sequential, which matters: spinning disks like sequential writes because there is no seek, and SSDs like them because the firmware can lay them out without write amplification. Crucially, appending to an existing file does not call `O_TRUNC`, does not touch the file's prior bytes, and does not race with itself for a single writer.
+
+**Fsync.** Now the line that earns the chapter. `os.fsync` on the log file's descriptor. Without this call, the bytes you just appended are sitting in the kernel page cache — RAM, under the kernel's management, not on disk.<Footnote n={3} /> A power cut at this moment loses the record entirely. With it, `fsync` blocks until the kernel has pushed those bytes through the page cache, through the device's own write cache, and onto persistent media — and only then does it return. This is the syscall that costs you a millisecond on a spinning disk, a hundred microseconds on a consumer NVMe, and is the reason every benchmark you have ever seen has an "fsync on/off" column. It is also the syscall that defines **durability**: a record in the log is durable the moment `fsync` returns successfully on it. Not before. Not at the moment `write()` returned. The layered write path from chapter 01 is still all true — app buffer, page cache, device cache, media — and `fsync` is the one call that drives a transaction all the way through it.
+
+<Callout type="note" title="Why doesn't ext4's journal save us?">
+Journaling filesystems like ext4 and XFS do keep a write-ahead log of their own. The trouble is that the journal is about *filesystem metadata*: directory entries, inode tables, free-block maps. It guarantees that after a crash the filesystem itself is consistent — directories don't dangle, inodes don't double-allocate. It does not guarantee anything about *your* file contents, because to ext4, the bytes inside `a.json` are payload. A journaling filesystem stops your filesystem from corrupting itself. It does not stop your application's two-file invariant from tearing. Chapter 01 made this point about the torn page; the same logic applies to the multi-row tear. If you want application-level atomicity, you have to build it yourself, on top of the OS, in a log you control.
+</Callout>
+
+**Apply.** The fsync has returned. The record is durable. Now you do the actual writes to `a.json` and `b.json`, using the same atomic-rename trick from §1. These writes can fail, the machine can die during them, the disk can sigh and give up — none of it matters for correctness, because the log already says what was supposed to happen. If the apply step is half-finished when the lights come back on, recovery (next section) reads the log and finishes the work.
+
+**Ack.** Tell the user the transfer succeeded. This is the cheap step on the critical path and the moment when you stop holding your breath, but it is also the moment that has to be *last*. Acking before fsync is the lie of chapter 01: you would be telling the user their transfer is safe when in fact a power cut would erase it. Acking before apply is fine — it just means the user sees success while a background process is still mutating the data files. Acking before fsync is the bug Postgres famously almost shipped against, when a Linux kernel quirk meant `fsync` could return success after silently discarding the dirty page; the fix took months of cross-team work because the contract between the database and the kernel had been broken in a way neither side had documented.<Footnote n={3} /> The lesson is the one the chapter has been repeating: durability is a contract about the order in which specific syscalls return.
+
+Notice what the log buys us that two atomic renames did not. It collapses the *N-write transaction* into a *one-write transaction*: the moment the log record is on disk, the transaction has happened, even if zero data files have been touched. The data files are now bookkeeping. They are a faster way to read the current balance than scanning the log from the beginning. If they get torn or lost, recovery rebuilds them. The thing you cannot afford to lose is the log.
+
+This shape — one durable append, then a separate apply step — is also why every modern database can be its own replication system. Chapter 12 will show how shipping log records to a second machine is, for free, a way to keep a second copy of the database in sync. And the cost of `fsync` per transaction is exactly the cost chapter 09 will tackle with *group commit*: bundle many transactions into one `fsync`, amortize the millisecond across all of them, and the per-transaction durability cost falls off a cliff.
+
+A short tour of the vocabulary, because you are going to meet these words again. The position of a record inside the log — its byte offset, or some monotonically increasing counter — is what real databases call a *log sequence number*, or LSN. The data file on disk is sometimes called the *materialized state* or, when it lives in memory, a *page* in the *buffer pool*. The act of replaying log records against the data files is *redo*. The act of unwinding an aborted transaction's effects is *undo* — which we do not need yet, because our log records the *new* state, not a *delta*, so re-applying a redo record is safe whether the apply finished, half-finished, or never started. Real ARIES recovery keeps both flavours of record, plus a *dirty page table*, plus *checkpoint records* that bound how far back recovery has to scan. Chapter 10 builds all of that. The stripped-down version in front of you is the ancestor every variant descends from.
+
+One more shape to notice. The log is append-only, which means it grows forever. Left unchecked, the recovery scan from byte zero gets slower with every transaction the database has ever processed. Real systems prune the log behind a *checkpoint* — a marker that says "everything before this offset has been applied to the data files and durably persisted, so recovery can start from here." Once you have checkpoints, you can truncate the log behind them and bound the recovery cost. We will not build a checkpoint in this chapter — the whole point of stripping ARIES down is to see the recovery loop in its pure form — but it is worth knowing the cost-of-correctness ledger does not stop with `fsync`. The price of a log that grows forever is paid in recovery time and in disk space, and the engineering of bounding both is most of what chapter 10 is about.
+
+The sandbox below is the log, built from scratch. About 50 lines. A `Log` class that appends records and fsyncs them (the fsync is a no-op in Pyodide's in-memory filesystem, but the call shape is the same as the one you'd write against ext4). A `Database` class with a `transfer()` that walks the four steps in order. Toggle `CRASH_BEFORE_FSYNC`, `CRASH_AFTER_FSYNC`, and `CRASH_BETWEEN_APPLIES` to land the crash at each of the interesting points and see what's in the log versus what's in the data files.
+
+<PythonSandbox
+  client:only="react"
+  initialCode={`import json, os
+
+class Log:
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            open(path, 'w').close()
+
+    def append(self, record):
+        with open(self.path, 'a') as f:
+            f.write(json.dumps(record) + '\\n')
+            f.flush()
+            os.fsync(f.fileno())   # the load-bearing call
+
+    def read_all(self):
+        with open(self.path) as f:
+            return [json.loads(line) for line in f if line.strip()]
+
+def atomic_write(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.rename(tmp, path)
+
+def read(path):
+    with open(path) as f:
+        return json.load(f)
+
+class Database:
+    def __init__(self, log):
+        self.log = log
+
+    def transfer(self, src, dst, amt,
+                 crash_before_fsync=False,
+                 crash_after_fsync=False,
+                 crash_between_applies=False):
+        # 1. Append. 2. Fsync (inside append).
+        # We simulate "before fsync" by writing the bytes without forcing them out.
+        if crash_before_fsync:
+            with open(self.log.path, 'a') as f:
+                f.write(json.dumps({'op': 'transfer', 'src': src, 'dst': dst, 'amt': amt}) + '\\n')
+            raise RuntimeError('crash: log appended but not fsynced — treat as never-committed')
+        self.log.append({'op': 'transfer', 'src': src, 'dst': dst, 'amt': amt})
+        if crash_after_fsync:
+            raise RuntimeError('crash: log durable, apply never ran — recovery will replay')
+        # 3. Apply.
+        a = read(src); a['balance'] -= amt; atomic_write(src, a)
+        if crash_between_applies:
+            raise RuntimeError('crash: src applied, dst not — recovery will finish it')
+        b = read(dst); b['balance'] += amt; atomic_write(dst, b)
+        # 4. Ack.
+        return 'ok'
+
+log = Log('wal.log')
+db = Database(log)
+
+print('before:', read('a.json'), read('b.json'))
+try:
+    db.transfer('a.json', 'b.json', 50, crash_after_fsync=True)
+except RuntimeError as e:
+    print('crash:', e)
+print('after:  ', read('a.json'), read('b.json'))
+print('log:    ', log.read_all())
+`}
+  initialFiles={{
+    'a.json': '{"owner": "Alice", "balance": 100}\n',
+    'b.json': '{"owner": "Bob", "balance": 50}\n',
+    'wal.log': '',
+  }}
+  watchFiles={['a.json', 'b.json', 'wal.log']}
+/>
+
+</Section>
+
+<Section
+  id="commit-record"
+  title="The commit record"
+  quiz={{
+    question: "Where, exactly, does the line between 'committed' and 'not committed' live?",
+    options: [
+      { text: "In the data files: a transaction is committed once both account balances are on disk." },
+      { text: "In the presence of a specific commit record, fsynced, in the log — everything before it is real, everything after it is not.", correct: true },
+      { text: "In the database's RAM: a transaction is committed once it has been removed from the in-memory transaction list." },
+    ],
+  }}
+>
+
+There is a question we have been dodging.
+
+Suppose recovery opens the log after a crash and sees the line *transfer 50 from a to b*. Did that transfer happen? Were we mid-write when the lights went out, with only half the intent on disk? Was the fsync interrupted? The log entry exists, but the existence of an entry is not the same as a *promise* about an entry. We need a marker in the log that says: *everything before this line is real*. Not a marker somewhere else — in the log, in line, so that the same `fsync` that makes the marker durable also makes the records it covers durable. One fsync, one decision point.
+
+That marker is called a **commit record**. It is a single short entry — `{"op": "commit", "txn": 42}` is enough — written *last*, after every other record in the transaction has been appended. Recovery's rule becomes: a transaction is committed if and only if its commit record is present in the log. The op records before it are *intentions*. The commit record promotes them, all at once, from intention to fact. A torn commit record — half its bytes on disk — fails the parse, and recovery treats the whole transaction as not-committed. The atomicity question collapses to a single byte-range question: is the commit record fully in the log, or not?
+
+<CommitRecordToggle client:visible />
+
+The three-way toggle in the figure is not academic. Every relational database in production ships a knob that controls exactly this trade-off. **Postgres** calls it `synchronous_commit`: `on` fsyncs the WAL before the client gets the ack (the slow, safe path); `off` lets the WAL flush in the background (faster, but a crash inside the flush window loses committed transactions). **MySQL/InnoDB** spells it `innodb_flush_log_at_trx_commit`: `1` is fsync per commit, `2` writes the OS but skips the fsync, `0` flushes once a second and is breathtakingly fast and breathtakingly lossy. **SQLite** exposes the same dial as `PRAGMA synchronous`: `FULL` fsyncs aggressively, `NORMAL` fsyncs less, `OFF` doesn't. The knobs have different names because the projects are different, but they are the same physical choice in three different vocabularies: where, exactly, do you put the fsync that protects the commit record?
+
+"Committed" is therefore not a state of the data files. The data files don't know what a transaction is. *Committed* is the presence of a specific record, fsynced, in the log. Everything downstream — the apply step, the ack, the user's smile — is the consequence of one byte-range being durable on one file. Atomicity becomes a property not of disks or filesystems or storage controllers, but of the commit record's position in the log.
+
+That reframing is worth pausing on. In chapter 01, atomicity felt like a property of the medium — the disk either accepted the bytes or it didn't, and the database's job was to wrestle the medium into giving an honest answer. With the commit record in hand, atomicity is no longer about the medium at all. It is about a single decision: did the commit record reach the log durably? The disk can be torn, the data files can be lying, the page cache can have lost half your writes — none of it matters, because the commit record is the contract. Recovery's job is just to read the contract and make the world match.
+
+There is also a quiet move happening with the commit record that is worth naming. Until this section, the boundary of a transaction was implicit: a transaction was "whatever the application happens to be doing right now." The commit record makes the boundary *explicit*. A transaction has a beginning (the first op record with a given txn id) and an end (the commit record with that id). Recovery can iterate over transactions, not over individual writes, because the log carries enough structure to tell which records belong together. That structure is also what lets a *future* version of the database run two transactions at the same time and keep them straight — each one is identified by its txn id, each one ends with its own commit record. That is chapter 03's problem, and it depends on the boundary we just drew.
+
+</Section>
+
+<Section
+  id="recovery"
+  title="Recovery"
+  quiz={{
+    question: "After a reboot, recovery scans the log forward. What does it actually do with each record?",
+    options: [
+      { text: "It rolls every record back, so the database starts from an empty state." },
+      { text: "It redoes every operation up to the last commit record and ignores anything after — the half-finished transfer from before the crash finishes itself.", correct: true },
+      { text: "It asks the operating system to replay the syscalls in the order they were originally issued." },
+    ],
+  }}
+>
+
+The lights come on. The machine reboots. The database process starts up and looks at its files. `a.json` says $50, which matches the debit half of a transfer but not the credit half. `b.json` still says $50. The user, who saw the green checkmark before the power went out, expects to see Bob holding $100. What happens next is the entire point of the chapter, and it is much less dramatic than the buildup suggests: the database opens the log, scans it once from start to finish, and replays whatever the log says was committed. That's recovery.
+
+<StepThrough
+  client:visible
+  steps={[
+    { label: "Open the log", content: "Before touching any data file, the database opens the log. The data files might be in a torn state — a.json says $50, b.json says $50, total is $100 instead of $150 — and you cannot trust them yet. The log is the source of truth, and the only file whose contents you have any basis to trust is the one whose contents you were forced to fsync before acknowledging the user. Everything else, including the data files, is downstream of the log and is being treated as suspect until proven otherwise." },
+    { label: "Scan forward", content: "Read the log from byte zero to the end. Parse one record at a time. The log is append-only, so the order on disk is the order of intent: every record after byte N was written strictly after the records before byte N. There is no sorting, no merging, no index — just a sequential read. On the spinning rust of the 1990s this was a single fast pass; on a modern SSD it is so cheap it barely registers. Real systems bound the scan with a checkpoint record so you don't replay from the dawn of time, but checkpoints are a chapter 10 optimization; the algorithm is identical without them." },
+    { label: "Find the last commit record", content: "As you scan, you watch for two things: ordinary op records (transfer 50 from a to b, debit X, credit Y) and commit records. An op record by itself is intent — it says what the transaction wanted to do, but not whether the transaction made it across the commit line. A commit record promotes everything before it, within that transaction, from intent to fact. So the question recovery has to answer for each transaction is: did its commit record make it into the log? If the answer is yes, the transaction is real. If the answer is no — either because the crash hit before the commit was appended, or because the commit record itself is torn and fails to parse — the transaction is treated as if it never happened." },
+    { label: "Redo up to the commit", content: "For every transaction whose commit record is present, replay its op records against the data files. The transfer that left a.json torn? You see its op record, you see its commit record, you re-apply the debit and credit, and the data files end up consistent again. Notice the property that makes this safe: the log records the intended new state, not a delta, so replaying the same record twice produces the same result as replaying it once. Idempotence. You can run recovery, crash mid-recovery, and run recovery again — the data files converge to the right answer regardless of how many times the apply step has been attempted. This is the simplest end of a family of techniques whose canonical form is the ARIES algorithm; ARIES adds LSNs, undo records, dirty page tables, and fuzzy checkpoints, all of which chapter 10 will earn." },
+    { label: "Ignore the tail", content: "Anything after the last valid commit record is garbage. An op record without a matching commit means the transaction was in flight when the crash hit — by the rule we just set, it never committed, so we have no obligation to honor it. A torn commit record at the end of the log is the same case: it failed to fsync cleanly, so it never committed. Recovery truncates the log at the last good commit point (or just leaves the tail in place to be overwritten by the next append; both are valid). The data files now reflect every committed transaction and no uncommitted ones. The database opens for business. The user, who watched their browser tab spin for forty seconds while the machine rebooted, refreshes the page and sees Bob holding $100." },
+  ]}
+/>
+
+</Section>
+
+<Section
+  id="contract"
+  title="The contract"
+  quiz={{
+    question: "Map ACID onto the WAL you just built. Which mechanism implements Atomicity?",
+    options: [
+      { text: "The fsync on the log file before the ack." },
+      { text: "The commit record: either it's in the log and fsynced, or the transaction never happened.", correct: true },
+      { text: "The atomic rename on each individual data file." },
+    ],
+  }}
+>
+
+Chapter 01 promised you the contract. Chapter 02 just built the machinery underneath it.
+
+Look at what you've assembled. A log file you append to and fsync. A commit record that promotes intent into fact. An apply step that mutates the data files. A recovery procedure that brings the data files back in line with the log after a crash. Four small pieces, in roughly fifty lines of Python. That's all an ACID transaction is, mechanically: a unit of work bracketed by a write of intent into the log and a fsynced commit record at the end. Everything else is bookkeeping.
+
+<TransactionSynthesis client:visible />
+
+Map the four letters onto what you built. **Atomicity** is the commit record: either it's in the log and fsynced, or the transaction never happened. There is no half-state — the byte-range is either entirely there or it fails to parse. **Durability** is the fsync on the log file before the ack. The acknowledgement returns *after* the fsync, so by the time the user has seen "success," the record is on persistent media. **Consistency** is what you get to *have* because atomicity and durability hold: either both legs of the transfer are in the log (and recovery will replay both, or neither) or the transfer was never committed. The invariant that the total stays at $150 is preserved end to end, because there is no possible interleaving of crashes and replays that leaves only one of the two writes applied. **Isolation** is the one panel grayed out in the figure, with an arrow pointing off the page to chapter 03 — what does it mean for *two* transactions to be in flight against the same log at the same time, and what does each one see of the other's work? That is the next chapter's problem.
+
+Re-read the closing of chapter 01's contract scene with new eyes. The four properties are not abstract guarantees a database makes about a magical kind of safety; they are concrete consequences of the small machine you just wrote. Atomicity is the commit record. Durability is the fsync. Consistency is the invariant that survives because atomicity and durability hold the transaction together end to end. The thing chapter 01 promised you, chapter 02 has now built.
+
+ACID is not four properties of a database. It's four properties of a *transaction* — and a transaction is the unit of work the WAL is built to protect. The transaction is also the answer to the question the title of this chapter has been holding open: what *is* a transaction, beyond a syntactic envelope around a few writes? A transaction is the smallest unit of work the WAL knows how to commit, abort, or replay. It is the unit at which the log records intent. It is the unit at which the commit record makes its decision. It is the unit at which recovery operates. Every layer of vocabulary that real databases use — savepoints, nested transactions, two-phase commit, isolation levels — sits on top of this primitive. Chapter 03 onward will keep adding floors. The basement is here.
+
+</Section>
+
+<Section
+  id="sandbox"
+  title="Build it yourself"
+>
+
+Put it together. The sandbox below is the whole machine: a `Log`, a `Database` that runs four-step commits with explicit commit records, and a `recover()` function that scans the log and rebuilds the data files. Three transfers run. The crash lands after the second commit record but before the third's apply finishes. The data files end up torn. You call `recover()` and watch them come back to a consistent state — because every committed transaction in the log gets re-applied, every uncommitted one is dropped, and idempotence makes it safe to do this whether the apply step had finished, half-finished, or never started.
+
+<PythonSandbox
+  client:only="react"
+  initialCode={`import json, os
+
+class Log:
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            open(path, 'w').close()
+    def append(self, rec):
+        with open(self.path, 'a') as f:
+            f.write(json.dumps(rec) + '\\n')
+            f.flush()
+            os.fsync(f.fileno())
+    def read_all(self):
+        with open(self.path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+def atomic_write(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+    os.rename(tmp, path)
+
+def read(path):
+    with open(path) as f:
+        return json.load(f)
+
+class Database:
+    def __init__(self, log):
+        self.log = log
+        self.next_txn = 1
+
+    def transfer(self, src, dst, amt, crash_before_commit=False, crash_after_commit=False):
+        txn = self.next_txn; self.next_txn += 1
+        self.log.append({'txn': txn, 'op': 'transfer', 'src': src, 'dst': dst, 'amt': amt})
+        if crash_before_commit:
+            raise RuntimeError(f'crash before commit record for txn {txn}')
+        self.log.append({'txn': txn, 'op': 'commit'})
+        if crash_after_commit:
+            raise RuntimeError(f'crash after commit for txn {txn}, apply unfinished')
+        a = read(src); a['balance'] -= amt; atomic_write(src, a)
+        b = read(dst); b['balance'] += amt; atomic_write(dst, b)
+        return txn
+
+def recover(log):
+    records = log.read_all()
+    # Group by txn; only replay txns whose commit record is present.
+    by_txn = {}
+    committed = set()
+    for r in records:
+        by_txn.setdefault(r['txn'], []).append(r)
+        if r.get('op') == 'commit':
+            committed.add(r['txn'])
+    for txn in sorted(committed):
+        for r in by_txn[txn]:
+            if r['op'] == 'transfer':
+                a = read(r['src']); a['balance'] -= r['amt']; atomic_write(r['src'], a)
+                b = read(r['dst']); b['balance'] += r['amt']; atomic_write(r['dst'], b)
+    return committed
+
+def totals():
+    return read('a.json')['balance'] + read('b.json')['balance']
+
+log = Log('wal.log')
+db = Database(log)
+
+print('start:', read('a.json'), read('b.json'), 'total=', totals())
+
+db.transfer('a.json', 'b.json', 10)
+db.transfer('b.json', 'a.json', 5)
+try:
+    db.transfer('a.json', 'b.json', 20, crash_after_commit=True)
+except RuntimeError as e:
+    print('crash:', e)
+
+print('after crash:', read('a.json'), read('b.json'), 'total=', totals())
+print('log records:')
+for r in log.read_all(): print(' ', r)
+
+# Wipe the data files back to the pre-crash baseline to demonstrate full replay.
+atomic_write('a.json', {'owner': 'Alice', 'balance': 100})
+atomic_write('b.json', {'owner': 'Bob', 'balance': 50})
+
+print('\\nrecovering...')
+committed = recover(log)
+print(f'replayed txns: {sorted(committed)}')
+print('after recovery:', read('a.json'), read('b.json'), 'total=', totals())
+`}
+  initialFiles={{
+    'a.json': '{"owner": "Alice", "balance": 100}\n',
+    'b.json': '{"owner": "Bob", "balance": 50}\n',
+    'wal.log': '',
+  }}
+  watchFiles={['a.json', 'b.json', 'wal.log']}
+/>
+
+<details class="my-6 rounded-md border border-[color:var(--color-rule)] bg-[color:var(--color-code-bg)] px-4 py-3">
+<summary class="cursor-pointer font-sans text-sm font-semibold text-[color:var(--color-ink)] hover:text-[color:var(--color-accent)]">
+  Run this locally for real fsync numbers
+</summary>
+
+<div class="mt-4">
+
+The sandbox above is convincing about *correctness*. It is silent about *cost*, because Pyodide's in-memory filesystem makes every `fsync` a no-op. The number you actually care about — how long does a real fsync cost on a real device — has to be measured against real hardware.
+
+Save the script below as `wal.py`, run it once as `python3 wal.py` to see a small demo, then run `python3 wal.py --bench` to time 10,000 commits with fsync and 10,000 without. The difference is what `fsync` is *actually* costing you on your laptop, in microseconds per commit. The number is usually surprising in both directions: faster than people expect on consumer NVMe (often well under 100 µs), and slower than people expect on a spinning disk (often 5–10 ms).
+
+```python
+# wal.py — a 80-line write-ahead log + recovery, with a fsync benchmark.
+# Tested on macOS and Linux. Requires Python 3.8+.
+import argparse, json, os, sys, time
+
+class Log:
+    def __init__(self, path, fsync=True):
+        self.path = path
+        self.do_fsync = fsync
+        open(path, 'a').close()  # ensure file exists
+
+    def append(self, rec):
+        with open(self.path, 'a') as f:
+            f.write(json.dumps(rec) + '\n')
+            f.flush()
+            if self.do_fsync:
+                os.fsync(f.fileno())
+
+    def read_all(self):
+        out = []
+        with open(self.path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    # Torn tail — ignore everything from here.
+                    break
+        return out
+
+def atomic_write(path, data):
+    tmp = path + '.tmp'
+    with open(tmp, 'w') as f:
+        json.dump(data, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, path)
+
+def recover(log_path, data_paths):
+    records = Log(log_path).read_all()
+    committed, by_txn = set(), {}
+    for r in records:
+        by_txn.setdefault(r['txn'], []).append(r)
+        if r.get('op') == 'commit':
+            committed.add(r['txn'])
+    for txn in sorted(committed):
+        for r in by_txn[txn]:
+            if r['op'] == 'transfer':
+                with open(r['src']) as f: a = json.load(f)
+                with open(r['dst']) as f: b = json.load(f)
+                a['balance'] -= r['amt']
+                b['balance'] += r['amt']
+                atomic_write(r['src'], a)
+                atomic_write(r['dst'], b)
+    return committed
+
+def bench(n, fsync):
+    log_path = '/tmp/wal-bench.log'
+    if os.path.exists(log_path):
+        os.remove(log_path)
+    log = Log(log_path, fsync=fsync)
+    start = time.perf_counter()
+    for i in range(n):
+        log.append({'txn': i, 'op': 'transfer', 'src': 'a', 'dst': 'b', 'amt': 1})
+        log.append({'txn': i, 'op': 'commit'})
+    elapsed = time.perf_counter() - start
+    os.remove(log_path)
+    return elapsed / n * 1e6  # microseconds per commit
+
+def demo():
+    for f, v in [('a.json', {'owner': 'A', 'balance': 100}),
+                 ('b.json', {'owner': 'B', 'balance': 50})]:
+        with open(f, 'w') as h: json.dump(v, h)
+    if os.path.exists('wal.log'): os.remove('wal.log')
+    log = Log('wal.log')
+    for txn, amt in enumerate([10, 5, 20], start=1):
+        log.append({'txn': txn, 'op': 'transfer', 'src': 'a.json', 'dst': 'b.json', 'amt': amt})
+        log.append({'txn': txn, 'op': 'commit'})
+    committed = recover('wal.log', ['a.json', 'b.json'])
+    with open('a.json') as f: a = json.load(f)
+    with open('b.json') as f: b = json.load(f)
+    print(f'committed txns: {sorted(committed)}')
+    print(f'final: a={a["balance"]} b={b["balance"]} total={a["balance"] + b["balance"]}')
+
+if __name__ == '__main__':
+    p = argparse.ArgumentParser()
+    p.add_argument('--bench', action='store_true', help='run 10,000-commit fsync benchmark')
+    p.add_argument('-n', type=int, default=10_000)
+    args = p.parse_args()
+    if args.bench:
+        with_fsync = bench(args.n, fsync=True)
+        without = bench(args.n, fsync=False)
+        print(f'{args.n} commits with fsync:    {with_fsync:8.1f} µs/commit')
+        print(f'{args.n} commits without fsync: {without:8.1f} µs/commit')
+        print(f'ratio: {with_fsync / without:6.1f}×')
+    else:
+        demo()
+```
+
+<Callout type="warning" title="The device may lie about fsync">
+The benchmark above measures what `fsync` *returns* — not what the storage device actually persisted. Many consumer drives have volatile write caches that ack the host before the bytes hit NAND, and many fsync implementations don't issue a drive-level cache flush. On macOS you need `fcntl(fd, F_FULLFSYNC)` for that; on Linux it depends on the filesystem, the mount options, and whether write barriers are enabled. A long-running power-pulled fleet test is the only way to know what your hardware actually honors. Chapter 09 takes this question seriously — once you know exactly what costs how much, you can amortize it with group commit and drive the per-transaction cost down without lying about durability.
+</Callout>
+
+</div>
+</details>
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+Now we have a log and a commit record. Time to put two of them in the same room.
+
+Everything chapter 02 built was a single writer talking to a single log. The reader has earned durability and atomicity, but isolation — the I in ACID — has been waiting in the wings the entire chapter. The race scene from chapter 01, where Ada vanished because two processes touched the same file, is the question chapter 02 deliberately did not answer. Two transactions, both writing, both reading, both wanting to see a consistent world while the other is in the middle of changing it: who sees what, when?
+
+That is also where the SQL finally arrives. `BEGIN`, `COMMIT`, `ROLLBACK` — the three keywords this entire book has been building toward — are the syntax that opens, closes, and unwinds the transaction we have just built the guts of. Chapter 03 is where you finally get to type them.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The seven entries below are the ones to chase next. Each carries a one-line note on why it's worth the time.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Mohan et al., 1992 — "ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging."</strong> The canonical recovery paper. Dense. Read §1–§3 first, then come back to the rest after Chapter 10.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Jim Gray, 1978 — "Notes on Data Base Operating Systems."</strong> Predates ARIES; the first place transactions and recovery are described as one coherent problem. Still the clearest exposition of <em>why</em> a log.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>PostgreSQL WAL documentation</strong> — <a href="https://www.postgresql.org/docs/current/wal-intro.html">postgresql.org/docs/current/wal-intro.html</a>. Production-grade description of every concept in this chapter, with the names Postgres actually uses. Read after the chapter to map our vocabulary onto a real system.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>SQLite WAL mode</strong> — <a href="https://www.sqlite.org/wal.html">sqlite.org/wal.html</a>. The shortest readable description of a real WAL in shipping software. Worth reading end to end.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Hellerstein, Stonebraker, Hamilton, 2007 — "Architecture of a Database System," Chapter 7.</strong> The textbook view: where the WAL sits relative to the buffer pool, the lock manager, and the access methods. Useful for the next several chapters.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 7.</strong> The same material at a level one notch above this book, with the operational consequences — replication lag, failover — brought forward. Strongly recommended companion reading.
+  </Footnote>
+  <Footnote n={7}>
+    <strong>Helland & Campbell, 2009 — "Building on Quicksand."</strong> Bonus reading on the <em>limits</em> of recovery: what happens when the failure model assumed by the WAL is wrong. Short, opinionated, important.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
