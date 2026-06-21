@@ -87,4 +87,4 @@ Node ≥ 22.12 is required (see `engines` in `package.json`).
 
 ## License
 
-TBD.
+[MIT](./LICENSE) — free to read, run, fork, and reuse.
