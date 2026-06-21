@@ -1,35 +1,342 @@
 ---
 import Layout from '@/layouts/Layout.astro';
+import { getCollection } from 'astro:content';
+
+const published = (await getCollection('chapters'))
+  .filter((c) => c.id !== '_test')
+  .map((c) => ({
+    num: c.data.chapterNumber,
+    title: c.data.title,
+    summary: c.data.summary,
+    status: c.data.status,
+    href: `/chapters/${c.id}`,
+  }));
+
+const planned = [
+  {
+    num: 2,
+    title: 'The Transaction',
+    summary: 'ACID mechanically — write-ahead logs, commit records, and crash recovery.',
+    status: 'planned',
+    href: null,
+  },
+  {
+    num: 3,
+    title: 'Isolation Levels',
+    summary: 'Dirty reads through serializable. Each anomaly staged in SQLite.',
+    status: 'planned',
+    href: null,
+  },
+  {
+    num: 4,
+    title: 'Where Data Actually Lives',
+    summary: 'Pages, heaps, B-trees, indexes — from first principles, drawn in CSS.',
+    status: 'planned',
+    href: null,
+  },
+];
+
+const chapters = [...published, ...planned].sort((a, b) => a.num - b.num);
+const firstReadable = chapters.find((c) => c.status === 'published');
 ---
 
-<Layout title="Databases Deep-Dive">
-  <section class="space-y-6">
-    <h1 class="text-3xl font-bold tracking-tight">Databases Deep-Dive</h1>
-    <p class="text-gray-300 text-lg">
-      An engineering-first course on how databases actually work: storage engines,
-      indexing, concurrency, recovery, replication, and modern system internals.
-    </p>
-    <div class="grid gap-4 sm:grid-cols-2">
-      <a href="/chapters" class="block rounded-lg border border-white/10 p-4 hover:bg-white/5">
-        <div class="font-medium">Chapters</div>
-        <div class="text-sm text-gray-400">Read and interact with course content</div>
-      </a>
-      <a href="/sandbox" class="block rounded-lg border border-white/10 p-4 hover:bg-white/5">
-        <div class="font-medium">SQL Sandbox</div>
-        <div class="text-sm text-gray-400">Run SQLite queries in the browser</div>
-      </a>
-    </div>
-    <div id="progress" class="text-sm text-gray-400">Loading progress…</div>
-  </section>
+<Layout title="Understanding Databases">
+  <article class="spread">
+    <section class="title-page">
+      <p class="eyebrow">A book in progress &middot; 2026</p>
 
-  <script is:inline>
-    const updateProgress = () => {
-      const data = JSON.parse(localStorage.getItem('course-progress') || '{}');
-      const total = 19;
-      const done = Object.values(data).filter(Boolean).length;
-      const pct = Math.round((done / total) * 100);
-      document.getElementById('progress').textContent = `Progress: ${done}/${total} chapters (${pct}%)`;
-    };
-    updateProgress();
-  </script>
+      <h1 class="title">
+        <span class="title-word">Understanding</span>
+        <span class="title-word title-word--accent">Databases</span>
+      </h1>
+
+      <p class="subtitle">
+        An interactive deep-dive into how databases actually work.
+        Read in the page, run the experiments, break things on purpose.
+      </p>
+
+      <hr class="rule" />
+
+      <blockquote class="epigraph">
+        Databases are special because they refuse to lie —
+        even when everything around them is trying to make them.
+      </blockquote>
+
+      <hr class="rule" />
+
+      {firstReadable && (
+        <a class="begin" href={firstReadable.href}>
+          <span class="begin-label">
+            Begin reading
+            <span class="begin-arrow" aria-hidden="true">&rarr;</span>
+          </span>
+          <span class="begin-detail">
+            Chapter {String(firstReadable.num).padStart(2, '0')} &middot; {firstReadable.title}
+          </span>
+        </a>
+      )}
+    </section>
+
+    <section class="contents-page">
+      <p class="eyebrow eyebrow--right">Contents</p>
+
+      <ol class="toc">
+        {chapters.map((c) => {
+          const num = String(c.num).padStart(2, '0');
+          const linkable = c.status === 'published' && c.href;
+          return (
+            <li class={`toc-row toc-row--${c.status}`}>
+              {linkable ? (
+                <a class="toc-link" href={c.href}>
+                  <span class="toc-num">{num}</span>
+                  <span class="toc-title">{c.title}</span>
+                  <span class="toc-leader" aria-hidden="true"></span>
+                  <span class="toc-status">{c.status}</span>
+                </a>
+              ) : (
+                <div class="toc-link toc-link--inert">
+                  <span class="toc-num">{num}</span>
+                  <span class="toc-title">{c.title}</span>
+                  <span class="toc-leader" aria-hidden="true"></span>
+                  <span class="toc-status">{c.status}</span>
+                </div>
+              )}
+              <p class="toc-summary">{c.summary}</p>
+            </li>
+          );
+        })}
+      </ol>
+    </section>
+  </article>
+
+  <p class="colophon">
+    Set in Source Serif 4
+    &middot; Code in JetBrains Mono
+    &middot; Sandboxes run in your browser
+    &middot; <a href="https://github.com/pyalwin/understanding-databases">Source on GitHub</a>
+  </p>
 </Layout>
+
+<style>
+  .spread {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 5.5rem 2.5rem 4rem;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 4.5rem;
+    position: relative;
+  }
+  .spread::before {
+    content: '';
+    position: absolute;
+    top: 5.5rem;
+    bottom: 4rem;
+    left: 50%;
+    width: 1px;
+    background: var(--color-rule);
+    transform: translateX(-50%);
+  }
+  @media (max-width: 880px) {
+    .spread {
+      grid-template-columns: 1fr;
+      padding: 3.5rem 1.5rem 2.5rem;
+      row-gap: 3rem;
+    }
+    .spread::before { display: none; }
+  }
+
+  .title-page { padding-right: 1.5rem; }
+  .contents-page { padding-left: 1.5rem; }
+  @media (max-width: 880px) {
+    .title-page, .contents-page { padding: 0; }
+  }
+
+  .eyebrow {
+    font-family: var(--font-sans);
+    font-size: 0.7rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.22em;
+    color: var(--color-ink-soft);
+    margin: 0 0 2.25rem;
+  }
+  .eyebrow--right { margin-bottom: 1.75rem; }
+
+  .title {
+    font-family: var(--font-serif);
+    font-weight: 400;
+    font-size: clamp(2.75rem, 6vw, 4.75rem);
+    line-height: 0.98;
+    letter-spacing: -0.025em;
+    color: var(--color-ink);
+    margin: 0 0 1.6rem;
+    display: flex;
+    flex-direction: column;
+  }
+  .title-word { display: block; }
+  .title-word--accent {
+    font-style: italic;
+    color: var(--color-accent);
+    font-weight: 500;
+  }
+
+  .subtitle {
+    font-family: var(--font-serif);
+    font-size: 1.1rem;
+    line-height: 1.55;
+    color: var(--color-ink-soft);
+    margin: 0;
+    max-width: 30ch;
+  }
+
+  .rule {
+    border: 0;
+    border-top: 1px solid var(--color-rule);
+    width: 3.5rem;
+    margin: 2.25rem 0;
+  }
+
+  .epigraph {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 1.02rem;
+    line-height: 1.55;
+    color: var(--color-ink);
+    margin: 0;
+    padding: 0 0 0 0.1rem;
+    max-width: 32ch;
+    border: 0;
+  }
+
+  .begin {
+    display: inline-flex;
+    flex-direction: column;
+    gap: 0.4rem;
+    text-decoration: none;
+    color: var(--color-ink);
+    transition: color 0.2s ease;
+  }
+  .begin:hover { color: var(--color-accent); }
+  .begin-label {
+    font-family: var(--font-serif);
+    font-size: 1.25rem;
+    font-weight: 500;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 0.55rem;
+  }
+  .begin-arrow {
+    display: inline-block;
+    transition: transform 0.2s ease;
+  }
+  .begin:hover .begin-arrow { transform: translateX(4px); }
+  .begin-detail {
+    font-family: var(--font-sans);
+    font-size: 0.72rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--color-ink-soft);
+  }
+
+  .toc {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+  }
+
+  .toc-row {
+    padding: 1.15rem 0 1.1rem;
+    border-top: 1px solid var(--color-rule);
+  }
+  .toc-row:last-child { border-bottom: 1px solid var(--color-rule); }
+
+  .toc-link {
+    display: flex;
+    align-items: baseline;
+    gap: 0.85rem;
+    text-decoration: none;
+    color: var(--color-ink);
+    transition: color 0.2s ease;
+  }
+  .toc-link:hover:not(.toc-link--inert) { color: var(--color-accent); }
+
+  .toc-num {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    font-weight: 500;
+    color: var(--color-ink-soft);
+    width: 1.6rem;
+    flex-shrink: 0;
+  }
+
+  .toc-title {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 1.15rem;
+    font-weight: 500;
+    flex-shrink: 0;
+  }
+
+  .toc-leader {
+    flex: 1;
+    border-bottom: 1px dotted var(--color-rule);
+    margin: 0 0.45rem 0.4rem;
+    min-width: 1.5rem;
+    align-self: flex-end;
+  }
+
+  .toc-status {
+    font-family: var(--font-sans);
+    font-size: 0.66rem;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.18em;
+    color: var(--color-ink-soft);
+    flex-shrink: 0;
+  }
+
+  .toc-row--published .toc-status { color: var(--color-accent); }
+
+  .toc-row--planned .toc-title,
+  .toc-row--planned .toc-status,
+  .toc-row--planned .toc-num {
+    color: var(--color-ink-soft);
+  }
+  .toc-row--planned .toc-title { opacity: 0.7; }
+
+  .toc-summary {
+    font-family: var(--font-serif);
+    font-style: italic;
+    font-size: 0.92rem;
+    line-height: 1.5;
+    color: var(--color-ink-soft);
+    margin: 0.4rem 0 0 2.45rem;
+    max-width: 42ch;
+  }
+
+  .colophon {
+    max-width: 1180px;
+    margin: 3rem auto 4rem;
+    padding: 1.75rem 2.5rem 0;
+    border-top: 1px solid var(--color-rule);
+    font-family: var(--font-sans);
+    font-size: 0.74rem;
+    font-weight: 500;
+    color: var(--color-ink-soft);
+    text-align: center;
+    letter-spacing: 0.04em;
+  }
+  .colophon a {
+    color: var(--color-ink-soft);
+    text-decoration: underline;
+    text-decoration-color: var(--color-rule);
+    text-underline-offset: 3px;
+    transition: color 0.2s ease;
+  }
+  .colophon a:hover {
+    color: var(--color-accent);
+    text-decoration-color: var(--color-accent);
+  }
+</style>
