@@ -8,9 +8,25 @@ status: published
 
 import { RaceScene, TearScene, InvariantScene, LieScene, ContractSynthesis } from '@/components/chapter-01';
 import { Callout, Footnote } from '@/components/scene';
+import Section from '@/components/scene/Section.astro';
+import ChapterReader from '@/components/scene/ChapterReader.astro';
 import { SqlSandboxReact } from '@/components/SqlSandboxReact';
+import { PythonSandbox } from '@/components/PythonSandbox';
 
-## The premise
+<ChapterReader chapterId="01-why-databases-are-special">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "By the end of this chapter, you should be able to describe a database as...",
+    options: [
+      { text: "A faster, more scalable file format." },
+      { text: "The machine that prevents four specific failure modes we're going to watch happen.", correct: true },
+      { text: "Another word for SQL." },
+    ],
+  }}
+>
 
 Open your editor and create a file called `users.json`. Drop in two users. Save. Congratulations — you've made a database.
 
@@ -18,7 +34,7 @@ Not really. But it's worth taking that joke seriously for a moment, because the 
 
 So let's not start with definitions. Let's start by trying to use a file as a database, and seeing where it breaks.
 
-The experiment is simple: write a small Node.js script that reads `users.json`, appends a new user, and writes the file back. Ship it to production. Congratulations again — you now have a real user registration system backed by a flat file, exactly as many early web apps were built. It will work fine in a demo. It will work fine the first week. Then two users will hit "Register" at the same moment, and you will discover the first failure.
+The experiment is simple: write a small Python script that reads `users.json`, appends a new user, and writes the file back. Ship it to production. Congratulations again — you now have a real user registration system backed by a flat file, exactly as many early web apps were built. It will work fine in a demo. It will work fine the first week. Then two users will hit "Register" at the same moment, and you will discover the first failure.
 
 There are four failures waiting in that file. They are not bugs in your script. They are properties of files — of filesystems and operating systems — that are simply absent from the interface `open()`, `read()`, `write()`, `close()` gives you. A database is not a smarter file. It is a machine specifically designed to close four specific gaps, and understanding those gaps is understanding what a database is *for*.
 
@@ -26,20 +42,36 @@ We're going to watch each failure happen. We'll use interactive diagrams to make
 
 The names of those four failures will emerge as we go. You may already know the acronym. Wait for it.
 
----
+</Section>
 
-## The race
+<Section
+  id="race"
+  title="The race"
+  quiz={{
+    question: "Why is the Ada record lost when two processes write users.json?",
+    options: [
+      { text: "Python doesn't lock files automatically." },
+      { text: "The O_TRUNC flag discards the existing file contents before writing, so the second writer overwrites the first.", correct: true },
+      { text: "JSON parsing failed in one of the processes." },
+    ],
+  }}
+>
 
 Picture two terminals on your laptop. In each one, you run the same script:
 
-```js
-const fs   = require('fs');
-const data = JSON.parse(fs.readFileSync('users.json', 'utf8'));
-data.users.push({ id: Date.now(), name: process.argv[2] });
-fs.writeFileSync('users.json', JSON.stringify(data, null, 2));
+```python
+import json, sys, time
+
+with open('users.json') as f:
+    data = json.load(f)
+
+data['users'].append({'id': int(time.time() * 1000), 'name': sys.argv[1]})
+
+with open('users.json', 'w') as f:
+    json.dump(data, f, indent=2)
 ```
 
-In terminal one you type `node add-user.js Ada`. In terminal two, a half-second later, you type `node add-user.js Bob`. You'd expect `users.json` to end up with three records: Eve (who was already there), Ada, and Bob.
+In terminal one you type `python add_user.py Ada`. In terminal two, a half-second later, you type `python add_user.py Bob`. You'd expect `users.json` to end up with three records: Eve (who was already there), Ada, and Bob.
 
 Open the file. Eve and Bob are there. Ada is gone.
 
@@ -47,9 +79,177 @@ The diagram below makes the timing visible. Click through it slowly.
 
 <RaceScene client:visible />
 
-Here's what happened. Both processes called `readFileSync` and got the same snapshot of the file. At that moment, the file contained only Eve. Process 1 appended Ada to its in-memory copy; Process 2 appended Bob to its. Then each process called `writeFileSync`, which opens the file, truncates it to zero bytes, and writes the whole thing from memory. Whoever finishes last wins. Process 1's write survives if it writes second. Process 2's write survives if it writes second. Neither knows the other exists.
+A real race needs two processes running at the same time — a single sandbox can't *actually* interleave them. So we'll do the next best thing: stage the interleaving by hand. The script below pretends to be both processes, performs each step in the order the diagram showed (P1 reads → P2 reads → P1 writes → P2 writes), and prints what's on disk after each step. Run it and watch Ada vanish.
 
-To be precise about the mechanics: `writeFileSync` issues a sequence of system calls roughly equivalent to:
+A real Python runtime (Pyodide) is loaded into your browser the first time you click **Run** — that takes a few seconds. After that, edits are instant. Try reordering the writes, or moving P2's read to *after* P1's write, and watch the outcome change.
+
+<PythonSandbox
+  client:visible
+  initialCode={`import json
+
+# Helpers — what each "process" actually does on the file.
+def read():
+    with open('users.json') as f:
+        return json.load(f)
+
+def write(data):
+    with open('users.json', 'w') as f:
+        json.dump(data, f, indent=2)
+
+def names_on_disk():
+    return [u['name'] for u in read()['users']]
+
+print("start: users.json contains", names_on_disk())
+print()
+
+# --- Stage the race: each step is one "process" doing one syscall. ---
+
+# Step 1: P1 reads
+p1 = read()
+print("Step 1 — P1 reads:", [u['name'] for u in p1['users']])
+
+# Step 2: P2 reads (before P1 has written)
+p2 = read()
+print("Step 2 — P2 reads:", [u['name'] for u in p2['users']])
+
+# Step 3: each modifies its OWN in-memory copy
+p1['users'].append({'id': 100, 'name': 'Ada'})
+p2['users'].append({'id': 200, 'name': 'Bob'})
+print("Step 3 — P1 in memory:", [u['name'] for u in p1['users']])
+print("           P2 in memory:", [u['name'] for u in p2['users']])
+
+# Step 4: P1 writes its version
+write(p1)
+print("Step 4 — P1 writes. On disk:", names_on_disk())
+
+# Step 5: P2 writes its version. P2's version doesn't include Ada,
+# because P2's read happened BEFORE P1's write.
+write(p2)
+print("Step 5 — P2 writes. On disk:", names_on_disk())
+
+print()
+print("Final users.json:")
+print(json.dumps(read(), indent=2))
+print()
+if 'Ada' not in names_on_disk():
+    print("⚠  Ada is gone. P2's write clobbered P1's, even though both succeeded.")
+`}
+  initialFiles={{
+    '/users.json': '{\n  "users": [\n    {"id": 1, "name": "Eve"}\n  ]\n}\n',
+  }}
+  watchFiles={['/users.json']}
+/>
+
+<details class="my-6 rounded-md border border-[color:var(--color-rule)] bg-[color:var(--color-code-bg)] px-4 py-3">
+<summary class="cursor-pointer font-sans text-sm font-semibold text-[color:var(--color-ink)] hover:text-[color:var(--color-accent)]">
+  Reproduce the real race on your laptop (two OS processes)
+</summary>
+
+<div class="mt-4">
+
+The sandbox above stages the race step by step, so the outcome is the same every time. The real failure on your laptop is *non-deterministic* — sometimes Ada wins, sometimes Bob wins, sometimes both make it in (if the OS schedules the reads and writes far enough apart). Save the script below as `race.py`, run it a few times, and watch the outcome flicker.
+
+```python
+# race.py — requires Python 3.8+
+import json
+import multiprocessing as mp
+import pathlib
+import time
+
+FILE = pathlib.Path("users.json")
+
+def reset():
+    FILE.write_text(json.dumps({"users": [{"id": 1, "name": "Eve"}]}, indent=2))
+
+def add_user(name, delay_after_read=0.05):
+    """One process: read the file, append a user, write it back.
+
+    The sleep exaggerates the read-write window so the race shows up
+    reliably on a fast machine. The retry on JSONDecodeError handles
+    a *second* symptom of the same bug: open(FILE, "w") truncates the
+    file to zero bytes BEFORE json.dump writes anything, so if the
+    other process happens to read in that window it sees an empty
+    file. Crashing is one way the race surfaces; the lost update is
+    another. We retry the read so the demo measures the lost update
+    cleanly."""
+    while True:
+        try:
+            with open(FILE) as f:
+                data = json.load(f)
+            break
+        except json.JSONDecodeError:
+            time.sleep(0.001)
+
+    time.sleep(delay_after_read)
+    data["users"].append({"id": int(time.time() * 1000), "name": name})
+
+    with open(FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+if __name__ == "__main__":
+    runs = 10
+    losses = 0
+    for i in range(runs):
+        reset()
+        p1 = mp.Process(target=add_user, args=("Ada",))
+        p2 = mp.Process(target=add_user, args=("Bob",))
+        p1.start(); p2.start()
+        p1.join();  p2.join()
+        names = [u["name"] for u in json.loads(FILE.read_text())["users"]]
+        ok = "Ada" in names and "Bob" in names
+        if not ok:
+            losses += 1
+        print(f"run {i+1:2d}: {names}  {'OK' if ok else 'LOST UPDATE'}")
+    print(f"\n{losses}/{runs} runs lost an update")
+```
+
+Run it:
+
+```bash
+python3 race.py
+```
+
+You'll see a mix of `OK` and `LOST UPDATE` lines across the ten runs — with `delay_after_read=0.05` most are losses, because the sleep keeps the two processes' reads-before-writes overlapping. Drop the sleep to `0` and the race window collapses to whatever the kernel happens to give you; you'll still see losses, just fewer of them. Bump it to `0.5` and you'll get all `LOST UPDATE`. *Whether you observe the bug depends entirely on timing the kernel happened to choose.* That's the actual nature of the bug: it lives in production for months and surfaces on a busy day.
+
+If you remove the `JSONDecodeError` retry and run with `delay_after_read=0`, you'll start seeing the second symptom directly:
+
+```
+json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+```
+
+That traceback is the same race showing up at a different layer: one process opened the file `"w"` (truncating it) at the exact moment the other was reading. Both symptoms — the lost update and the crash — come from the same root cause: the read-modify-write isn't atomic.
+
+### The fix: hold a lock across the read-modify-write
+
+Replace `add_user` with a version that takes an exclusive `flock` for the entire read-modify-write cycle. The lock serialises the two processes — whichever one acquires it first finishes its full cycle before the other can start.
+
+```python
+import fcntl
+
+def add_user(name, delay_after_read=0.05):
+    # Open for read+write so we can lock and rewrite in place.
+    # LOCK_EX blocks until we get exclusive access; the lock is
+    # released automatically when the file is closed.
+    with open(FILE, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        data = json.load(f)
+        time.sleep(delay_after_read)
+        data["users"].append({"id": int(time.time() * 1000), "name": name})
+        f.seek(0)
+        f.truncate()
+        json.dump(data, f, indent=2)
+```
+
+Rerun with this `add_user` in place and you should see `0/10 runs lost an update` and zero tracebacks — both failure modes gone. The cost is exactly what you observe: concurrency has been removed. The two processes no longer race because one of them is always waiting.
+
+That's the entire shape of what databases do for you. Chapter 7 unpacks the trade-off in detail: lock too coarsely and you serialise work that could have run in parallel; lock too finely and the bookkeeping overhead can dominate. `fcntl.flock` is also single-host — useless if your app runs on three machines behind a load balancer — and advisory, so a misbehaving process can ignore it. A real database's locking subsystem fixes both gaps and adds row-level granularity, deadlock detection, and a few other things you'd rather not implement yourself.
+
+</div>
+</details>
+
+Here's what happened. Both processes called `json.load` and got the same snapshot of the file. At that moment, the file contained only Eve. Process 1 appended Ada to its in-memory copy; Process 2 appended Bob to its. Then each process opened the file in write mode (`'w'`), which truncates it to zero bytes, and wrote the whole thing from memory via `json.dump`. Whoever finishes last wins. Process 1's write survives if it writes second. Process 2's write survives if it writes second. Neither knows the other exists.
+
+To be precise about the mechanics: `open('users.json', 'w')` followed by a write issues a sequence of system calls roughly equivalent to:
 
 ```c
 fd = open("users.json", O_WRONLY | O_TRUNC | O_CREAT, 0644);
@@ -59,7 +259,7 @@ close(fd);
 
 The `O_TRUNC` flag is the killer. It tells the kernel to discard the existing file contents before writing. So the second process to reach `open()` throws away whatever the first process wrote. The file is well-formed JSON at every point. No error is returned. No exception is thrown. Ada just vanishes.
 
-This is not a bug in Node.js. It is not a race condition in the threading sense — neither process shares memory with the other. It is a property of the `write(2)` syscall: it operates on a file descriptor, and file descriptors are not coordinating mechanisms. Two processes can open the same file independently and the kernel has no obligation to tell either one that the other exists.
+This is not a bug in Python. It is not a race condition in the threading sense — neither process shares memory with the other. It is a property of the `write(2)` syscall: it operates on a file descriptor, and file descriptors are not coordinating mechanisms. Two processes can open the same file independently and the kernel has no obligation to tell either one that the other exists.
 
 Here's what's strange about this failure: it is entirely invisible at the syscall level. Both processes completed without an error. The file is syntactically valid at every point during the sequence. If you were logging the write calls, both would show success. The only way to detect the lost update is to compare the before-and-after at the application level and realize that Ada's record never made it.
 
@@ -81,9 +281,20 @@ But the cost of serialization is the cost of locks, and Chapter 7 exists because
 
 For now: this is what *Isolation* buys you. The word will mean more when we've seen all four failures. Hold it in mind.
 
----
+</Section>
 
-## The tear
+<Section
+  id="tear"
+  title="The tear"
+  quiz={{
+    question: "Why is a half-written page on disk dangerous even though it's 'just' a few wrong bytes?",
+    options: [
+      { text: "The OS automatically deletes the file." },
+      { text: "The torn bytes can break parsing for the whole file, including records that weren't being written.", correct: true },
+      { text: "The SSD logs a hardware error and refuses further writes." },
+    ],
+  }}
+>
 
 The race was about *who* writes. Now consider a different question: what does it mean for a write to *succeed*?
 
@@ -96,6 +307,29 @@ Set a crash point with the slider below and press Start. Watch what happens to t
 <TearScene client:visible />
 
 The record in the scene is a JSON object for Ada Lovelace — 75 bytes long. If you crash at byte 37, the file contains `{"id":42,"name":"Ada Lovelace","email"`. That is not valid JSON. Any attempt to parse it throws a syntax error. The record is not partially saved; it is corrupted in a way that can prevent reading *any* record that shares the same file, because a JSON parser reading the file will fail at byte 37 and give up.
+
+You can reproduce the torn write in Python below. Change `CRASH_AT` to control where the "power loss" happens, then click **Run**. After the exception fires, click **Show record.json** to see what's actually on the (virtual) disk.
+
+<PythonSandbox
+  client:visible
+  initialCode={`record = '{"id":42,"name":"Ada Lovelace","email":"ada@analyt.eng","role":"engineer"}'
+print(f"intended record is {len(record)} bytes")
+
+CRASH_AT = 37  # try 0, 37, or 75 (no crash)
+
+with open('record.json', 'w') as f:
+    written = 0
+    for ch in record:
+        if written >= CRASH_AT:
+            f.flush()  # make partial bytes visible on the "disk"
+            raise RuntimeError(f"simulated power loss at byte {written}")
+        f.write(ch)
+        written += 1
+    print(f"wrote all {written} bytes — no crash")
+`}
+  initialFiles={{ '/record.json': '' }}
+  watchFiles={['/record.json']}
+/>
 
 Here's why this happens at the hardware level. Modern storage devices — spinning disks and SSDs alike — operate at *page granularity*. An SSD page is typically 4 KB or 16 KB. A spinning disk sector was historically 512 bytes but modern drives use 4 KB sectors. When you write fewer bytes than a full page, the device cannot simply update those bytes in place. It must perform a *read-modify-write*: read the entire 4 KB page containing your bytes into a buffer, update the relevant bytes in that buffer, and write the whole page back. If power is interrupted between the read and the write-back, the page on disk may contain bytes from *both* the old and new versions of the data. This is a *torn page* — sometimes also called a *partial write*.
 
@@ -113,9 +347,20 @@ One sentence on the cost: WAL makes every write more expensive because it double
 
 This is what *Atomicity* buys you. "The write" becomes a single act — either the whole thing happened or none of it did — even though physically it is a sequence of operations that can be interrupted at any point.
 
----
+</Section>
 
-## The invariant
+<Section
+  id="invariant"
+  title="The invariant"
+  quiz={{
+    question: "What does 'Consistency' mean in ACID (not in CAP)?",
+    options: [
+      { text: "All replicas in a cluster agree on the data." },
+      { text: "Application-defined invariants — like 'total money is conserved' — are preserved across every transaction.", correct: true },
+      { text: "Queries always return the most recent committed write." },
+    ],
+  }}
+>
 
 The first two failures are about physical storage. The third failure is about meaning.
 
@@ -126,6 +371,38 @@ The rule — that the total must remain constant — is called an *invariant*. B
 <InvariantScene client:visible />
 
 Drag the slider to crash after step 3. Account A has been debited $50, but Account B has not yet been credited. The system total is $150, not $200. $50 has vanished. The invariant is broken.
+
+Reproduce it yourself in Python. The script below transfers $50 from A to B as two separate writes — change `CRASH_BETWEEN_WRITES` to inject a "power loss" after the debit but before the credit. Then **Show accounts.json** to see the half-done transfer on disk.
+
+<PythonSandbox
+  client:visible
+  initialCode={`import json
+
+with open('accounts.json') as f:
+    accounts = json.load(f)
+
+print(f"before: {accounts}, total = {sum(accounts.values())}")
+
+CRASH_BETWEEN_WRITES = True  # set False to commit both legs
+
+# Leg 1: debit A
+accounts['A'] -= 50
+with open('accounts.json', 'w') as f:
+    json.dump(accounts, f)
+
+if CRASH_BETWEEN_WRITES:
+    raise RuntimeError("crash after debiting A, before crediting B")
+
+# Leg 2: credit B
+accounts['B'] += 50
+with open('accounts.json', 'w') as f:
+    json.dump(accounts, f)
+
+print(f"after:  {accounts}, total = {sum(accounts.values())}")
+`}
+  initialFiles={{ '/accounts.json': '{"A": 100, "B": 100}' }}
+  watchFiles={['/accounts.json']}
+/>
 
 Notice that this is a different problem from the race in Section 1. There's only one writer here. There's no concurrency. The invariant breaks because the logical operation — "transfer $50" — requires two separate physical writes, and if anything interrupts between them, the system ends up in a state that was never supposed to exist.
 
@@ -141,9 +418,20 @@ One more point on responsibility. The database enforces what you declare. If you
 
 Atomicity is the tool. Consistency is the property it protects.
 
----
+</Section>
 
-## The lie
+<Section
+  id="lie"
+  title="The lie"
+  quiz={{
+    question: "Your app calls write() and prints 'saved!'. Without fsync, what's true?",
+    options: [
+      { text: "The data is already on the disk; the kernel never delays writes." },
+      { text: "The bytes may still be sitting in the OS page cache, and a power loss can erase them.", correct: true },
+      { text: "The kernel will automatically retry the write later, so the data is always safe." },
+    ],
+  }}
+>
 
 You build a form. A user clicks Save. Your application calls `write(fd, "balance=200", 11)`. The syscall returns 11. You print "Your changes have been saved." to the screen.
 
@@ -151,7 +439,7 @@ Are you lying?
 
 Probably, a little. Here is the full story of where those 11 bytes go.
 
-**Step 1: Application buffer.** If you're using standard C-library I/O (`fopen` / `fwrite` / `fclose`), writes first land in a libc buffer in your process's address space. They don't even reach the kernel until you call `fflush()` or close the file descriptor. If your process is killed at this point, the bytes are gone.
+**Step 1: Application buffer.** Python's `open()` returns a buffered writer by default: when you call `f.write(...)`, the bytes first land in a userspace buffer inside your process. They don't reach the kernel until the buffer fills, until you call `f.flush()`, or until the file is closed. (The same is true at the C level for `fopen` / `fwrite` / `fclose` — Python is using libc under the hood.) If your process is killed at this point, the bytes are gone.
 
 **Step 2: Kernel page cache.** Once the write reaches the kernel (via the `write(2)` syscall), it lands in the *page cache* — a region of physical RAM managed by the kernel for filesystem I/O. The page cache is a write-back cache: the kernel marks the page "dirty" and returns control to your process immediately. The write is not on disk. It is in RAM, under the kernel's management. If power fails at this point, the bytes are gone.
 
@@ -167,7 +455,31 @@ Toggle "fsync after write" off, click `write("balance=200")`, then pull the plug
 
 Now toggle fsync on and repeat. The write call blocks until the kernel has confirmed that the data reached durable storage, and the crash leaves the disk consistent.
 
-The syscall that bridges the gap is `fsync(2)`. When you call `fsync(fd)`, the kernel flushes all dirty pages for that file descriptor to the device and waits for the device to confirm they've been written to non-volatile storage. The call returns only when it's safe to tell the user "your data is persisted."
+The sandbox below lets you watch the *first* layer of buffering — the one inside your Python process. After `f.write(...)`, the bytes are sitting in a `BufferedWriter` and the file on disk still has zero bytes. Only `f.flush()` pushes them out. In a real OS, `os.fsync(...)` would then push them from the kernel page cache to the device — Pyodide's in-memory filesystem can't simulate that step, but the call shape is identical to what you'd write in production code.
+
+<PythonSandbox
+  client:visible
+  initialCode={`import os
+
+with open('data.txt', 'w') as f:
+    f.write('balance=200')
+    print(f"after write(): on-disk size = {os.path.getsize('data.txt')} bytes")
+
+    f.flush()
+    print(f"after flush(): on-disk size = {os.path.getsize('data.txt')} bytes")
+
+    # On a real OS, the bytes are now in the kernel page cache.
+    # os.fsync() blocks until they reach the storage device.
+    os.fsync(f.fileno())
+    print("after fsync(): bytes have (notionally) reached the device")
+
+print(f"after close:  on-disk size = {os.path.getsize('data.txt')} bytes")
+`}
+  initialFiles={{ '/data.txt': '' }}
+  watchFiles={['/data.txt']}
+/>
+
+The syscall that bridges the gap is `fsync(2)`. When you call `fsync(fd)` — `os.fsync(f.fileno())` in Python, after a `f.flush()` — the kernel flushes all dirty pages for that file descriptor to the device and waits for the device to confirm they've been written to non-volatile storage. The call returns only when it's safe to tell the user "your data is persisted."
 
 <Callout type="warning" title="macOS lies a little differently">
   On macOS, `fsync(2)` only guarantees that data has been flushed from the kernel page cache to the storage device's internal cache. It does *not* issue a drive-level cache flush command. If the drive has a volatile write cache (which most consumer drives do), a power failure after `fsync()` but before the drive drains its cache can still lose data. To get true persistence on macOS, you need `fcntl(fd, F_FULLFSYNC)`, which issues the drive-level flush. PostgreSQL on macOS uses `F_FULLFSYNC` for this reason. SQLite does too.
@@ -181,9 +493,20 @@ The point is not to make you fear `fsync`. The point is that "persisted" is a co
 
 This is what *Durability* buys you. The gap between "acknowledged" and "persisted" is closed by someone paying `fsync`'s price at the right moment.
 
----
+</Section>
 
-## The contract
+<Section
+  id="contract"
+  title="The contract"
+  quiz={{
+    question: "ACID is most usefully understood as...",
+    options: [
+      { text: "A historical artefact from 1970s database research." },
+      { text: "The names of four specific failures a database prevents on your behalf.", correct: true },
+      { text: "A theorem about distributed systems." },
+    ],
+  }}
+>
 
 Look back at what you've watched.
 
@@ -220,9 +543,20 @@ Multiversion concurrency control — Chapter 8 — is the technique most modern 
 
 A database, then, is a machine for paying these costs on your behalf, in exchange for a precise set of guarantees. The rest of this book opens up the machine and shows you how it works: what data structures it uses, how those data structures enable the guarantees, and what the trade-offs are when you push the machine in different directions.
 
----
+</Section>
 
-## Do it yourself
+<Section
+  id="sandbox"
+  title="Do it yourself"
+  quiz={{
+    question: "What does wrapping the two UPDATEs in BEGIN/COMMIT actually guarantee?",
+    options: [
+      { text: "The transfer happens faster." },
+      { text: "No other reader observes the intermediate state where money has left A but hasn't arrived at B.", correct: true },
+      { text: "The database automatically backs up the data before applying the changes." },
+    ],
+  }}
+>
 
 The bank transfer is the canonical example because it makes the invariant-breaking tangible and the fix obvious. Let's run it.
 
@@ -270,9 +604,12 @@ SELECT * FROM accounts;
 
 The transaction aborts. The invariant — "no negative balances" — was declared to the database, and the database enforced it. Both `UPDATE` statements are rolled back together: A still has $100, B still has $100, total is still $200. That's ACID in one experiment: Atomicity (both or neither), Consistency (invariant enforced), Isolation (no other connection saw the broken state), Durability (if we'd committed, it would have been permanent).
 
----
+</Section>
 
-## What's next
+<Section
+  id="whats-next"
+  title="What's next"
+>
 
 ACID describes what a database *promises*. It doesn't describe how those promises are implemented, or what your data looks like at rest, or how the database finds a specific row among millions without scanning everything.
 
@@ -288,19 +625,59 @@ The remaining chapters — replication, distributed transactions, and the CAP tr
 
 The whole book is, in a sense, an answer to a question you've now earned the right to ask: you know why databases are necessary. Now: how do they work?
 
----
+</Section>
 
-## Footnotes
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
 
-<ol style={{ listStyle: 'none', padding: 0, marginTop: '2rem' }}>
+The references below are organised by what you might want next. The first three are the citations from this chapter. The rest is a curated path into the literature, ordered roughly by approachability — start at the top, descend as deep as you have appetite for.
+
+### Citations from this chapter
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
   <Footnote n={1}>
-    PostgreSQL documentation, "Reliability and the Write-Ahead Log."
-    [postgresql.org/docs/current/wal-intro.html](https://www.postgresql.org/docs/current/wal-intro.html)
+    PostgreSQL documentation — *"Reliability and the Write-Ahead Log."* The canonical primer on WAL written by the people who maintain it. [postgresql.org/docs/current/wal-intro.html](https://www.postgresql.org/docs/current/wal-intro.html)
   </Footnote>
   <Footnote n={2}>
-    Martin Kleppmann, *Designing Data-Intensive Applications*, chapter 7, "Transactions" — section on the multiple, conflicting meanings of "consistency."
+    Martin Kleppmann, *Designing Data-Intensive Applications*, Chapter 7 — *"Transactions."* See the section "The Meaning of Consistency" for the clearest exposition of the C-in-ACID vs C-in-CAP confusion in print.
   </Footnote>
   <Footnote n={3}>
-    Craig Ringer, "PostgreSQL's handling of fsync() errors is unsafe and risks data loss at least on XFS." LWN, April 2018. [lwn.net/Articles/752063/](https://lwn.net/Articles/752063/)
+    Craig Ringer, *"PostgreSQL's handling of fsync() errors is unsafe and risks data loss at least on XFS."* LWN, April 2018. The original "fsyncgate" report. [lwn.net/Articles/752063/](https://lwn.net/Articles/752063/)
   </Footnote>
 </ol>
+
+### Books to read next
+
+- **Designing Data-Intensive Applications** — Martin Kleppmann (O'Reilly, 2017). The modern survey. If you only read one more book about databases, read this one. Chapters 7 (transactions) and 8 (the trouble with distributed systems) are the direct follow-ons to this chapter.
+- **Database Internals** — Alex Petrov (O'Reilly, 2019). Where Kleppmann is breadth, Petrov is depth: storage engines, B-trees, LSM-trees, distributed consensus protocols, all in one book. Excellent companion to Chapters 3–9 of this book.
+- **Transaction Processing: Concepts and Techniques** — Jim Gray & Andreas Reuter (Morgan Kaufmann, 1992). 1100 pages, three decades old, still the bible. Heavy going but everything is in there — locking, recovery, distributed commit, the lot.
+- **Readings in Database Systems** ("The Red Book") — edited by Peter Bailis, Joseph Hellerstein, Michael Stonebraker (5th ed., 2015). A curated anthology of the most important database papers, each with a commentary on why it still matters today. Free online: [redbook.io](http://www.redbook.io/).
+
+### Foundational papers
+
+- **"Principles of Transaction-Oriented Database Recovery"** — Theo Härder & Andreas Reuter. *ACM Computing Surveys*, 1983. The paper that named ACID. Worth reading for the original framing alone — you'll notice the authors are working out the concepts in real time.
+- **"ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging"** — C. Mohan, Don Haderle, Bruce Lindsay, Hamid Pirahesh, Peter Schwarz. *ACM TODS*, 1992. The recovery algorithm every major relational database uses some variant of. The terminology in your favourite DB's recovery code probably came from here.
+- **"Architecture of a Database System"** — Joseph M. Hellerstein, Michael Stonebraker, James Hamilton. *Foundations and Trends in Databases*, 2007. A 140-page survey covering the entire architecture of a modern RDBMS. Free PDF on Hellerstein's website at Berkeley.
+- **"A Relational Model of Data for Large Shared Data Banks"** — E. F. Codd. *Communications of the ACM*, 1970. The paper that started the relational era. Twelve pages. Read it once; the prose has aged remarkably well.
+
+### Online courses & deep documentation
+
+- **CMU 15-445 / 15-721 — Intro & Advanced Database Systems**. Andy Pavlo's free graduate-level lectures, the closest thing to a top-tier graduate database course you can audit from anywhere. Videos on YouTube; slides and assignments at [15445.courses.cs.cmu.edu](https://15445.courses.cs.cmu.edu/).
+- **SQLite — "Atomic Commit in SQLite"** — [sqlite.org/atomiccommit.html](https://www.sqlite.org/atomiccommit.html). One of the clearest written explanations of how an actual storage engine achieves the A in ACID, by the people who implemented it. Read this and the "How SQLite Works" companion at [sqlite.org/about.html](https://www.sqlite.org/about.html).
+- **PostgreSQL Internals through Pictures** — Bruce Momjian's slide decks at [momjian.us/main/presentations/internals.html](https://momjian.us/main/presentations/internals.html). Visual deep-dives into how PostgreSQL works under the hood; useful if you find prose-only explanations of the buffer pool, MVCC, or WAL hard going.
+
+### Articles worth the click
+
+- **"On Disks and Durability"** — the TigerBeetle team's engineering blog posts on what `fsync` actually guarantees across operating systems and devices, motivated by their own correctness work on a transactional database. [tigerbeetle.com/blog](https://tigerbeetle.com/blog).
+- **Phil Eaton's database internals blog** at [notes.eatonphil.com](https://notes.eatonphil.com). Excellent applied posts on storage engines, WAL design, and "I built a small database to understand X" tutorials.
+- **"It's always TCP_NODELAY. Always."** — Marc Brooker, [brooker.co.za](https://brooker.co.za/blog/). Not specifically about databases, but the same flavour of "the abstraction was leaking and here's why" that runs through this chapter. Browse the index; many entries are gold.
+
+### A note on what you have just earned
+
+You finished a chapter that promised you'd come out understanding ACID viscerally, and the reading above is for when you're ready to go past visceral and into rigour. None of it is required. The next chapter assumes only what's in this one.
+
+</Section>
+
+</ChapterReader>
