@@ -7,7 +7,7 @@ O'Reilly-deep. Narrated like a story. Illustrated with 3Blue1Brown-style
 animations and live in-browser code sandboxes.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-2f6b3a.svg?style=flat-square)](./LICENSE)
-[![Status](https://img.shields.io/badge/status-chapter%2001%20published-1e4fa5.svg?style=flat-square)](#chapters)
+[![Status](https://img.shields.io/badge/status-chapters%2001%E2%80%9302%20published-1e4fa5.svg?style=flat-square)](#chapters)
 [![Made with Astro](https://img.shields.io/badge/Astro-6-BC52EE.svg?style=flat-square&logo=astro&logoColor=white)](https://astro.build)
 [![React 19](https://img.shields.io/badge/React-19-149ECA.svg?style=flat-square&logo=react&logoColor=white)](https://react.dev)
 [![Tailwind v4](https://img.shields.io/badge/Tailwind-v4-38BDF8.svg?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
@@ -68,7 +68,7 @@ Open <http://localhost:4321> and start with Chapter 01.
 | # | Title                          | Status | Highlights |
 |---|--------------------------------|--------|------------|
 | 01 | **Why Databases Are Special**  | ![Published](https://img.shields.io/badge/published-2f6b3a.svg?style=flat-square) | Races, torn writes, broken invariants, lying disks. Five interactive scenes + Python sandboxes. |
-| 02 | **The Transaction**            | ![Planned](https://img.shields.io/badge/planned-a16207.svg?style=flat-square) | ACID mechanically, write-ahead logging, crash recovery. |
+| 02 | **The Transaction**            | ![Published](https://img.shields.io/badge/published-2f6b3a.svg?style=flat-square) | The write-ahead log, the commit record, recovery — built by hand in Python in the browser. |
 | 03 | **Isolation Levels**           | ![Planned](https://img.shields.io/badge/planned-a16207.svg?style=flat-square) | Dirty reads through serializable, anomaly by anomaly. |
 | 04 | **Where Data Actually Lives**  | ![Planned](https://img.shields.io/badge/planned-a16207.svg?style=flat-square) | Pages, heaps, B-trees, indexes from first principles. |
 
