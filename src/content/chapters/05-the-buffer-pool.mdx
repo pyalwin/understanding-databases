@@ -1,0 +1,316 @@
+---
+title: The Buffer Pool
+chapterNumber: 5
+summary: "Every chapter so far has said \"read a page\" as if reading a page were free. It isn't — RAM and disk are a hundred thousand times apart. Build the buffer pool by hand in Python: frames, the page table, pinning, the dirty bit, then go deep on eviction — LRU, the scan that wrecks it, the clock Postgres actually uses, and LRU-K — and finish where the WAL meets the page."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import BufferPoolScene from '@/components/chapter-05/BufferPoolScene';
+import EvictionScene from '@/components/chapter-05/EvictionScene';
+import ScanThrashScene from '@/components/chapter-05/ScanThrashScene';
+import ClockScene from '@/components/chapter-05/ClockScene';
+import LRUKFigure from '@/components/chapter-05/LRUKFigure';
+import { POOL_SANDBOX, PINDIRTY_SANDBOX, WRITEBACK_SANDBOX } from '@/components/chapter-05/sandboxes';
+import { LRU_SANDBOX, SCANTHRASH_SANDBOX } from '@/components/chapter-05/eviction-sandboxes';
+import { CLOCK_SANDBOX } from '@/components/chapter-05/clock-sandbox';
+
+<ChapterReader chapterId="05-the-buffer-pool">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "The B-tree from Chapter 04 turns a lookup into three page reads. The same three reads, served entirely from the buffer pool instead of from an SSD, cost how much less — and why does that gap decide whether the buffer pool is worth building?",
+    options: [
+      { text: "Roughly a hundred to a thousand times less — about 100ns per page in RAM versus tens of microseconds from SSD. The whole point of the engine's speed is keeping those three pages resident, so the lookup never touches the disk at all.", correct: true },
+      { text: "About twice as fast, because RAM has roughly double the bandwidth of an SSD and the page count is unchanged." },
+      { text: "Nothing measurable — the B-tree already made the lookup O(log n), so where the pages live no longer matters.", },
+    ],
+  }}
+>
+
+At the end of Chapter 04 we pointed across the room at the buffer pool, said *that's where the WAL and the page finally sit at the same table*, and promised one sentence of follow-through: **we've pointed at it; next, we build it.** This is next.
+
+So let's collect the debt by naming the lie. Every chapter of this book has said "read a page" as if reading a page were a single, free, atomic thing. Chapter 04 counted the cost of a full scan in *pages read* — hundreds of them — and the cost of a B-tree lookup in pages read — three or four — and treated each of those reads as one identical unit, a flat tick on a counter. That was a useful fiction. It let us reason about access paths without drowning in hardware. But it was a fiction, and now the bill comes due, because the single most important fact about reading a page is the one we kept hidden: *where the page is when you read it.*
+
+Here are the numbers, and they are not close. A page already sitting in RAM is yours in about a hundred nanoseconds — a few cache misses and a pointer chase. The same page on a modern SSD is tens to a hundred microseconds away. On a spinning disk it's closer to ten milliseconds, because the platter has to physically rotate the right sector under the head. Line those up and the gap between RAM and disk is not a factor of two or ten. It's a factor of a hundred thousand. If a page in memory took one second to read, the same page from a spinning disk would take a day and a night.
+
+That ratio is the whole reason this chapter exists. No storage engine can afford to treat a RAM read and a disk read as the same operation, because they differ by five orders of magnitude, and a B-tree's beautiful "three page reads" is a catastrophe if all three come from cold disk and a triviality if all three come from memory. So the engine does the only sane thing: it keeps a pool of pages in RAM, pulls a page in the first time it's touched, and hangs on to it in case it's touched again. The disk holds the truth; memory holds the *working set*; and the entire game — the game this chapter is about — is deciding which pages get to stay in memory when there isn't room for all of them.
+
+That deciding-machine is the **buffer pool**. It's a cache, and like every cache it lives or dies on one question: when you have to throw something out to make room, what do you throw out? Get that wrong and you evict the page you're about to need, read it back from disk, and pay the hundred-thousand-fold penalty for nothing. Get it right and the hot pages — the top of every B-tree, the rows everyone is hammering — stay resident, and the disk only sees the genuinely cold ones.
+
+Here is the plan, and it is the by-now-familiar plan: you build the thing yourself, in Python, in your browser, and you feel each version's limits before you fix them. First the **pool** itself — a fixed array of frames and a page table, with the only two outcomes that matter, a hit and a miss. Then the two pieces of bookkeeping the naive pool forgets: **pinning** a page so it can't be evicted out from under you, and the **dirty bit** that marks a page you've changed. Then the heart of the chapter — **eviction** — where we build LRU, watch a single large scan demolish it, and climb through the clock algorithm (the one PostgreSQL actually runs) up to LRU-K. And we close where Chapter 04 said we would: the moment you evict a *modified* page, you have to write it back to disk, and you cannot do that safely without obeying the write-ahead log from Chapter 02. The log and the page, the same table at last.
+
+By the end you won't have read about a cache. You'll have written the one a database can't live without.
+
+</Section>
+
+<Section
+  id="the-pool"
+  title="The pool"
+  quiz={{
+    question: "A buffer pool of 4 frames currently holds pages {1, 2, 3} with frame 3 free. Its page table is {1:0, 2:1, 3:2}. A query requests page 2, then page 9. Using the model from the scene, what does each request cost?",
+    options: [
+      { text: "Page 2 is a hit — the page table has it, so it's returned from its frame with no disk read. Page 9 is a miss — not in the table, so read it from disk into the free frame and add the entry 9→3.", correct: true },
+      { text: "Both are hits, because the pool has free space and a pool with free space never misses." },
+      { text: "Page 2 is a miss and page 9 is a hit, because the pool serves the most recently inserted page fastest.", },
+    ],
+  }}
+>
+
+Start with the smallest version of the pool that is still a pool, and ask what it has to be made of.
+
+It needs somewhere to put pages. That's a fixed array of **frames** — slots in RAM, each exactly one page wide, each able to hold one page's worth of bytes copied up from disk. The array is fixed because memory is fixed: you decide up front how much RAM the pool gets, divide it by the page size, and that's how many frames you have. PostgreSQL calls this number `shared_buffers`; MySQL's InnoDB calls its version the buffer pool size. Pick 128 MB of 8 KB pages and you've got sixteen thousand frames. That count never changes while the server runs, and it is the entire reason eviction exists: the frames will fill, and then what?
+
+It also needs a way to *find* a page. Given a page number — page 8,675,309, say, the one the B-tree just told you to fetch — the pool has to answer "is that page resident, and if so, in which frame?" instantly, on every single request, because this is the hottest path in the whole engine. The answer is a hash map: the **page table**, mapping a page number to the index of the frame holding it, or to nothing at all if the page isn't resident. That's it. A fixed array of frames plus a hash map from page-number to frame. Everything else in this chapter is bookkeeping bolted onto those two structures.
+
+With those two pieces, a page request has exactly two outcomes, and the entire performance of the database rides on which one you get. You ask for page P. The pool looks in the page table. If P is there — a **hit** — it hands you the frame, and you never touch the disk; that's your hundred-nanosecond read. If P isn't there — a **miss** — the pool finds a free frame, issues a real disk read to pull P up into it, records P→frame in the page table, and *then* hands you the frame; that's your tens-of-microseconds read, or your ten-millisecond read, depending on what kind of disk is underneath. Hit or miss. Resident or not. The whole chapter is a fight to make that first outcome the common one.
+
+<BufferPoolScene client:visible />
+
+Figure 5.1 is the pool with nothing hidden. On the left, the frames; on the right, the page table. Request pages by number and watch: a hit flashes the frame green and the counters tick `hits`; a miss animates a read up from disk into a free frame, adds a row to the page table, and ticks `misses`. The running hit-rate is the one number that matters, so watch what drives it — request a handful of distinct pages and the misses pile up, then request the *same* pages again and they all turn into hits. That repetition is the only thing a cache can exploit. Drag the pool-size slider and you'll see the obvious: a bigger pool holds more pages, so more of your requests land as hits. The slider is the budget; the hit-rate is what the budget buys.
+
+The sandbox builds exactly that pool in about forty lines. A `BufferPool` has a `frames` list, a `page_table` dict, a `disk` dict standing in for the pages on disk, and a `get(page_no)` that returns a frame — counting a hit if the page was already in the table and a miss if it had to read it in. There's no eviction yet; the pool is sized large enough that there's always a free frame. Run it on a request stream with repeats and read the hit-rate off the bottom.
+
+<PythonSandbox client:only="react" initialCode={POOL_SANDBOX} />
+
+Notice what this *is*, because the name matters for the rest of the chapter. You've built a cache — specifically, the database's own page cache, living inside the database process. And if that phrase rings a bell, it should: the operating system already runs a page cache of its own. When any program reads a file, the kernel keeps recently-touched disk blocks in spare RAM and serves repeat reads from memory; we walked through exactly that machinery — the kernel's dirty pages, the writeback daemon, the gap between `write()` and the disk — back in Chapter 01.<Footnote n={6} /> So a fair question is: if the OS already caches pages, why does the database build a second cache on top of it, duplicating the work and often the data?
+
+Because the database knows things the OS cannot. The kernel sees an undifferentiated stream of block reads; it has no idea that *this* page is a B-tree root touched on every query while *that* one is a leaf touched once by a scan and never again. The database knows the difference, because it issued the reads and understands their meaning, so it can make far smarter keep-or-evict decisions than a general-purpose kernel guessing from access timing alone. And there's a second reason, the one this whole chapter is bending toward: the database has a **write-ahead log**, and it must coordinate what it evicts with what that log has made durable. The OS page cache has no log to answer to and no such constraint. We'll cash that out in §7. For now, hold onto the smaller truth the counters just proved: a hit and a miss differ by orders of magnitude, so the page table is the hottest path in the engine and keeping the right pages resident is the only game worth playing.<Footnote n={1} />
+
+</Section>
+
+<Section
+  id="pin-and-dirty"
+  title="Pin and dirty"
+  quiz={{
+    question: "A 4-frame pool needs to evict to make room. Frame 0 holds a page with pin_count 2; frame 1 holds a clean page with pin_count 0; frame 2 holds a dirty page with pin_count 0; frame 3 is empty. Which frames are eviction candidates, and what extra cost does evicting frame 2 carry that evicting frame 1 does not?",
+    options: [
+      { text: "Only frames 1 and 2 are candidates — frame 0 is pinned and must not be touched. Evicting frame 2 first requires writing its modified page back to disk, because it's dirty; frame 1 is clean and can simply be dropped.", correct: true },
+      { text: "Only frame 0 is a candidate, because a higher pin count means the page is most important to evict first." },
+      { text: "All occupied frames are candidates and all cost the same; the dirty bit only affects reads, not eviction.", },
+    ],
+  }}
+>
+
+The pool you just built has a quiet bug, and it's the kind that doesn't show up until two things happen at once. It will evict any page it likes, whenever it likes. That's fine when nobody's looking at the page. It is a disaster when somebody is.
+
+Picture a B-tree descent from Chapter 04, mid-flight. The engine has read the root, followed a separator down to an internal node, and is about to read the next pointer — when the pool, needing a frame for some unrelated request, evicts the very internal node the descent is standing on. Now the descent holds a frame index that points at a frame which has been refilled with a different page entirely. It reads garbage, or it reads the wrong page's bytes and follows a pointer into nonsense. The fix is a piece of bookkeeping called the **pin count**: while any code is actively using a frame, it `pin`s it — increments a counter — and when it's done, it `unpin`s it — decrements. A frame with a pin count above zero is *in use* and absolutely must not be evicted. Only frames pinned by nobody — pin count zero — are eviction candidates. Pinning is how a page says "hands off, I'm being read right now," and it's why the B-tree descent in Chapter 04 could trust that the node under its feet would still be there a microsecond later.
+
+The second piece of bookkeeping is the one Chapter 02 already named for us. When a transaction *modifies* a row, it modifies the row's bytes in the frame — in RAM, in the pool — not on disk. The page in the frame now says something different from the page on disk. That frame is **dirty**: it carries the only correct copy of that page, and the disk's copy is stale. You met this exact noun in Chapter 02, in the recovery vocabulary — *a dirty page in the buffer pool, the materialized state that the log knows how to reconstruct.* Back then it was a word in a sentence about recovery. Here it's a single bit hanging off a frame, and it has a concrete, expensive consequence: **a dirty frame cannot simply be dropped.** A clean frame holds a page identical to disk, so evicting it costs nothing — you just forget it and reuse the frame. But evict a dirty frame by forgetting it and you have thrown away the only up-to-date copy of that page; the modification is gone. So before a dirty frame can be evicted, its contents have to be *written back* to disk first. That write is the hidden cost of the dirty bit, and paying it correctly is the climax of this chapter — §7.
+
+<PythonSandbox client:only="react" initialCode={PINDIRTY_SANDBOX} />
+
+The sandbox bolts both onto the §1 pool: a `pin_count` and a `dirty` flag per frame, with `pin`, `unpin`, and `mark_dirty`. The interesting method is `evictable()` — the list of frames that are actually candidates. Pin a page, and watch it drop out of the candidate list; the descent that pinned it is safe. Unpin it, and it rejoins. Mark a page dirty and it stays a candidate — dirty doesn't mean unevictable — but it's now flagged as a page that will cost a disk *write* on its way out, not just a quiet drop.
+
+Figure 5.1 surfaces both, too: flip back to it and each frame now wears a pin badge and a dirty marker. Pin a frame and it locks; modify one and it goes dirty. The two bits don't change *which page* the policy would pick to evict — that's the next four sections — but they change which pages are *eligible* (only the unpinned ones) and how much an eviction *costs* (a clean victim is free to drop; a dirty victim owes a write). Hold both facts: eviction can only touch unpinned frames, and evicting a dirty one is never free. The eviction policy we build next gets to choose only among the unpinned frames, and it should prefer, all else equal, not to keep paying for dirty write-backs it could have avoided.
+
+</Section>
+
+<Section
+  id="eviction-lru"
+  title="Eviction: LRU"
+  quiz={{
+    question: "An LRU pool of 3 frames is hit with this access stream, where R is a B-tree root touched on every request: R, 1, R, 2, R, 3, R, 4. After the whole stream, is page R still resident — and why does that justify Chapter 04's claim that the hot top of a B-tree is 'almost always already in memory'?",
+    options: [
+      { text: "R is still resident. It's touched on every request, so it's the most-recently-used page every time and LRU's victim is always one of the cold leaf pages instead. A page that's used constantly sits permanently at the front of the recency order and never reaches the evictable end.", correct: true },
+      { text: "R was evicted, because it's the oldest page in the pool — it was inserted first, and LRU evicts the page that has been resident longest.", },
+      { text: "R was evicted once per cycle and re-read each time, so it thrashes in and out and the hit rate on R is near zero.", },
+    ],
+  }}
+>
+
+Now the pool fills, and the chapter turns. Up to here we've leaned on a free frame always being available. The moment the pool is full and a miss arrives, that crutch is gone: to read the new page in, you must first throw a resident page *out*. Which one? That single decision — the **eviction policy** — is the center of gravity of the entire buffer pool, because it's the difference between a cache that keeps your hot pages and a cache that keeps throwing them away. This is the hero of the chapter, and we'll spend the next four sections on it.
+
+The classic answer, and the right default, is **LRU**: evict the **least-recently-used** unpinned frame. The bet is *temporal locality* — the observation, true of almost every real workload, that a page touched recently is likely to be touched again soon, and a page nobody has touched in a long while probably won't be missed. So LRU keeps the recently-used pages and sacrifices the stale ones. To make that choice it needs to know, at eviction time, which resident page has gone longest without a touch — so it maintains a recency order: every time a page is accessed, it moves to the *most-recently-used* end; the page sitting at the *least-recently-used* end is the next victim.
+
+<EvictionScene client:visible />
+
+Figure 5.2 lays that recency order out as a lane, most-recently-used at one end, least at the other. Request pages and watch each touched page jump to the most-recently-used end. When the pool is full and a miss arrives, the scene highlights the page stranded at the least-recently-used end, evicts it — animating a write-back first if it happens to be dirty — and installs the new page at the most-recently-used end. The counters track hits, misses, and evictions. Run a workload whose hot set is smaller than the pool and you'll watch the hit-rate climb and hold: once the hot pages are in, they keep getting touched, keep jumping to the front, and never drift down to the evictable end. LRU is *keeping your working set*, which is exactly what you wanted.
+
+And now do the thing the quiz asks, because it closes a loop we opened a chapter ago. Set one page to be touched on *every* request — call it R, the root of the B-tree — and scatter cold pages around it. Watch R. It never moves toward the evictable end, because every single request shoves it straight back to most-recently-used; the victim is always one of the cold pages instead. R is *pinned in place by its own popularity*. This is the precise mechanism behind the promise Chapter 04 made in its fan-out callout: the top of the tree is "small, hot, and almost always already in memory." Now you can see *why*. The B-tree root is read on every lookup in the entire database; under any sane recency policy it is permanently the most-recently-used page, so it is the last thing that could ever be evicted. The second level of the tree — a few hundred pages touched on nearly every lookup — sits just behind it, also effectively immune. The disk reads you actually pay for are the cold leaves at the bottom. The "three page reads" of a B-tree lookup is really "two from RAM, one from disk," and the buffer pool running LRU is the thing making that true.
+
+<PythonSandbox client:only="react" initialCode={LRU_SANDBOX} />
+
+The sandbox makes the policy concrete: it extends the §2 pool with recency tracking and an `evict()` that picks the least-recently-used *unpinned* frame, writing it back first if it's dirty. Run the hot-set workload and read the hit-rate; it's high, because the hot pages keep refreshing their recency and the evictions all land on cold pages. While you're here, notice the cost model the code is quietly counting, because it's the model the rest of the chapter argues about. A miss into a pool with a free frame costs one disk read. A miss into a full pool whose victim is *clean* still costs one disk read — drop the victim, read the new page. But a miss whose victim is *dirty* costs **two** disk operations: one write to flush the victim, then one read to bring the new page in. Eviction isn't free, and evicting dirty pages is twice as expensive as evicting clean ones — a fact that will matter enormously in §7.
+
+LRU is a genuinely good default. It captures temporal locality, it keeps hot pages like the B-tree root resident automatically, and most of the time it is exactly the policy you want. Which is why the next section is so unsettling: there's a workload — an extremely common one — where this good, sensible policy does precisely the wrong thing, and throws your entire hot working set on the floor.
+
+</Section>
+
+<Section
+  id="lru-breaks"
+  title="When LRU breaks"
+  quiz={{
+    question: "A 100-frame LRU pool is holding a hot working set of 90 pages at a 95% hit rate. A reporting query then runs a single sequential scan over a 10,000-page table — each page read exactly once. Right after the scan finishes, what is the hit rate on the original hot set, and what's the name for what happened?",
+    options: [
+      { text: "It collapses toward zero — the scan's 10,000 one-shot pages each entered as most-recently-used and evicted a hot page, so by the end the hot set has been flushed out of the pool entirely. This is sequential flooding.", correct: true },
+      { text: "It's unchanged at 95%, because LRU recognises the scan pages are used only once and refuses to cache them.", },
+      { text: "It rises above 95%, because the scan warms the pool with more pages and a fuller pool always hits more often.", },
+    ],
+  }}
+>
+
+Here's the workload that breaks it, and the cruel part is that LRU breaks by following its own rule perfectly.
+
+A **sequential scan** — the Chapter 04 full-table scan, the thing a reporting query or an unindexed `WHERE` does — reads every page of a big table exactly once, start to finish. Now feed that scan through LRU. Each page the scan reads is a miss, so it comes into the pool installed at the most-recently-used end — because it was, just now, the most recently used. To make room, LRU evicts the page at the least-recently-used end. But your hot working set — the B-tree roots, the popular rows, everything the OLTP traffic actually needs — hasn't been touched since the scan started, so it's drifting toward the cold end. One scan page at a time, the scan's single-use pages march in at the front and shove your hot pages out the back. By the time the scan finishes, the pool is full of table pages that will *never be read again*, and every genuinely hot page is gone. The next ordinary lookup misses. And the next. The hit rate doesn't dip; it falls off a cliff.
+
+This has a name: **sequential flooding**, or cache pollution. And LRU did nothing wrong by its own logic — every one of those scan pages genuinely *was* the most-recently-used page at the moment it arrived. That's the whole problem. LRU judges a page by a single fact: when was it last touched? It cannot tell the difference between a page touched once by a scan that will never want it again and a page touched once a moment ago that's about to be touched a thousand more times. To LRU they look identical, so the one-shot scan page gets exactly the same protection as your hottest row, and worse, it gets that protection *at your hottest row's expense.*
+
+<ScanThrashScene client:visible />
+
+Figure 5.3 makes the collapse visceral. It starts with a hot set sitting comfortably in the pool at a high hit rate — green, stable, happy. Then you launch a sequential scan larger than the pool and watch it bulldoze: frame by frame, the hot pages get overwritten by scan pages, and the hit-rate readout — the focal point of the whole scene — drains toward zero as it goes. There's a before/after on the hot set's hit rate so the damage is a number, not a vibe. Flip the toggle to compare against a scan-resistant policy and watch the hot set *survive* the same scan — a preview of the two fixes the next sections build.
+
+<PythonSandbox client:only="react" initialCode={SCANTHRASH_SANDBOX} />
+
+The sandbox turns the collapse into a measurement you can't argue with. It warms a hot set in an LRU pool, measures the hit rate, runs a scan bigger than the pool, and measures again. The first number is high; the second is on the floor. That delta is sequential flooding, in a value you can read off the screen — the same move Chapter 04 used to make the full scan's O(n) undeniable.
+
+This is not a contrived corner case; it is a Tuesday. One analytics query, one nightly report, one unindexed lookup over a big table, and an OLTP system's carefully-warmed cache is gone — throughput craters not because the scan was slow but because the scan *poisoned the cache for everyone else.* Real engines defend against exactly this, and the next two sections build the machinery — but it takes two distinct moves, because raw recency, however it's tracked, isn't the cure. First, eviction has to be cheap enough to run at all at the scale of millions of touches a second: that's the **clock** algorithm, §5, an O(1) approximation of LRU. Plain clock won't *fix* scan flooding — it makes the same recency bet LRU does — but its usage-counter variant (the one PostgreSQL ships) starts to resist scans by demanding a page be touched repeatedly before it sticks. Then §6 attacks the root misjudgment head-on, by refusing to let a single touch promote a page over a genuinely hot one — **LRU-K**, the frequency fix. PostgreSQL, worth noting, also takes a blunter and very effective precaution: it runs large sequential scans through a small **ring buffer** — a few hundred kilobytes of frames the scan recycles among itself — so a big scan can't reach into `shared_buffers` and trash the shared working set at all. Recency alone, it turns out, is not enough. You have to know the difference between *recent* and *valuable*.
+
+</Section>
+
+<Section
+  id="the-clock"
+  title="The clock"
+  quiz={{
+    question: "A clock pool has frames in a circle with reference bits, and the hand is about to sweep. The frames in hand order read: [ref=1], [ref=1], [ref=0], [ref=1]. Using the second-chance rule, which frame gets evicted, and what state are the reference bits in when the hand stops?",
+    options: [
+      { text: "The third frame (ref=0) is evicted. The hand clears the first two set bits to 0 as it passes them — giving those pages a second chance — and stops at the first frame it finds already cleared. The fourth frame is never reached.", correct: true },
+      { text: "The first frame is evicted, because the hand always evicts the first frame it lands on regardless of its reference bit.", },
+      { text: "The fourth frame (ref=1) is evicted, because the hand sweeps to the end and takes the last set bit.", },
+    ],
+  }}
+>
+
+LRU has a second problem, quieter than scan flooding but just as disqualifying at scale: it's *expensive to maintain*. True LRU has to move a page to the front of the recency order on **every single access** — not just on misses, on *hits too*, which are the common case. At a few million page touches per second, that's a few million reorderings per second of some shared, concurrently-accessed data structure, each one needing a lock or a clever lock-free dance. The bookkeeping to track perfect recency can cost more than the cache misses it saves. So production engines almost never run true LRU. They run a cheap approximation of it, and the canonical one is the **clock**, also called **second-chance**.
+
+The trick is to replace the precise recency order with a single bit per frame. Arrange the frames in a circle. Each frame has a **reference bit**. When a page is accessed, you don't reorder anything — you just set its reference bit to 1, which is one cheap write and nothing else; that's what makes it O(1) on the hot path. A **hand** points at one frame, like a clock hand, and it only moves when you need to evict. To evict, the hand sweeps forward: at each frame it looks at the reference bit. If the bit is 1, the page has been touched since the hand last came by, so it earns a **second chance** — the hand clears the bit to 0 and moves on without evicting. If the bit is already 0, the page hasn't been touched in a full sweep around the circle, so it's the victim: evict it, install the new page there, and leave the hand pointing just past it for next time.
+
+Sit with why this approximates LRU. A page that's touched often keeps getting its reference bit re-set to 1, so every time the hand reaches it the bit is set, the page gets another second chance, and it survives — exactly the behaviour you want for a hot page like the B-tree root. A page touched once and then ignored has its bit cleared on the hand's first pass and gets evicted on the second pass. So "recently touched" pages survive and "not touched in a while" pages die, which is LRU's bet — but achieved with one bit per frame and zero work on a hit beyond flipping that bit. It's not *exactly* LRU; the hand evicts in circular position order, not strict recency order, so the precise victim can differ. But it's close enough, and it's cheap enough, that it wins.
+
+<ClockScene client:visible />
+
+Figure 5.4 is the clock turning. Frames sit in a ring with their reference bits showing and the hand parked somewhere on the circle. Request pages and watch their reference bits light to 1 with no reordering. Then trigger an eviction and watch the hand sweep: it clears set bits to 0 as it passes — each a second chance spent — and stops dead at the first frame whose bit is already 0, evicting that one. Keep one page hot by requesting it repeatedly and you'll see its bit re-set faster than the hand can clear it; it never dies. A counter alongside compares the clock's behaviour to LRU's on the same trace, so you can see how closely the cheap approximation tracks the expensive ideal.
+
+<PythonSandbox client:only="react" initialCode={CLOCK_SANDBOX} />
+
+The sandbox is a real `ClockPool`: a circular list of frames, a `ref` bit per frame, a `hand` index, and an `evict()` that runs the sweep — clear-and-advance on a set bit, stop-and-evict on a clear one. Run it on the §4 scan workload and compare, and be honest about the result: on hit rate, the single-bit clock *ties* true LRU. It's making the same recency bet, so it keeps and evicts the same pages and the numbers come out equal. What the clock buys you is not a better hit rate — it's the *same* hit rate at O(1) per access, instead of LRU's reorder-on-every-touch. And it doesn't *cure* scan flooding either: a scan still floods the ring with one-shot pages, and a long enough scan still evicts your hot pages. The real scan resistance has to come from somewhere else — the usage *counter* just below, and the change of question in §6.
+
+<Callout type="note" title="This is what PostgreSQL actually runs">
+PostgreSQL's buffer manager evicts with a clock-sweep over `shared_buffers` — the exact algorithm in this section, with one generalisation. Instead of a single reference *bit*, each buffer carries a small **usage counter** (0–5). An access increments the counter; the sweeping hand *decrements* it instead of clearing it, and only evicts a buffer when its counter has been ticked all the way down to zero. So a page has to survive several sweeps' worth of neglect before it's evicted, and very hot pages — which keep getting their counter bumped back up — are extremely sticky. It's the second-chance idea with a dial instead of a switch: more chances for pages that have earned them.<Footnote n={4} />
+</Callout>
+
+The clock is the practical shape of the policy — the cheap approximation, not the textbook ideal, because at a million touches a second the cheap approximation is the only one you can afford. But it still inherits LRU's fundamental blind spot: it judges a page by whether it was touched *recently*, with no memory of whether it's been touched *before*. A scan page and a hot page both arrive with a freshly-set bit. To finally tell those apart, you need to stop counting only the last touch — and start counting the touch before it.
+
+</Section>
+
+<Section
+  id="lru-k"
+  title="Smarter: LRU-K"
+  quiz={{
+    question: "Under LRU-2, a page's priority is the time of its 2nd-most-recent access. A scan touches page X exactly once. A hot page Y has been accessed many times, most recently a moment before X's single touch — so X's last touch is more recent than Y's. Which page does LRU-2 evict first, and why is that the opposite of what plain LRU would do?",
+    options: [
+      { text: "LRU-2 evicts X. X has no 2nd-most-recent access at all, so it ranks as infinitely old and is evicted ahead of Y, which has a real access history. Plain LRU would keep X — its single touch is the most recent — and evict the genuinely hot Y instead.", correct: true },
+      { text: "LRU-2 evicts Y, because Y has been in the pool longer and accumulated more accesses, making it the stale one.", },
+      { text: "LRU-2 keeps both and evicts a third page, because a page with any access in the last K requests is never a candidate.", },
+    ],
+  }}
+>
+
+Name the blind spot precisely, because the fix falls right out of it. Plain LRU, and the clock that approximates it, judge a page by its **single most-recent access**. That's one number, one timestamp, and it cannot distinguish a page touched once from a page touched ten thousand times — only *when* it was last touched. So a scan's one-shot page, freshly touched, looks every bit as worthy as a genuinely hot page that was touched a moment earlier. Recency is all LRU sees, and recency is exactly the axis a sequential scan saturates.
+
+The fix, from a 1993 paper by O'Neil, O'Neil, and Weikum, is almost insultingly simple once you see it: instead of remembering a page's *last* access, remember its **K-th-most-recent** access, and judge the page by *that*. The popular choice is K=2 — **LRU-2** — so each page is ranked by the time of its **second**-most-recent touch.<Footnote n={2} /> Watch what this does to the scan page. A page the scan touched exactly once has a most-recent access, sure — but it has *no second-most-recent access at all*. Its K-th-most-recent access is infinitely far in the past, so LRU-2 ranks it as the oldest, coldest thing in the pool and evicts it first — ahead of any page that has been touched even twice. The single touch that fooled plain LRU is precisely the signal LRU-2 uses to throw the page out. Meanwhile a genuinely hot page, with a long history of accesses, has a very recent second-most-recent touch and stays comfortably resident.
+
+What LRU-2 has really done is fold **frequency** into a policy that used to see only **recency**. "Has this page been accessed more than once recently?" is a frequency question, and the second-most-recent timestamp answers it in a single comparable number. A page needs a *history* to be protected, not just a moment in the spotlight — so one touch from a scan can never again promote a page over a row the workload actually uses. That is scan resistance, and it comes from counting accesses, not just timing the last one.
+
+<LRUKFigure client:visible />
+
+Figure 5.5 puts the two pages side by side with their access histories drawn as timelines. One page was scanned once — a single tick, recent, and nothing before it. The other was accessed repeatedly — a row of ticks trailing back in time. The figure highlights the one mark that decides everything: the **second-most-recent** access. For the scanned page there isn't one, so it's marked as infinitely old; for the hot page it's right there and recent. Toggle between LRU-1 (plain) and LRU-2 and watch the verdict flip: LRU-1, looking only at the single most-recent tick, keeps the scanned page (its one touch is more recent) and would evict the hot one; LRU-2, looking at the second tick, correctly evicts the scanned page and protects the hot one. Same two pages, opposite decisions — and the whole difference is one extra timestamp.
+
+Keep this honest about where it lands in practice. Real engines rarely implement literal LRU-K with its full per-page access history — maintaining K timestamps for every page and a priority queue over them has its own overhead. What they ship instead are relatives that capture the same principle more cheaply: MySQL's InnoDB splits its buffer-pool LRU list into a **young** and an **old** sublist and inserts newly-read pages at the *midpoint*, so a page swept in by a scan and never re-touched ages out of the old sublist without ever polluting the young one. Others use **segmented LRU**, or **ARC** — Adaptive Replacement Cache — which balances a recency list and a frequency list and tunes the split between them automatically as the workload shifts.<Footnote n={3} /> The implementations differ, but the idea underneath them all is the one LRU-2 makes cleanest: *don't let a single touch promote a page.* Demand a history. That's where scan resistance lives.
+
+</Section>
+
+<Section
+  id="dirty-writeback"
+  title="Dirty pages and the write-ahead rule"
+  quiz={{
+    question: "The buffer pool is about to evict a dirty page whose last modification is recorded in the WAL at LSN 42. The log has been fsync'd through LSN 30. Under the write-ahead rule, what must happen before the page is written to disk — and what disaster does the rule prevent?",
+    options: [
+      { text: "The WAL must be flushed through at least LSN 42 before the page is written. Otherwise a crash mid-write could leave a torn page on disk with no durable log records to repair it — the page's own changes were never logged durably, so recovery has nothing to redo from.", correct: true },
+      { text: "Nothing extra is needed — the page can be written immediately, and the WAL will be flushed lazily afterward whenever the next checkpoint runs.", },
+      { text: "The page must be discarded rather than written, because a dirty page whose LSN exceeds the durable LSN can never be safely persisted.", },
+    ],
+  }}
+>
+
+Everything in this chapter has been building to one moment, and Chapter 04 told you its name in advance: the room where the log and the page sit down at the same table. Here it is.
+
+Start from the cost we flagged in §2 and §3 and then walked past. Evicting a *clean* page is free — drop it, the disk already has it. Evicting a **dirty** page is not: its frame holds the only current copy, so before the frame can be reused, that page has to be **written back** to disk. If every eviction of a hot, frequently-dirtied page had to stop and wait for a synchronous disk write, eviction would be agonizingly slow. So engines run a **background writer** (PostgreSQL's `bgwriter`, and the checkpointer alongside it): a process that wanders the pool ahead of demand, proactively flushing dirty pages to disk so that by the time a frame is actually needed for eviction, it's already clean and can be dropped instantly. The background writer's job is to make sure the eviction path rarely has to block on a write. That's the easy half.
+
+The hard half is that **you cannot write a dirty data page to disk whenever you feel like it.** Here's the trap. Writing a page to disk is not atomic — we proved that in Chapter 01 with the torn write, where a crash mid-write leaves a page with some new bytes and some old bytes, valid as neither. The only thing in the entire system that can repair a torn page is the **write-ahead log** from Chapter 02: the log holds the records describing every change made to that page, so recovery can take the torn page and *redo* those changes to reconstruct the correct version. But — and this is the whole point — that repair only works if the log records are *already on disk* when the crash happens. If you wrote the dirty page to disk before its log records were durable, and the crash tears the page, recovery opens the log to fix it and finds… nothing. The records describing the page's changes were still sitting in memory when the power died. The page is torn and unrepairable. The modification, and possibly the page, are lost.
+
+So the buffer pool obeys an iron rule, the **write-ahead rule**, the literal meaning of "write-ahead log": *a dirty page's log records must be durable on disk before the dirty page itself is written to disk.* Log ahead of page, always. Every dirty frame remembers the **LSN** — log sequence number, Chapter 02's monotonic stamp on each log record — of its most recent modification. Before the pool writes that frame to disk, it forces the log to be flushed (fsync'd) through at least that LSN. Only then may the page go down. The log always reaches disk first, so whatever state a crash leaves the data pages in, the log is guaranteed to be at least as far along — and recovery always has the records it needs to redo. This is the exact image Chapter 04 promised: **Chapter 02's WAL and Chapter 04's pages, finally at the same table, with the buffer pool enforcing the seating.**
+
+<PythonSandbox client:only="react" initialCode={WRITEBACK_SANDBOX} />
+
+The sandbox makes the rule and its violation concrete. The pool's frames carry the LSN of their last modification; `write_back` can either honor the rule — calling `wal.flush_through(lsn)` to make the log durable through the page's LSN *before* writing the page — or skip it. Run it once with the rule off: the page hits disk, the machine "crashes" before the log was ever flushed, and recovery finds a torn page with no durable log records to fix it — **unrecoverable**. Run it once with the rule on: `flush_through` fires first, so even though the crash lands at the same instant, the log records are safe and recovery can redo the change — **recoverable**. Same crash, same instant; the only difference is the order of two disk writes, and that order is the whole ballgame.
+
+<Callout type="warning" title="Steal and no-force">
+The write-ahead rule is what licenses the two policies real engines actually want. **Steal**: the pool is allowed to evict (and thus write to disk) a page modified by a transaction that *hasn't committed yet* — it can "steal" the frame — which is only safe because the WAL also records enough to *undo* that change if the transaction later aborts. **No-force**: a transaction is allowed to commit *without* forcing all its dirty pages to disk first — the pages can be written back lazily later — which is only safe because the WAL records enough to *redo* those changes if a crash beats the write-back. Steal needs undo; no-force needs redo; both need the write-ahead rule. It's the combination that lets the buffer pool manage memory on its own schedule instead of the transactions' — and it's why the WAL isn't optional.
+</Callout>
+
+Two honest boundaries before we move on. First, the forward reference: the write-ahead rule is the *connection* between log and page, but the full machinery that exploits it — the **dirty page table** that tracks which pages need redo, the **checkpoints** that periodically bound how far back recovery must replay, and the complete crash-recovery algorithm (ARIES, analysis-redo-undo) — is **Chapter 10**. We're laying the one rule everything there stands on; we are not building recovery here. Second, the contrast that explains this whole chapter's existence: remember the OS page cache from §1, the one that also holds dirty pages and flushes them lazily? It has no write-ahead log to answer to. It writes its dirty pages back in whatever order is convenient, because if the machine crashes mid-write, the OS simply doesn't promise your file is intact — that was the entire lesson of Chapter 01. The database makes a stronger promise, and the write-ahead rule is the price of it. *That* is why a database builds its own page cache instead of trusting the kernel's: not for speed, but because its cache has to obey the log, and the kernel's cache has never heard of the log. The buffer pool isn't just a cache. It's a cache that takes orders from the WAL.<Footnote n={5} />
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+Look at what the engine can do now. Chapter 04 gave it the structures to find any row's page — heaps, B-trees, indexes — and turn "read the whole table" into "read three pages." This chapter gave it the buffer pool, so those three pages are usually already in memory, and the ones that aren't come in once and stay for as long as they're useful, evicted by a policy that knows the difference between a hot row and a one-shot scan. The engine can fetch any page, fast. The disk is no longer the bottleneck it was on page one of Chapter 04.
+
+But notice the question we've quietly been *assuming* an answer to this whole time. Every example fetched a page we already knew we wanted — *this* B-tree root, *that* leaf, the pages of *this* scan. We never asked the prior question: faced with an actual SQL query — a `SELECT` with a `WHERE` and a `JOIN` and an `ORDER BY` — *which* pages should the engine read, and in what order? Should it scan the heap or descend an index? If two indexes apply, which one? When it joins two tables, which does it read first, and does it build a hash table or sort both sides? The buffer pool will happily and quickly serve whatever pages it's asked for. It has no opinion about which pages are the right ones to ask for. That opinion — turning a declarative query into a concrete plan of page accesses, and choosing the cheapest plan among thousands — is a whole engine of its own.
+
+> We can fetch any page fast now. We still have no idea which pages a query *should* touch. That's the next chapter.
+
+That's the **query planner and executor**, and it's **Chapter 06**. It's where the SQL you write stops being a wish and becomes a sequence of the exact page reads this chapter just made cheap.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Six places to go deeper, each with a line on why it earns the detour. The first four are the load-bearing references for the algorithms in this chapter; the last two are the wider map.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Wolfgang Effelsberg &amp; Theo Härder, 1984 — "Principles of Database Buffer Management" (ACM TODS).</strong> The foundational paper on database buffer pools: frames, the page table, pinning, replacement strategy, and the argument for why a database manages its own buffers instead of trusting the operating system. Everything in §1–§3 traces back here.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Elizabeth O'Neil, Patrick O'Neil &amp; Gerhard Weikum, 1993 — "The LRU-K Page Replacement Algorithm for Database Disk Buffering" (SIGMOD).</strong> The §6 idea from the source: judge a page by its <em>K</em>-th-most-recent reference, not its last, and scan resistance falls out for free. Short, sharp, and still the cleanest statement of the principle.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Nimrod Megiddo &amp; Dharmendra Modha, 2003 — "ARC: A Self-Tuning, Low Overhead Replacement Cache" (USENIX FAST).</strong> A modern scan-resistant policy that balances recency and frequency and tunes the split between them automatically, with no magic parameters to set. The natural next read once LRU-K has convinced you frequency belongs in the policy.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>PostgreSQL source &amp; documentation — the buffer manager and clock-sweep.</strong> The README at <a href="https://github.com/postgres/postgres/blob/master/src/backend/storage/buffer/README">src/backend/storage/buffer/README</a> and the <a href="https://www.postgresql.org/docs/current/runtime-config-resource.html">shared_buffers</a> docs. The §5 clock algorithm exactly as a production engine ships it, with the usage counter that generalises the single reference bit into a dial.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Hellerstein, Stonebraker &amp; Hamilton, 2007 — "Architecture of a Database System," §4 (Buffer Management).</strong> Where the buffer pool sits relative to the access methods below it and the WAL beside it — the same engine-wide map this book has been drawing chapter by chapter, in one authoritative survey.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 3 ("Storage and Retrieval").</strong> The OS-page-cache-versus-database-buffer-pool framing from §1 and §7, plus the operational consequences of replacement policy, set one notch above this book's altitude. The natural companion read.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
