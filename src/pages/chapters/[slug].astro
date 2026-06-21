@@ -14,12 +14,12 @@ const num = String(entry.data.chapterNumber).padStart(2, '0');
 
 <Layout title={entry.data.title}>
   <article class="page-column px-6 pt-12 pb-24">
-    <header class="prose-column mb-12 text-center">
-      <p class="font-sans text-xs tracking-[0.18em] uppercase text-[color:var(--color-accent)] mb-3">
+    <header class="prose-column mb-10 sm:mb-12 text-center">
+      <p class="font-sans text-[11px] sm:text-xs tracking-[0.18em] uppercase text-[color:var(--color-accent)] mb-3">
         Chapter {num}
       </p>
-      <h1 class="text-[44px] font-semibold leading-[1.05] mb-4">{entry.data.title}</h1>
-      <p class="text-[color:var(--color-ink-soft)] text-[18px] leading-relaxed italic">
+      <h1 class="text-[30px] sm:text-[38px] lg:text-[44px] font-semibold leading-[1.1] sm:leading-[1.05] mb-4">{entry.data.title}</h1>
+      <p class="text-[color:var(--color-ink-soft)] text-[16px] sm:text-[18px] leading-relaxed italic">
         {entry.data.summary}
       </p>
     </header>

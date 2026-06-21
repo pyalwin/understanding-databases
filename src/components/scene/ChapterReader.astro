@@ -11,10 +11,22 @@ const { chapterId } = Astro.props;
     class="sticky top-0 z-30 -mx-6 mb-10 border-b border-[color:var(--color-rule)] px-6 py-3 backdrop-blur"
     style="background: color-mix(in srgb, var(--color-page) 95%, transparent);"
   >
-    <div class="page-column flex items-center gap-4">
+    <div class="page-column flex items-center gap-3 sm:gap-4">
+      <button
+        type="button"
+        data-toc-toggle
+        class="lg:hidden flex-shrink-0 -ml-1 p-1.5 rounded-md text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)] hover:bg-[color:var(--color-rule)]/50 transition-colors"
+        aria-label="Open table of contents"
+      >
+        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+          <line x1="3" y1="5" x2="15" y2="5" />
+          <line x1="3" y1="9" x2="15" y2="9" />
+          <line x1="3" y1="13" x2="15" y2="13" />
+        </svg>
+      </button>
       <div class="font-sans text-[11px] text-[color:var(--color-ink-soft)] tabular-nums whitespace-nowrap font-medium">
         <span class="text-[color:var(--color-accent)] font-semibold" data-progress-count>0</span>
-        <span class="opacity-50"> / <span data-progress-total>0</span> checkpoints</span>
+        <span class="opacity-50"> / <span data-progress-total>0</span><span class="hidden sm:inline"> checkpoints</span></span>
       </div>
       <div class="flex-1 h-1.5 bg-[color:var(--color-rule)] rounded-full overflow-hidden">
         <div
@@ -29,6 +41,40 @@ const { chapterId } = Astro.props;
         data-progress-pct
       >0%</div>
     </div>
+  </div>
+
+  {/* Mobile TOC drawer */}
+  <div
+    class="fixed inset-0 z-40 lg:hidden"
+    style="display: none;"
+    data-toc-drawer
+  >
+    <div
+      class="absolute inset-0 bg-black/30 backdrop-blur-sm"
+      data-toc-backdrop
+    ></div>
+    <aside
+      class="absolute right-0 top-0 bottom-0 w-[82%] max-w-[320px] shadow-2xl overflow-y-auto"
+      style="background: var(--color-page); border-left: 1px solid var(--color-rule);"
+    >
+      <div class="flex items-center justify-between px-5 py-4 border-b border-[color:var(--color-rule)]">
+        <div class="font-sans text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-soft)] font-semibold">
+          Checkpoints
+        </div>
+        <button
+          type="button"
+          data-toc-close
+          class="-mr-1 p-1.5 rounded-md text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)]"
+          aria-label="Close table of contents"
+        >
+          <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+            <line x1="4" y1="4" x2="14" y2="14" />
+            <line x1="14" y1="4" x2="4" y2="14" />
+          </svg>
+        </button>
+      </div>
+      <ol class="p-4 space-y-1.5" data-reader-toc-mobile></ol>
+    </aside>
   </div>
 
   <div class="flex gap-12 items-start">
@@ -180,11 +226,24 @@ const { chapterId } = Astro.props;
 
     const $ = <T extends Element = HTMLElement>(sel: string) => shell.querySelector<T>(sel);
 
-    /* Sidebar TOC */
+    /* TOC (rendered into both the desktop sidebar and the mobile drawer) */
     const tocList = $<HTMLOListElement>('[data-reader-toc]');
-    const renderTOC = () => {
-      if (!tocList) return;
-      tocList.innerHTML = '';
+    const tocListMobile = $<HTMLOListElement>('[data-reader-toc-mobile]');
+    const tocDrawer = $<HTMLDivElement>('[data-toc-drawer]');
+    const tocToggle = $<HTMLButtonElement>('[data-toc-toggle]');
+    const tocClose = $<HTMLButtonElement>('[data-toc-close]');
+    const tocBackdrop = $<HTMLDivElement>('[data-toc-backdrop]');
+
+    const openDrawer = () => {
+      if (tocDrawer) tocDrawer.style.display = 'block';
+    };
+    const closeDrawer = () => {
+      if (tocDrawer) tocDrawer.style.display = 'none';
+    };
+
+    const renderTocInto = (target: HTMLOListElement | null, onPick?: () => void) => {
+      if (!target) return;
+      target.innerHTML = '';
       const currentDone = completed.has(sections[currentIndex].id);
       sections.forEach((s, i) => {
         const li = document.createElement('li');
@@ -224,11 +283,28 @@ const { chapterId } = Astro.props;
 
         btn.appendChild(badge);
         btn.appendChild(label);
-        btn.addEventListener('click', () => goTo(i));
+        btn.addEventListener('click', () => {
+          goTo(i);
+          if (onPick) onPick();
+        });
         li.appendChild(btn);
-        tocList.appendChild(li);
+        target.appendChild(li);
       });
     };
+
+    const renderTOC = () => {
+      renderTocInto(tocList);
+      renderTocInto(tocListMobile, closeDrawer);
+    };
+
+    if (tocToggle) tocToggle.addEventListener('click', openDrawer);
+    if (tocClose) tocClose.addEventListener('click', closeDrawer);
+    if (tocBackdrop) tocBackdrop.addEventListener('click', closeDrawer);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && tocDrawer && tocDrawer.style.display === 'block') {
+        closeDrawer();
+      }
+    });
 
     /* Progress bar */
     const trophyEl = $<HTMLDivElement>('[data-reader-trophy]');
