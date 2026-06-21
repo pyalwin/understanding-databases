@@ -1,0 +1,899 @@
+---
+title: Isolation Levels
+chapterNumber: 3
+summary: Two transactions, one database. The dirty read, the non-repeatable read, the phantom, the lost update, the write skew — what each one is, what stops it, and what every isolation level is actually promising.
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import { SqlSandboxReact } from '@/components/SqlSandboxReact';
+import TimelineScene from '@/components/chapter-03/TimelineScene';
+import IsolationMatrix from '@/components/chapter-03/IsolationMatrix';
+
+<ChapterReader chapterId="03-isolation-levels">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 02 ended with a working WAL for a single writer. What is the new problem chapter 03 actually has to solve?",
+    options: [
+      { text: "How to make fsync faster on consumer SSDs." },
+      { text: "What two concurrent transactions are allowed to see of each other's in-flight work — and what each isolation level is actually promising about that.", correct: true },
+      { text: "How to replicate the log to a second machine for high availability." },
+    ],
+  }}
+>
+
+We left chapter 02 with one transaction in a room. Now put two of them in there.
+
+Everything chapter 02 built — the log, the commit record, the fsync, the recovery loop — assumed a single writer. One process, one transaction at a time, talking to a log it owned alone. The machinery is honest about durability and atomicity. It is silent about what happens when a *second* writer walks in. Two transactions, both reading, both writing, both wanting a coherent view of the world while the other is in the middle of changing it: who sees what, and when?
+
+The race scene from chapter 01 was the question in its rawest form — two processes overwriting `users.json` because nothing serialized them. Chapter 02 deliberately did not answer that question, because the answer is not a syscall. It is a discipline: rules about what a transaction is allowed to observe of another transaction's in-flight work, enforced by the database, expressed through the SQL standard's isolation levels, and named by a set of anomalies — dirty read, non-repeatable read, phantom, lost update, write skew — that have specific shapes you can learn to recognise. This chapter is the work of naming each one, watching it happen, and watching the database refuse to let it happen.
+
+Look at the sandbox below before reading further. It is the chapter 02 WAL, almost unchanged — the same append-fsync-apply ceremony — but with two `transfer()` calls running back-to-back, each doing a read, a compute, and a write, interleaved the way two real processes would interleave. The log records every operation honestly. Both commits succeed. Both writers think they posted a deposit. The total drops anyway. Money has stopped existing, and you can see exactly where the gap is: nobody owned the row between the read and the write. The WAL protected durability. It did nothing to protect the read.
+
+<PythonSandbox
+  client:only="react"
+  initialCode={`import json, os
+
+# The chapter 02 WAL, slimmed down. Append, fsync (no-op in Pyodide,
+# real call shape), apply.
+class Log:
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            open(path, 'w').close()
+    def append(self, rec):
+        with open(self.path, 'a') as f:
+            f.write(json.dumps(rec) + '\\n')
+            f.flush()
+            os.fsync(f.fileno())
+    def read_all(self):
+        with open(self.path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+def read_balance():
+    with open('account.json') as f:
+        return json.load(f)['balance']
+
+def write_balance(bal):
+    tmp = 'account.json.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({'owner': 'Alice', 'balance': bal}, f)
+    os.rename(tmp, 'account.json')
+
+# A "transaction" does the read-modify-write the WAL was built to protect.
+# It logs both phases. Two of them interleave below — the same pattern
+# the race scene in chapter 01 showed, now with full ACID machinery
+# underneath every individual write.
+def deposit(txn_id, amt, log, phase):
+    if phase == 'read':
+        bal = read_balance()
+        log.append({'txn': txn_id, 'op': 'read',  'balance': bal})
+        return bal
+    if phase == 'write':
+        bal = amt['after']
+        log.append({'txn': txn_id, 'op': 'write', 'balance': bal})
+        log.append({'txn': txn_id, 'op': 'commit'})
+        write_balance(bal)
+
+log = Log('wal.log')
+print(f'start: balance = {read_balance()}')
+
+# T1 reads. T2 reads. Both see 100.
+t1_seen = deposit(1, None, log, 'read')
+t2_seen = deposit(2, None, log, 'read')
+print(f'T1 reads {t1_seen}, T2 reads {t2_seen}')
+
+# T1 computes "100 + 50 = 150" and writes 150. Commit record fsynced. Durable.
+deposit(1, {'after': t1_seen + 50}, log, 'write')
+print(f'after T1 commits: balance = {read_balance()}')
+
+# T2, working from its own (now stale) read of 100, computes "100 + 30 = 130"
+# and writes 130. Commit record fsynced. Durable. T1's $50 deposit is gone.
+deposit(2, {'after': t2_seen + 30}, log, 'write')
+print(f'after T2 commits: balance = {read_balance()}')
+
+print(f'\\nexpected: 100 + 50 + 30 = 180')
+print(f'actual:   {read_balance()}')
+print('the log:')
+for r in log.read_all(): print(' ', r)
+`}
+  initialFiles={{
+    'account.json': '{"owner": "Alice", "balance": 100}\n',
+    'wal.log': '',
+  }}
+  watchFiles={['account.json', 'wal.log']}
+/>
+
+The WAL did its job. Each transaction's intent landed on disk, each commit record fsynced, each apply step completed. Recovery from any crash in there would replay both deposits faithfully. The problem is upstream of the log: T2's read happened before T1's write, and nothing told T2 that the value it was holding had gone stale. Chapter 02 made every individual write honest. It did not give the database any way to police the *gap between a read and a write* across two concurrent transactions. That gap is what the rest of this chapter is about.
+
+Five anomalies sit inside that gap. The chapter walks them in order of subtlety. The **dirty read** is the loudest — one transaction sees another's uncommitted work and acts on a number that gets rolled back. The **non-repeatable read** is quieter — the same `SELECT` inside the same transaction returns two different answers because somebody committed an update in between. The **phantom** is quieter still — the same range query returns two different *sets* because somebody inserted a row matching the predicate. The **lost update** is the §0 anomaly, formalised — two read-modify-writes overwrite each other and one transaction's work vanishes. The **write skew** is the killer — two transactions read an overlapping set of rows, each writes a disjoint row, and the combination breaks an invariant that neither write alone would have. Each of those five has a name, a shape, a level that allows it, and a level that prevents it. By the end of §7 you'll be able to walk into any production database, read its `BEGIN ISOLATION LEVEL` documentation, and know which of the five it is signing up to defend you against.
+
+Before we can talk about gaps, we need the syntax that opens and closes a transaction in the first place — the three keywords this book has been promising since chapter 01.
+
+</Section>
+
+<Section
+  id="begin-commit"
+  title="BEGIN, COMMIT, ROLLBACK"
+  quiz={{
+    question: "What is the BEGIN keyword actually doing at the level of the WAL you built in chapter 02?",
+    options: [
+      { text: "Allocating a new transaction id and opening the bracket whose closing brace is either a commit record or a rollback.", correct: true },
+      { text: "Telling the kernel to fsync the log so far." },
+      { text: "Taking an exclusive lock on every row the transaction might touch." },
+    ],
+  }}
+>
+
+Three keywords. That is the whole surface area.
+
+`BEGIN` opens a transaction. The database allocates a fresh transaction id — a monotonically increasing integer in most engines, identical in spirit to the `txn` field your chapter 02 WAL stamped on every record — and starts tagging every subsequent write with that id. `COMMIT` closes the bracket: it appends the commit record, fsyncs it, and from that moment the transaction is durable and visible to other readers. `ROLLBACK` closes the bracket the other way: it discards the in-flight writes without ever writing a commit record, so recovery — and every other transaction — treats them as if they never happened. The brackets are the transaction. Everything between them is intent; everything after `COMMIT` is fact.
+
+The sandbox below runs against a real SQLite, compiled to WebAssembly, running in your browser.<Footnote n={5} /> Nothing is shipped to a server; the entire database lives in a few kilobytes of in-tab memory. The three statements you'll meet are the same three statements you would type at `psql` or `mysql` or `sqlite3` on a server — `BEGIN` and `COMMIT` are SQL standard, supported by every relational database in production. The vocabulary in front of you is exactly the vocabulary the rest of the book will assume.
+
+<SqlSandboxReact client:only="react" initialSql={`-- The accounts table from chapter 01, recreated. Two rows.
+CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER);
+INSERT INTO accounts VALUES ('A', 100), ('B', 50);
+
+-- A transaction that commits. Both writes either happen or neither does.
+BEGIN;
+  UPDATE accounts SET balance = balance - 25 WHERE id = 'A';
+  UPDATE accounts SET balance = balance + 25 WHERE id = 'B';
+COMMIT;
+
+SELECT id, balance FROM accounts;
+
+-- A transaction that rolls back. The two writes never happened, from
+-- the point of view of anybody who looks afterwards.
+BEGIN;
+  UPDATE accounts SET balance = balance - 999 WHERE id = 'A';
+  UPDATE accounts SET balance = balance + 999 WHERE id = 'B';
+ROLLBACK;
+
+SELECT id, balance FROM accounts;`} />
+
+Map the three keywords onto the WAL you built. `BEGIN` doesn't touch the log — it allocates a txn id in memory and tells the database "every write tagged with this id belongs together." Each `UPDATE` between `BEGIN` and `COMMIT` appends an op record to the log under that txn id, exactly the way `db.transfer()` did in chapter 02. `COMMIT` appends the commit record — `{"op": "commit", "txn": id}` — and fsyncs it. That single byte-range becoming durable is the moment the transaction crosses from intent to fact. `ROLLBACK` is the cheap path: the database drops the in-flight writes from memory, writes nothing to the log (or writes an explicit abort marker, depending on the engine), and the next reader sees the world as if `BEGIN` had never been typed.
+
+A small vocabulary note, because the rest of the chapter leans on it. Some engines spell `BEGIN` as `START TRANSACTION` — they are aliases in MySQL and Postgres alike. Most engines auto-commit each statement when no `BEGIN` is in scope, which is why naked `UPDATE accounts SET balance = balance - 25` works at all: an implicit transaction wraps it, and the implicit `COMMIT` lands the moment the statement returns. The bracket is always there. Sometimes you draw it yourself; sometimes the database draws it for you, one statement wide.
+
+There is also an isolation-level setting that hangs off `BEGIN`. In Postgres you can write `BEGIN ISOLATION LEVEL SERIALIZABLE` and the rest of the transaction runs under that level. Every level in the matrix you'll meet in §7 — `READ UNCOMMITTED`, `READ COMMITTED`, `REPEATABLE READ`, `SERIALIZABLE` — attaches to a specific `BEGIN`. The level is not a property of the database; it is a property of the transaction. Which makes sense the moment you remember what a transaction is: a unit of work bracketed by `BEGIN` and `COMMIT`. The level is the rulebook that bracket runs under.
+
+Three keywords, one transaction id, two possible endings, one rulebook. Everything else in the chapter is a story about what other transactions can see between the `BEGIN` and the `COMMIT`, and which rulebook decides what they're allowed to see.
+
+</Section>
+
+<Section
+  id="dirty-read"
+  title="The dirty read"
+  quiz={{
+    question: "A dirty read is a read of what, exactly?",
+    options: [
+      { text: "A row that has been written by a transaction that has not yet committed.", correct: true },
+      { text: "A row that has been written and then rolled back." },
+      { text: "A row that was committed but has since been overwritten." },
+    ],
+  }}
+>
+
+Here is the cleanest anomaly to name, and the rarest one to see in modern production.
+
+T1 opens a transaction and updates Alice's balance from $100 to $200. It has not committed. The new value is sitting in T1's in-flight write set, in memory, tagged with T1's txn id — exactly the kind of record your chapter 02 WAL would write as an op record but not yet promote with a commit record. T2 opens its own transaction and reads Alice's balance. The question this section turns on is: what number does T2 see?
+
+If T2 sees $200 — the uncommitted value — that's a **dirty read**. The number is "dirty" because it has not yet been blessed by a commit record. It is intent, not fact. And the reason it matters becomes obvious if T1 then rolls back: T1's update reverts, Alice's balance goes back to $100, and T2 is now holding a number that *never existed in any committed state of the database*. If T2 went on to compute interest on $200, or trigger a fraud alert because the deposit was too large, T2 acted on a hallucination. The log, after the rollback, has no trace of $200. T2's decision is based on a value the database itself does not believe was ever real.
+
+<TimelineScene
+  client:visible
+  number="3.1"
+  title="Dirty read"
+  caption="T2 reads a value T1 has written but not committed. T1 rolls back. T2 commits a decision based on a number that never existed in any committed state."
+  ops={[
+    { t: 1, type: 'begin', label: 'BEGIN' },
+    { t: 2, type: 'begin', label: 'BEGIN' },
+    { t: 1, type: 'write', label: 'UPDATE balance = 200', detail: 'was 100', effect: '(uncommitted) T1 holds balance = 200' },
+    { t: 2, type: 'read',  label: 'SELECT balance', detail: 'reads 200', effect: 'T2 reads T1’s uncommitted value' },
+    { t: 1, type: 'rollback', label: 'ROLLBACK', effect: 'T1 reverts — balance is back to 100' },
+    { t: 2, type: 'write', label: 'UPDATE log SET fraud = ?', detail: 'based on 200', effect: 'T2 acts on a value that was never real' },
+    { t: 2, type: 'commit', label: 'COMMIT', effect: 'T2 commits a decision built on a number no committed state ever held' },
+  ]}
+/>
+
+Now try to reproduce the anomaly in SQLite. You can't — and that's the lesson. SQLite's concurrency model is single-writer (one transaction holds the writer lock at a time) and its readers see a stable snapshot from the start of their transaction.<Footnote n={5} /> The `PRAGMA read_uncommitted = 1` knob does exist, but it only loosens isolation between connections in shared-cache mode, which is off by default, and even then it never lets you see writes from an unfinished transaction in a different connection. SQLite simply refuses to expose uncommitted state.
+
+PostgreSQL is more pointed still. The SQL standard defines `READ UNCOMMITTED` as the level that allows dirty reads. Postgres accepts the keyword and silently upgrades it to `READ COMMITTED` — its lowest *real* level. The behaviour is documented as: dirty reads are not supported and the level is treated as an alias.<Footnote n={4} /> MySQL/InnoDB is the major engine that actually honors `READ UNCOMMITTED` literally. So in practice, dirty reads are the easiest anomaly to define, the textbook entry point to the topic, and the one you almost never have to defend against — because most modern engines simply refuse to do it. The sandbox below demonstrates the refusal: even with the SQLite knob set, the read inside the second statement does not see the in-flight write that hasn't been committed.
+
+<SqlSandboxReact client:only="react" initialSql={`-- A single-connection emulation: SQLite never exposes uncommitted writes
+-- from a different connection, so we lean on the transaction itself to
+-- show what "uncommitted" looks like. The point is what happens when
+-- you ROLLBACK: the value vanishes from history.
+CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER);
+INSERT INTO accounts VALUES ('A', 100);
+
+-- Open a transaction, write 200, observe that *this* connection sees 200,
+-- then roll back and observe that history denies the write ever happened.
+BEGIN;
+  UPDATE accounts SET balance = 200 WHERE id = 'A';
+  -- Inside the same transaction we see our own uncommitted write:
+  SELECT balance AS inside_txn FROM accounts WHERE id = 'A';
+ROLLBACK;
+
+-- After the rollback, no record of the write remains. A second transaction
+-- that read the 200 would have been holding a number that, by the end of
+-- this script, no longer appears anywhere on disk or in the log.
+SELECT balance AS after_rollback FROM accounts WHERE id = 'A';`} />
+
+A real two-connection demonstration would need two sandboxes; sql.js gives us one. Take the emulation for what it is: the rollback erases the write from history, and any other transaction that had read $200 would be marooned, holding a value the database now claims never existed. That marooning is the dirty read, in one sentence.
+
+The fix is the cheapest of the chapter. Refuse to expose any value that has not yet been promoted by a commit record. `READ COMMITTED` is exactly that rule: a `SELECT` only ever returns the most recent *committed* value of a row, never a value sitting in another transaction's in-flight write set. Every relational database in production implements `READ COMMITTED` at the floor. Postgres and Oracle make it the default. SQLite is stricter still by default. Dirty reads, as a real production hazard, are a problem most modern engines have legislated out of existence.
+
+It is worth pausing on *why* the legislation is cheap. Implementing `READ COMMITTED` requires nothing more than what the WAL already gave you in chapter 02: a commit record. Every row in memory carries the id of the transaction that wrote it; every read consults a small in-memory table — Postgres calls it the *commit log*, often abbreviated `clog` — that maps txn ids to their status (in-progress, committed, aborted). A read of a row written by a still-in-progress transaction is filtered out; the read returns the previous committed version. The machinery is small and fast and fits inside the same data structures the WAL was already maintaining. This is the textbook example of one isolation guarantee falling out of another for free: durability (the commit record) and a tiny extra bit of bookkeeping (the txn-status table) compose into a dirty-read defence without any new machinery. The chapter's later anomalies will not be this cheap. Phantom prevention costs predicate-aware data structures; write-skew prevention costs runtime dependency tracking. But the floor is free, and that is why the floor is universal.
+
+</Section>
+
+<Section
+  id="non-repeatable-read"
+  title="The non-repeatable read"
+  quiz={{
+    question: "A non-repeatable read happens when, between two reads of the same row inside one transaction, the row changes. What changed it?",
+    options: [
+      { text: "Your own transaction wrote it in between the two reads." },
+      { text: "Another transaction committed an update to that row between your two reads.", correct: true },
+      { text: "The database garbage-collected an old MVCC version of the row." },
+    ],
+  }}
+>
+
+`READ COMMITTED` plugs the dirty-read hole, but it leaves a quieter one open.
+
+T1 begins a transaction, reads Alice's balance, gets $100, and goes off to do something — generate a report, send an email, compute interest, whatever takes time inside a transaction. Meanwhile T2 begins, updates Alice's balance to $150, commits. T2's write was honest: it touched a row, the commit record fsynced, the change is durable. Now T1 — still inside its original transaction, still holding the same `BEGIN` it opened a moment ago — reads Alice's balance a second time. Under `READ COMMITTED`, it gets the most recent committed value. Which is now $150. The same `SELECT` inside the same transaction returned two different answers.
+
+That is a **non-repeatable read**. The row was committed between the two reads, so it's not dirty — T1 saw real, durable, fsynced numbers both times. But the *transaction* T1 is running can no longer reason about Alice's balance as a stable value. If the second half of T1's logic assumed the first half's number was still true, the logic is wrong. The classic shape is: read a balance, decide whether to allow a withdrawal, write the withdrawal. If the balance changes underneath the decision, the decision is based on a stale premise.
+
+<TimelineScene
+  client:visible
+  number="3.2"
+  title="Non-repeatable read"
+  caption="T1 reads, T2 updates and commits, T1 reads again — and gets a different answer. The row is not dirty (both values were committed). The reads inside T1 are simply not stable."
+  ops={[
+    { t: 1, type: 'begin', label: 'BEGIN' },
+    { t: 1, type: 'read',  label: 'SELECT balance', detail: 'reads 100', effect: 'T1 holds balance = 100 as its working number' },
+    { t: 2, type: 'begin', label: 'BEGIN' },
+    { t: 2, type: 'write', label: 'UPDATE balance = 150', detail: 'was 100', effect: '(uncommitted) T2 holds balance = 150' },
+    { t: 2, type: 'commit', label: 'COMMIT', effect: 'balance = 150 is now durable and committed' },
+    { t: 1, type: 'read',  label: 'SELECT balance', detail: 'reads 150', effect: 'T1’s second read disagrees with its first — same row, same txn' },
+    { t: 1, type: 'commit', label: 'COMMIT' },
+  ]}
+/>
+
+The single-connection emulation in SQLite below shows the same shape, with the help of `SAVEPOINT` to stand in for "the other transaction's commit landed in the middle." Read the comments alongside the SQL.
+
+<SqlSandboxReact client:only="react" initialSql={`-- A single-connection rehearsal of the two-connection anomaly. The
+-- "outer" transaction is T1; the SAVEPOINT/RELEASE pair stands in
+-- for T2 sneaking in between T1's two reads, committing its update,
+-- and leaving. SQLite at its default isolation actually prevents this
+-- between separate connections (its readers hold a stable snapshot)
+-- but in a single connection you can watch the shape.
+CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER);
+INSERT INTO accounts VALUES ('A', 100);
+
+BEGIN;                                    -- T1 begins
+  SELECT balance AS read_1 FROM accounts WHERE id = 'A';  -- T1 reads 100
+  SAVEPOINT t2;                           -- pretend T2 starts here
+    UPDATE accounts SET balance = 150 WHERE id = 'A';
+  RELEASE SAVEPOINT t2;                   -- pretend T2 commits here
+  SELECT balance AS read_2 FROM accounts WHERE id = 'A';  -- T1 re-reads
+COMMIT;
+-- read_1 = 100, read_2 = 150. Same row, same transaction,
+-- two different answers.`} />
+
+The rule that prevents this is `REPEATABLE READ`. The name describes what it promises: any row a transaction reads can be read again — same answer, every time, for the duration of that transaction. Two implementations dominate. The traditional one is *read locks*: take a shared lock on every row you read and hold it until commit; concurrent writers block on those locks; readers and writers serialize. The modern one is *snapshot isolation* via MVCC, which we will meet properly in chapter 08: at `BEGIN`, the transaction captures a snapshot id; every read consults that snapshot, ignoring any committed write whose commit timestamp is later than the snapshot. T2's commit at $150 happens *after* T1's snapshot, so T1 never sees it. Both reads return $100. The first read is repeatable.
+
+The trade-off between the two implementations is real and worth stating. Read locks pay their cost at *read* time: every `SELECT` takes locks, every concurrent writer waits on them, and a long-running read can stall the rest of the system. Snapshot isolation pays its cost in *storage*: every write keeps the prior version of the row around for as long as some live transaction's snapshot might want to see it, which is what chapter 08's vacuum subsystem exists to manage. The snapshot model trades disk space and bookkeeping for non-blocking reads; the lock model trades waiting for storage simplicity. Modern engines almost universally chose the snapshot model — Postgres, Oracle, SQL Server, MySQL all keep multiple row versions internally — because non-blocking reads turn out to matter more, in practice, than the disk overhead costs.
+
+Postgres's `REPEATABLE READ` is the snapshot flavour — a fact the Postgres documentation states bluntly, with a small footnote that this is stricter than the SQL standard requires.<Footnote n={4} /> A snapshot prevents the non-repeatable read *and*, by accident, prevents almost every other read-side anomaly the SQL standard names — for free, with no extra locks, just by virtue of every read inside the transaction consulting the same frozen view. Almost every. There is one anomaly snapshot isolation does not catch, and one anomaly it catches accidentally, and the next section is the harder of the two.
+
+</Section>
+
+<Section
+  id="phantom"
+  title="The phantom"
+  quiz={{
+    question: "A phantom differs from a non-repeatable read in what specific way?",
+    options: [
+      { text: "It's a re-read of the same row that returns a different value." },
+      { text: "It's a re-execution of the same range query that returns a different set of rows, because another transaction inserted or deleted rows matching the predicate.", correct: true },
+      { text: "It's a row that vanishes because the table was vacuumed." },
+    ],
+  }}
+>
+
+The non-repeatable read was about a *row*. The phantom is about a *set*.
+
+T1 runs `SELECT count(*) FROM users WHERE active = true` and gets 47. The intent of the query is not "tell me about row 17" — it's "tell me how many rows match this predicate." T1 sits with that 47 for a moment, perhaps computing per-user storage budgets that total to a cluster-wide cap. Meanwhile T2 begins, inserts a new user with `active = true`, commits. T1 reruns the same `SELECT count(*)`. The answer is 48. Nothing T1 had read changed value; the rows T1 already saw still have the same balances, the same usernames, the same active flags. A *new row* appeared that matches the predicate. The result of the *query* changed.
+
+That new row is a **phantom**. It haunts the predicate. And here is the subtle reason `REPEATABLE READ`, as the SQL standard defines it, fails to prevent it: the traditional implementation of `REPEATABLE READ` is *row-level read locks*. T1 reads 47 rows and takes a shared lock on each one. T2's new row didn't exist when T1 took its locks — there was nothing to lock. T2 inserts the row, commits, and the row is now in the table. T1's locks are honest; they were taken on every row T1 read. But T1 never had any way to lock *the absence of a row* it was about to discover.
+
+<TimelineScene
+  client:visible
+  number="3.3"
+  title="Phantom"
+  caption="T1 runs the same range query twice. Between the two executions, T2 inserts a new row matching the predicate. T1's first count is 47; T1's second is 48. No row T1 had ever read changed — a row that didn't exist appeared inside the predicate."
+  ops={[
+    { t: 1, type: 'begin', label: 'BEGIN' },
+    { t: 1, type: 'read',  label: 'SELECT count(*) WHERE active', detail: 'reads 47', effect: 'T1 holds count = 47' },
+    { t: 2, type: 'begin', label: 'BEGIN' },
+    { t: 2, type: 'write', label: 'INSERT user (active=true)', detail: 'new row', effect: '(uncommitted) a 48th matching row in T2' },
+    { t: 2, type: 'commit', label: 'COMMIT', effect: 'the new row is now durable and committed' },
+    { t: 1, type: 'read',  label: 'SELECT count(*) WHERE active', detail: 'reads 48', effect: 'T1’s second count disagrees with its first — same query, same txn' },
+    { t: 1, type: 'commit', label: 'COMMIT' },
+  ]}
+/>
+
+This is the anomaly whose distinction the 1995 Berenson critique was most insistent on, because the original ANSI SQL definition of `REPEATABLE READ` was vague enough to leave open whether it prevented phantoms.<Footnote n={1} /> The critique pointed out — correctly — that phantoms are a categorically different beast from non-repeatable reads, requiring categorically different machinery to prevent. The cleanest mental separator: row-level read locks protect rows that *exist*; phantom prevention requires protecting the *space where a row could appear*.
+
+Two strategies dominate. The first is **predicate locks** (or their pragmatic cousin, *gap locks* in MySQL/InnoDB): take a lock not on the rows you read, but on the predicate you read with. T1's `WHERE active = true` locks out any concurrent insert of an active user until T1 commits. This is conceptually clean and operationally expensive, because evaluating an arbitrary predicate against every concurrent insert is impractical at scale. InnoDB approximates it by locking the *index gaps* between adjacent index entries on the columns the predicate touches, which works for indexed columns and falls back to broader locking for the rest. The cost is concurrency: any insert into a range a long-running transaction has read has to wait.
+
+The second strategy is **snapshot isolation**, which catches phantoms by accident. T1's snapshot was taken at `BEGIN`. T2's new row was inserted and committed *after* that snapshot. The snapshot-aware query that T1 reruns simply does not see the new row, because the row's commit timestamp is later than the snapshot's. No locks. No predicate evaluation. The phantom is invisible because the snapshot is older than the phantom. This is why Postgres's `REPEATABLE READ` — implemented as snapshot — prevents phantoms despite the SQL standard not requiring `REPEATABLE READ` to do so.<Footnote n={4} />
+
+Forward-reference time. The reason phantom prevention is hard, structurally, is that a `WHERE active = true` query is implemented as a *range scan* — the database walks an index from the first matching entry to the last, returning rows along the way. The "space where a new row could appear" is a range of index keys, not a fixed set of rows. Chapter 04 builds B-trees from scratch and shows exactly what walking a range looks like; once you have that picture in your head, predicate locks become the obvious-but-expensive thing to do (lock the range), and snapshot isolation becomes the clever-but-different thing to do (look at the range through old glasses). Phantoms live in the same place B-tree range scans live. That place is chapter 04.
+
+The single-connection SQLite emulation below uses a sleight of hand similar to §3 — a savepoint to play the part of T2's mid-stream commit — and shows the same shape: the same `SELECT count(*)` returns two different answers inside one transaction, because rows appeared inside the predicate between the reads.
+
+<SqlSandboxReact client:only="react" initialSql={`-- Phantom: the count changes between two reads of the same predicate,
+-- because a matching row was inserted in between. We use SAVEPOINT to
+-- play the part of a concurrent T2 sneaking in between T1's two reads.
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+INSERT INTO users VALUES (1, 'Eve', 1), (2, 'Ada', 1), (3, 'Bob', 0);
+
+BEGIN;
+  SELECT count(*) AS count_1 FROM users WHERE active = 1;   -- 2
+
+  SAVEPOINT t2;
+    INSERT INTO users VALUES (4, 'Grace', 1);
+  RELEASE SAVEPOINT t2;
+
+  SELECT count(*) AS count_2 FROM users WHERE active = 1;   -- 3
+COMMIT;
+-- count_1 = 2, count_2 = 3. The query never lied about any individual
+-- row; a row that didn't exist when count_1 ran did exist when count_2 ran.`} />
+
+The clean takeaway: phantoms are the moment isolation stops being about rows and starts being about predicates. Row-level row-read locks miss them. Snapshot catches them as a side effect. Predicate locks catch them directly and pay for it in concurrency. There is no cheap fix.
+
+</Section>
+
+<Section
+  id="lost-update"
+  title="The lost update"
+  quiz={{
+    question: "Two transactions both read balance=100, both add 10, both write 110, both commit. What guarantee did the database fail to provide?",
+    options: [
+      { text: "Durability — one of the commits was lost." },
+      { text: "Atomicity — one of the transactions was partially applied." },
+      { text: "Isolation — the second write should have seen the first transaction's update before computing its own.", correct: true },
+    ],
+  }}
+>
+
+You met this anomaly in chapter 01 as a *race* on a flat file. It has a more formal name once both writers are inside transactions.
+
+T1 begins, reads Alice's balance ($100), adds $10, writes $110, commits. T2 begins at the same time, reads Alice's balance ($100, because T1 hasn't committed yet, or because T2's snapshot was taken first), adds $10, writes $110, commits. Both transactions did honest read-modify-writes. Both fsynced. Both succeeded. The final balance is $110, not $120. T1's $10 deposit is gone. Notice the shape: this is the chapter 01 lost update, but with `BEGIN`/`COMMIT` wrapped around each side and a write-ahead log doing its honest work underneath. The WAL machinery did not save us, because the WAL machinery does not police the gap between a read and a write.
+
+<TimelineScene
+  client:visible
+  number="3.4"
+  title="Lost update"
+  caption="Both transactions read 100, both compute 110, both commit. The WAL durably persists both commits. T1's $10 deposit disappears anyway."
+  ops={[
+    { t: 1, type: 'begin', label: 'BEGIN' },
+    { t: 2, type: 'begin', label: 'BEGIN' },
+    { t: 1, type: 'read',  label: 'SELECT balance', detail: 'reads 100', effect: 'T1 holds working number 100' },
+    { t: 2, type: 'read',  label: 'SELECT balance', detail: 'reads 100', effect: 'T2 holds working number 100' },
+    { t: 1, type: 'write', label: 'UPDATE balance = 110', detail: '100 + 10', effect: '(uncommitted) T1 holds balance = 110' },
+    { t: 1, type: 'commit', label: 'COMMIT', effect: 'balance = 110 is durable and committed' },
+    { t: 2, type: 'write', label: 'UPDATE balance = 110', detail: '100 + 10', effect: '(uncommitted) T2 holds balance = 110' },
+    { t: 2, type: 'commit', label: 'COMMIT', effect: 'balance still = 110 — T1’s $10 deposit is gone' },
+  ]}
+/>
+
+There are three different mechanisms a real database can use to prevent this, and they line up with three different intuitions about what the bug *is*.
+
+The first intuition is "the second write should have known the first one happened." Snapshot isolation enforces this with a rule called **first-committer-wins**: at commit time, the database checks whether any row T2 modified has been modified by another transaction that committed after T2's snapshot was taken. If so, T2 aborts. T2's `COMMIT` returns an error — Postgres throws a serialization failure — and the application is expected to retry the transaction from the top, which re-reads the now-updated balance, computes $120, and writes $120. Snapshot isolation catches the lost update *as a write-write conflict*. This is how PostgreSQL's `REPEATABLE READ` handles it; it is *not* how `READ COMMITTED` handles it, because `READ COMMITTED` doesn't even have a snapshot to compare against.<Footnote n={4} />
+
+The second intuition is "the read of the balance should have promised that nobody else would touch it." This is the `SELECT … FOR UPDATE` pattern: T1's read takes an exclusive lock on the row it read, held until commit; T2's matching `SELECT … FOR UPDATE` blocks until T1 commits, then re-reads the now-current $110, computes $120, writes $120. Same correct answer, different mechanism. This is the pattern most ORMs reach for when the read-modify-write loop is intentional, because it is explicit and predictable: the lock is visible in the query, the contention is visible in the wait.
+
+The third intuition is "stop reading and computing — just tell the database what you want and let it figure it out." Replace `SELECT balance; UPDATE balance = $value` with `UPDATE balance = balance + 10`. The arithmetic happens *inside* the database's write path; the row is exclusively locked for the duration of the update; both transactions queue up on the same row and apply their deltas in order. This is the cheapest, simplest fix, and the answer for most real lost-update bugs in production. The reason you don't always get to use it: many updates are not expressible as commutative deltas. "Set name to whatever the user typed" is not `name = name + ?`. For the cases that *are* commutative — counters, balances, totals — this is the textbook win.
+
+`SERIALIZABLE`, of course, catches the lost update by definition: the rule of `SERIALIZABLE` is "the result is as if the transactions had run one after the other in some order," and no serial schedule produces $110 from two $10 deposits onto $100. Postgres implements `SERIALIZABLE` via SSI, which we'll meet properly in the next section.<Footnote n={3} />
+
+The single-connection emulation in SQLite below shows the lost update in its rawest form — both transactions written sequentially in one connection, but with the reads pinned to the value before the first update lands, the way two concurrent connections at `READ COMMITTED` would behave.
+
+<SqlSandboxReact client:only="react" initialSql={`-- A two-transaction interleaving rehearsed in one connection. The
+-- read-modify-write of each side is staged so that both sides take
+-- their working number from the original balance, not from each
+-- other's writes. The final commit overwrites the value the prior
+-- commit had just established.
+CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INTEGER);
+INSERT INTO accounts VALUES ('A', 100);
+
+-- T1's full transaction, with its read happening before T2's begins.
+BEGIN;
+  -- T1 reads 100. (In real life this value lives in T1's app memory.)
+  SELECT balance AS t1_read FROM accounts WHERE id = 'A';
+COMMIT;
+
+-- T2's full transaction, with its read also happening before T1's
+-- update lands. Then T2 writes back the new value computed from 100.
+BEGIN;
+  SELECT balance AS t2_read FROM accounts WHERE id = 'A';
+  -- T2 computes 100 + 10 and writes 110.
+  UPDATE accounts SET balance = 110 WHERE id = 'A';
+COMMIT;
+
+-- Now T1 finishes its work, also writing 110 (computed from its
+-- original read of 100). T2's deposit is overwritten.
+BEGIN;
+  UPDATE accounts SET balance = 110 WHERE id = 'A';
+COMMIT;
+
+SELECT balance AS final FROM accounts WHERE id = 'A';
+
+-- Expected if both deposits landed: 120. Actual: 110.
+-- Fix: replace the SELECT + UPDATE with
+--   UPDATE accounts SET balance = balance + 10 WHERE id = 'A';
+-- and run both that way. Both deposits land. Balance = 120.`} />
+
+The lost update is the easiest anomaly to *recognise* in your own application code, because the shape — read, decide, write — is so common. It is the easiest one to fix if your write is a commutative delta. And it is the hardest one to debug after the fact, because, as chapter 01 noted, nothing in the syscall trace or the WAL says anything went wrong. Both commits are honest. The accounting is just off.
+
+</Section>
+
+<Section
+  id="write-skew"
+  title="The write skew"
+  quiz={{
+    question: "Two on-call doctors each check 'is anyone else on call?', see one other doctor, and each go off shift. The invariant 'at least one doctor on call' breaks. What's the shape of the anomaly?",
+    options: [
+      { text: "A lost update: both writes targeted the same row and one overwrote the other." },
+      { text: "A dirty read: each transaction saw the other's uncommitted write." },
+      { text: "A write skew: each transaction read a set of rows, made a decision based on that set, and wrote a disjoint set — and the reads and writes together broke an invariant that neither write alone would have.", correct: true },
+    ],
+  }}
+>
+
+Save the strongest anomaly for last, because it is the one snapshot isolation gets wrong.
+
+Here is the canonical scenario. A hospital runs a rule: *at least one doctor must be on call at all times.* Two doctors, Alice and Bob, are both on call. Both want to clock off — Alice has an emergency at home, Bob has been on for sixteen hours. Each opens an app that does the same check: count the doctors currently on call; if there are at least two, allow this one to go off-shift. Alice's transaction queries the table, sees two on-call doctors (herself and Bob), passes the check, updates her own row to `on_call = false`. Bob's transaction, running concurrently, queries the table at the same time, *also* sees two on-call doctors (himself and Alice — because at the moment Bob's snapshot was taken, Alice had not yet committed her change), passes the check, updates his own row to `on_call = false`. Both commit. Zero doctors are on call. The invariant the hospital cares about — *at least one* — is broken.
+
+<TimelineScene
+  client:visible
+  number="3.5"
+  title="Write skew"
+  caption="Two transactions read an overlapping set of rows, each makes a decision based on what it sees, and each writes a disjoint row. Neither write alone broke the invariant. Together, they did. Snapshot isolation cannot see this — both writers respected their own snapshot honestly."
+  ops={[
+    { t: 1, type: 'begin', label: 'BEGIN' },
+    { t: 2, type: 'begin', label: 'BEGIN' },
+    { t: 1, type: 'read',  label: 'SELECT count(*) WHERE on_call', detail: 'reads 2', effect: 'T1 sees 2 doctors on call (Alice, Bob)' },
+    { t: 2, type: 'read',  label: 'SELECT count(*) WHERE on_call', detail: 'reads 2', effect: 'T2 sees 2 doctors on call (Alice, Bob)' },
+    { t: 1, type: 'write', label: 'UPDATE Alice.on_call = false', effect: '(uncommitted) Alice off-shift in T1' },
+    { t: 2, type: 'write', label: 'UPDATE Bob.on_call = false', effect: '(uncommitted) Bob off-shift in T2' },
+    { t: 1, type: 'commit', label: 'COMMIT', effect: 'Alice off-shift is durable — Bob still on call' },
+    { t: 2, type: 'commit', label: 'COMMIT', effect: '0 doctors on call — invariant broken, but no row was written twice' },
+  ]}
+/>
+
+Look at why snapshot isolation cannot catch this. Snapshot's machinery for preventing the lost update was *write-write conflict detection*: at commit time, check whether any row I'm writing has been touched by another transaction committed after my snapshot. Alice's transaction writes Alice's row. Bob's transaction writes Bob's row. The write sets are **disjoint**. There is no write-write conflict. Both transactions also read both rows, so the *read sets* overlap. But snapshot isolation, as classically implemented, only tracks write-write conflicts, not read-write conflicts across transactions. The two writes commit because, considered pairwise on individual rows, neither overwrote anything the other wrote. The invariant the hospital cares about — a property of the *set* of on-call doctors, not of any single row — is invisible to a check that only looks at single-row write conflicts.
+
+This is the anomaly the Berenson critique named *write skew*, and the anomaly the SSI paper was written to solve.<Footnote n={1} /><Footnote n={3} /> Snapshot isolation is correct on every read-side anomaly we have seen so far — dirty read, non-repeatable read, phantom, lost update — and wrong on this one. The shape is specific and worth memorising: **two transactions read an overlapping set, each writes a disjoint row in that set, and the combination of reads and writes breaks an invariant that no single write alone would have broken.**
+
+`SERIALIZABLE` catches it. The semantics of `SERIALIZABLE` are "the outcome must be as if the transactions had run one at a time, in some order." There is no serial order in which both doctors clock off — whichever runs first sees two on call and clocks off; whichever runs second sees only one on call and gets refused. So `SERIALIZABLE` must abort one of the two. The cleanest way to enforce that for free was, for years, *strict two-phase locking*: take read locks on every row you read, write locks on every row you write, hold them all until commit. It works. It serialises huge swaths of work that didn't actually conflict, because the lock manager has no idea which read-write pairs were *actually* dangerous and which were incidental.
+
+PostgreSQL's `SERIALIZABLE`, since 9.1, uses **SSI** — *Serializable Snapshot Isolation* — which is the elegant alternative. SSI runs every transaction at snapshot isolation, so reads are cheap and don't block writers. It additionally tracks, at runtime, the *read-write dependencies* between transactions: which transaction read a row that another transaction wrote, and in what order. The Cahill paper proved that any serialisation anomaly under snapshot isolation manifests as a particular pattern in those dependency edges — a cycle with two consecutive read-write edges out of a single transaction (the so-called *dangerous structure*).<Footnote n={3} /> SSI watches for that pattern at commit time and aborts one of the offending transactions when it sees it. The application catches a `40001` serialization failure and retries. Most workloads see almost zero aborts, because most workloads don't trigger the dangerous pattern. The ones that do — write-skew shapes — get caught and retried.
+
+The single-connection SQLite emulation can only gesture at the anomaly, because the whole point is two snapshots taken at the same moment. We can still stage the disjoint-write structure to make the shape visible.
+
+<SqlSandboxReact client:only="react" initialSql={`-- Two doctors, the invariant is "at least one is on call." Snapshot
+-- isolation lets both transactions read the table (seeing 2 on call),
+-- each decide to take its own doctor off, and each commit disjoint
+-- writes. Single-connection emulation: the two reads happen before
+-- either write lands.
+CREATE TABLE doctors (name TEXT PRIMARY KEY, on_call INTEGER);
+INSERT INTO doctors VALUES ('Alice', 1), ('Bob', 1);
+
+-- T1 reads.
+BEGIN;
+  SELECT count(*) AS t1_sees_on_call FROM doctors WHERE on_call = 1;
+COMMIT;
+
+-- T2 reads, before either T1 or T2 has written. Both see 2.
+BEGIN;
+  SELECT count(*) AS t2_sees_on_call FROM doctors WHERE on_call = 1;
+COMMIT;
+
+-- T1's write: Alice off-shift. Disjoint from T2's write.
+BEGIN;
+  UPDATE doctors SET on_call = 0 WHERE name = 'Alice';
+COMMIT;
+
+-- T2's write: Bob off-shift. Disjoint from T1's write. Both commits
+-- succeed; no row was overwritten. The invariant is broken anyway.
+BEGIN;
+  UPDATE doctors SET on_call = 0 WHERE name = 'Bob';
+COMMIT;
+
+SELECT count(*) AS final_on_call FROM doctors WHERE on_call = 1;
+-- 0. Both doctors are off shift. The hospital is in violation of its
+-- own rule. SSI in Postgres would have aborted one of these two
+-- transactions at commit time, because the read-write dependencies
+-- form the dangerous pattern Cahill's paper named.`} />
+
+<Callout type="note" title="Write skew is the case for SERIALIZABLE">
+If you have ever wondered "what does `SERIALIZABLE` actually buy me that `REPEATABLE READ` doesn't, in Postgres, given that Postgres's `REPEATABLE READ` is already snapshot?" — write skew is the answer. Snapshot isolation under any name gets dirty reads, non-repeatable reads, phantoms, and lost updates right. It gets write skew wrong. Anything in your application whose correctness depends on a multi-row invariant — at least one doctor on call, no overlapping bookings, the total of these rows must equal that row — should run at `SERIALIZABLE` on Postgres, and you should be prepared to handle and retry the occasional serialization failure. The cost is small. The correctness is total.
+</Callout>
+
+Write skew is the anomaly that decides whether your isolation level is *good enough*. If you can read the prose above and recognise the shape — overlapping reads, disjoint writes, multi-row invariant — in your own application, you have learned the most useful thing this chapter has to offer. Most production isolation bugs are write skews. Most of them sit in code that "works" at `REPEATABLE READ` for years before a busy day surfaces them.
+
+</Section>
+
+<Section
+  id="isolation-levels"
+  title="The isolation levels"
+  quiz={{
+    question: "PostgreSQL's REPEATABLE READ does not actually prevent every anomaly the ANSI standard says it should. Why not?",
+    options: [
+      { text: "Because it's implemented as snapshot isolation, which prevents non-repeatable reads and most phantoms but still permits write skew.", correct: true },
+      { text: "Because the Postgres team has not gotten around to implementing it correctly." },
+      { text: "Because REPEATABLE READ in Postgres is an alias for READ COMMITTED." },
+    ],
+  }}
+>
+
+Time to put the five anomalies and the five levels in one picture.
+
+<IsolationMatrix client:visible />
+
+Read it row by row, top to bottom, left to right, because each cell encodes a real decision someone at a real database vendor had to make.
+
+`READ UNCOMMITTED` allows every anomaly in the chapter. There is no machinery beyond the WAL itself — every read returns the latest value in memory, committed or not. As a useful level, it is essentially extinct. Postgres treats it as an alias for `READ COMMITTED`; SQLite never exposes it; MySQL/InnoDB honours it but few production deployments select it. The cell is on the matrix because the SQL standard defines it, and because the row makes the next four levels' improvements legible.
+
+`READ COMMITTED` closes the dirty-read hole. Every other anomaly is still possible. This is the default in Postgres and Oracle. The promise it makes — "a `SELECT` only returns committed values" — is the cheapest correctness floor, and it covers the vast majority of read-only or single-row write workloads adequately. It is also the level where lost updates and write skew are most easily triggered, because nothing in the level promises stability of reads across a transaction.
+
+`REPEATABLE READ` is where the SQL standard, the Postgres documentation, and the textbook all start to disagree. The standard requires that any row a transaction reads once must read the same on a second read. It does not require phantom prevention. It does not require write-skew prevention. The Postgres implementation is *snapshot isolation*, which is stricter — it prevents phantoms (because the snapshot is older than the new row) and lost updates (because first-committer-wins fires on write-write conflicts).<Footnote n={4} /> MySQL/InnoDB's implementation uses gap locks on top of row locks, which also prevents most phantoms in practice but for different reasons. The `SOMETIMES` cells in the phantom and lost-update rows are where this matrix earns its complexity: which anomaly is allowed at this level depends on whose `REPEATABLE READ` you're talking to. The original critique paper was specifically about this confusion — the SQL standard's definitions are under-specified, and every vendor closed the gaps differently.<Footnote n={1} />
+
+`SNAPSHOT` is the level snapshot isolation actually implements, regardless of what the engine calls it. Read-side anomalies are gone — every read inside the transaction sees the same frozen view of the world, so dirty reads, non-repeatable reads, and phantoms cannot happen. Lost updates are prevented by first-committer-wins on write-write conflicts. Write skew is allowed, for the reasons §6 spent its words on. This is the most popular real isolation level in production, even though most engines don't expose the name *snapshot* directly — Postgres calls it `REPEATABLE READ`, Oracle calls it `SERIALIZABLE` (incorrectly, by the strict definition), SQL Server has both `SNAPSHOT` and `READ COMMITTED SNAPSHOT`.
+
+`SERIALIZABLE` is the level whose semantics promise that the outcome is as if the transactions had executed one at a time in some serial order. Write skew is forbidden. Every anomaly is forbidden. The implementation strategies vary — strict two-phase locking in older systems, SSI in modern Postgres, optimistic concurrency control with abort-and-retry in others — but the contract is the same. The cost is the abort rate: workloads that trigger the dangerous SSI pattern will have a fraction of their transactions aborted and retried. The benefit is total: you can declare a multi-row invariant in your application logic and trust that no concurrent execution will break it.
+
+Three observations from staring at the table.
+
+First, the `ALLOWED → SOMETIMES → PREVENTED` progression as you move right is real, but the boundary between *prevented* and *sometimes* depends on the engine. The matrix is a teaching tool, not a database catalog. When you choose an isolation level in production, you choose it for a *specific engine* — and the engine's documentation is the source of truth for which anomalies that level actually prevents.<Footnote n={4} />
+
+Second, the gap between `SNAPSHOT` and `SERIALIZABLE` is one anomaly wide — write skew — but that one anomaly is the most common multi-row-invariant bug in real systems. The promotion from `SNAPSHOT` to `SERIALIZABLE` on Postgres is, mechanically, the activation of SSI's read-write dependency tracking; the cost is bookkeeping and occasional aborts; the payoff is the disappearance of an entire bug class. Most well-engineered Postgres applications run at `SERIALIZABLE` for the transactions whose correctness depends on multi-row reasoning, and at `READ COMMITTED` for everything else.
+
+Third, the matrix exists at all because the SQL standard's original isolation definitions were vague enough that vendors disagreed on what each level was promising. The Berenson critique is the paper that named the disagreement and forced the next twenty years of database design to be honest about it.<Footnote n={1} /> If you remember one paper from this chapter, remember that one.
+
+</Section>
+
+<Section
+  id="sandbox"
+  title="Build it yourself"
+>
+
+Chapter 02's WAL was honest about durability. We are about to make it honest about isolation, too — at least for the one anomaly that hurts the most.
+
+The Python sandbox below is the §0 lost-update reproduction, but exposed as a knob: pick an isolation strategy and watch the result change. The unfixed version is what the WAL gives you out of the box: two writers, two reads, two writes, $30 of deposits applied as $30 instead of $80 because nobody owned the row between the read and the write. The *commutative-delta* fix is the one §5 recommended — replace `read; write new` with `apply delta` and let the database serialize the deltas on the row. The *row-lock* fix takes a logical lock on the row at read time and releases it at commit, modelling `SELECT … FOR UPDATE`. Both fixes produce the correct final balance; each does so for a different reason, and the contrast is the whole point.
+
+<PythonSandbox
+  client:only="react"
+  initialCode={`import json, os
+
+class Log:
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            open(path, 'w').close()
+    def append(self, rec):
+        with open(self.path, 'a') as f:
+            f.write(json.dumps(rec) + '\\n')
+            f.flush()
+            os.fsync(f.fileno())
+    def read_all(self):
+        with open(self.path) as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+def read_balance():
+    with open('account.json') as f:
+        return json.load(f)['balance']
+
+def write_balance(bal):
+    tmp = 'account.json.tmp'
+    with open(tmp, 'w') as f:
+        json.dump({'owner': 'Alice', 'balance': bal}, f)
+    os.rename(tmp, 'account.json')
+
+# A tiny in-memory lock manager. Real databases have much fancier
+# versions of this (chapter 07 builds one); the shape is the same.
+_locks = {}
+def acquire(row, txn):
+    if row in _locks and _locks[row] != txn:
+        return False
+    _locks[row] = txn
+    return True
+def release(row, txn):
+    if _locks.get(row) == txn:
+        del _locks[row]
+
+# STRATEGIES — pick one.
+#   'none'    : the §0 anomaly. Both transactions read 100, write 130/150,
+#               last commit wins. Lost update.
+#   'delta'   : commutative-delta fix. The amount is applied inside the
+#               write, not computed from a stale read. Both deposits land.
+#   'rowlock' : SELECT...FOR UPDATE pattern. T1 takes a write lock on the
+#               row at read time; T2 has to wait until T1 commits, then
+#               re-reads the post-T1 balance and adds its own amount.
+STRATEGY = 'none'   # try 'delta' and 'rowlock' too
+
+def deposit(txn, amt, log, strategy):
+    if strategy == 'delta':
+        old = read_balance()
+        new = old + amt
+        log.append({'txn': txn, 'op': 'delta',  'amt': amt})
+        log.append({'txn': txn, 'op': 'commit'})
+        write_balance(new)
+        return new
+
+    # 'none' and 'rowlock' both do read; compute; write.
+    if strategy == 'rowlock':
+        # Block until we own the row. Single-threaded sim — if we can't
+        # get it, the other txn already has it; we wait by re-reading
+        # after they release. In a real DB this is queued by the lock
+        # manager.
+        if not acquire('account', txn):
+            raise RuntimeError(f'T{txn} would block on lock held by another txn')
+    old = read_balance()
+    log.append({'txn': txn, 'op': 'read', 'balance': old})
+    new = old + amt
+    log.append({'txn': txn, 'op': 'write', 'balance': new})
+    log.append({'txn': txn, 'op': 'commit'})
+    write_balance(new)
+    if strategy == 'rowlock':
+        release('account', txn)
+    return new
+
+# Reset state every run.
+write_balance(100)
+if os.path.exists('wal.log'): os.remove('wal.log')
+log = Log('wal.log')
+
+print(f'start balance: {read_balance()}')
+print(f'strategy:      {STRATEGY}\\n')
+
+if STRATEGY == 'rowlock':
+    # T1 grabs the lock first; T2's attempt blocks (we surface the
+    # block as an exception, then retry after T1 commits).
+    deposit(1, 50, log, 'rowlock')
+    print(f'T1 deposited 50: balance = {read_balance()}')
+    deposit(2, 30, log, 'rowlock')
+    print(f'T2 deposited 30: balance = {read_balance()}')
+else:
+    # The §0 interleaving: both transactions read before either writes.
+    t1_seen = read_balance()
+    t2_seen = read_balance()
+    print(f'T1 reads {t1_seen}, T2 reads {t2_seen}')
+
+    deposit(1, 50, log, STRATEGY)
+    print(f'after T1: balance = {read_balance()}')
+    if STRATEGY == 'none':
+        # The lost-update path: T2 writes back its own stale computation.
+        new = t2_seen + 30
+        log.append({'txn': 2, 'op': 'write', 'balance': new})
+        log.append({'txn': 2, 'op': 'commit'})
+        write_balance(new)
+    else:  # 'delta'
+        deposit(2, 30, log, STRATEGY)
+    print(f'after T2: balance = {read_balance()}')
+
+print(f'\\nexpected: 100 + 50 + 30 = 180')
+print(f'actual:   {read_balance()}')
+print(f'{"✓ no anomaly" if read_balance() == 180 else "✗ LOST UPDATE"}')
+print(f'\\nlog ({len(log.read_all())} records):')
+for r in log.read_all(): print(' ', r)
+`}
+  initialFiles={{
+    'account.json': '{"owner": "Alice", "balance": 100}\n',
+    'wal.log': '',
+  }}
+  watchFiles={['account.json', 'wal.log']}
+/>
+
+What you should take away from running it three times: the WAL was never the problem. The WAL is the same in all three runs. What changes between them is the *discipline around the read* — whether the write is computed inside the database from a stable row state (`delta`), or whether the read takes a logical lock that excludes the other writer (`rowlock`), or whether nothing protects the gap at all (`none`). Isolation is the discipline. The log is just the recording medium.
+
+<details class="my-6 rounded-md border border-[color:var(--color-rule)] bg-[color:var(--color-code-bg)] px-4 py-3">
+<summary class="cursor-pointer font-sans text-sm font-semibold text-[color:var(--color-ink)] hover:text-[color:var(--color-accent)]">
+  Run this locally — two real processes, one shared WAL
+</summary>
+
+<div class="mt-4">
+
+The Pyodide sandbox is a single Python interpreter pretending to be two. The real shape of the bug needs *two operating-system processes* hammering the same balance at the same time, with the kernel scheduler — not a `for` loop — deciding the interleaving. Save the script below as `wal_concurrent.py`, run it once, and watch the unfixed version lose money on most runs and the locked version never lose any. Standard library only; no Docker, no Postgres, no extra dependencies.
+
+```python
+# wal_concurrent.py — chapter 03 companion. Two writers, one balance,
+# one shared WAL file. Runs the same race the in-browser sandbox stages,
+# but with real OS processes and a real fcntl lock.
+#
+# Usage:
+#   python3 wal_concurrent.py            # both runs (no-lock + locked)
+#   python3 wal_concurrent.py --runs 20  # 20 iterations of each
+#
+# Requires Python 3.8+. Tested on macOS and Linux.
+
+import argparse
+import fcntl
+import json
+import multiprocessing as mp
+import os
+import time
+
+WAL_PATH = "wal.log"
+DATA_PATH = "account.json"
+
+
+def reset():
+    with open(DATA_PATH, "w") as f:
+        json.dump({"owner": "Alice", "balance": 100}, f)
+    if os.path.exists(WAL_PATH):
+        os.remove(WAL_PATH)
+    open(WAL_PATH, "a").close()
+
+
+def read_balance():
+    with open(DATA_PATH) as f:
+        return json.load(f)["balance"]
+
+
+def write_balance(bal):
+    tmp = DATA_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"owner": "Alice", "balance": bal}, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.rename(tmp, DATA_PATH)
+
+
+def log_append(rec):
+    with open(WAL_PATH, "a") as f:
+        f.write(json.dumps(rec) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def deposit_unsafe(txn, amt, delay=0.01):
+    """No lock. The window between read and write is wide open — exactly
+    the §0 anomaly, except with two OS-level processes instead of a
+    rehearsed interleave."""
+    bal = read_balance()
+    log_append({"txn": txn, "op": "read", "balance": bal})
+    time.sleep(delay)  # exaggerate the race window
+    new = bal + amt
+    log_append({"txn": txn, "op": "write", "balance": new})
+    log_append({"txn": txn, "op": "commit"})
+    write_balance(new)
+
+
+def deposit_safe(txn, amt, delay=0.01):
+    """SELECT...FOR UPDATE pattern: take an exclusive flock on the data
+    file for the whole read-modify-write. The OS serialises the two
+    processes; whichever one acquires the lock first finishes its
+    full cycle before the other can start."""
+    with open(DATA_PATH, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        # Re-read inside the lock — the value may have moved since
+        # we opened the file, the way a snapshot would have aged.
+        f.seek(0)
+        bal = json.load(f)["balance"]
+        log_append({"txn": txn, "op": "read", "balance": bal})
+        time.sleep(delay)
+        new = bal + amt
+        log_append({"txn": txn, "op": "write", "balance": new})
+        log_append({"txn": txn, "op": "commit"})
+        # Rewrite the data file in place while we hold the lock.
+        f.seek(0)
+        f.truncate()
+        json.dump({"owner": "Alice", "balance": new}, f)
+        f.flush()
+        os.fsync(f.fileno())
+        # flock released automatically on close.
+
+
+def race(deposit_fn, runs):
+    losses = 0
+    for i in range(runs):
+        reset()
+        # Two processes each deposit $50. Expected final balance: 200.
+        p1 = mp.Process(target=deposit_fn, args=(1, 50))
+        p2 = mp.Process(target=deposit_fn, args=(2, 50))
+        p1.start(); p2.start()
+        p1.join(); p2.join()
+        bal = read_balance()
+        ok = bal == 200
+        if not ok:
+            losses += 1
+        print(f"  run {i+1:2d}: final balance = {bal}  {'OK' if ok else 'LOST UPDATE'}")
+    return losses
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--runs", type=int, default=10)
+    args = p.parse_args()
+
+    print(f"=== no lock (the anomaly) ===")
+    lost_unsafe = race(deposit_unsafe, args.runs)
+    print(f"  {lost_unsafe}/{args.runs} runs lost an update\n")
+
+    print(f"=== fcntl.flock around read-modify-write ===")
+    lost_safe = race(deposit_safe, args.runs)
+    print(f"  {lost_safe}/{args.runs} runs lost an update")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+Two notes on what the script is and isn't.
+
+It is a faithful reproduction of the lost update, the one anomaly the chapter built up to in §5 and demonstrated in the §8 sandbox. The unsafe path will lose updates on most runs — exactly how many depends on your kernel scheduler and the `delay` knob. The safe path uses `fcntl.flock` for the read-modify-write, which is the same advisory-locking pattern chapter 01 ended its disclosure with; it is `SELECT … FOR UPDATE` translated into the language of the filesystem. Zero lost updates.
+
+It is not a model of the other anomalies. Write skew, in particular, needs a *multi-row* invariant the lock manager has no way to know about, which is exactly the place a single-file flock breaks down. That's why a real database has a lock manager (chapter 07) and an MVCC subsystem (chapter 08) and an SSI dependency tracker. The hand-built WAL is the bedrock; everything in the next several chapters builds upward from it.
+
+</div>
+</details>
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+The phantom you met in §4 was the moment isolation stopped being about *rows* and started being about *predicates*. The reason that distinction is hard, structurally, is that a `WHERE active = true` query is implemented as a walk down an ordered structure, and "the space where a new row could appear" is a range in that structure, not a fixed set of keys.
+
+Chapter 04 is the chapter where data finally gets a *home*. Pages — the fixed-size units the disk and the buffer pool both speak in. Files — how a table is laid out across pages. B-trees — the ordered structure your range scan walks. Heap files, secondary indexes, the difference between a clustered and an unclustered scan, and the reason every index decision is, underneath, a page-management decision. Once you can see the B-tree, you can see why phantom prevention has to be predicate-aware: the predicate maps to a range in the tree, and the range is what you have to defend.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The six entries below are the ones to chase next. Each carries a short note on why it's worth the time.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Berenson, Bernstein, Gray, Melton, O'Neil, O'Neil, 1995 — "A Critique of ANSI SQL Isolation Levels."</strong> The paper that named phantoms and write skew and pointed out that the SQL standard's isolation definitions were under-specified. Required reading: every isolation-level table you have ever seen in a database textbook is, downstream, a response to this critique.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Gray &amp; Reuter, 1992 — "Transaction Processing: Concepts and Techniques."</strong> The canonical textbook. Chapter 7 on locking, chapter 8 on isolation, chapter 9 on recovery. Encyclopedic and still the reference; if you only ever own one transaction-processing book, this is the one.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Cahill, Röhm, Fekete, 2008 — "Serializable Isolation for Snapshot Databases."</strong> The SSI paper. The reason PostgreSQL's SERIALIZABLE works the way it does — detect dangerous read-write cycles at runtime and abort one of the offenders, rather than locking pre-emptively. Surprisingly readable for a paper that ended up shipping in production.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>PostgreSQL documentation — "Transaction Isolation."</strong> <a href="https://www.postgresql.org/docs/current/transaction-iso.html">postgresql.org/docs/current/transaction-iso.html</a>. Definitive on what Postgres's READ COMMITTED, REPEATABLE READ, and SERIALIZABLE actually do — and the famous footnote that REPEATABLE READ is really snapshot isolation.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>SQLite documentation — "File Locking And Concurrency."</strong> <a href="https://www.sqlite.org/lockingv3.html">sqlite.org/lockingv3.html</a>. SQLite's single-writer model and what BEGIN IMMEDIATE buys you. The other end of the design space from Postgres: one writer at a time, no MVCC, isolation by serialization rather than by versioning.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 7.</strong> Best modern overview of weak isolation, with the operational consequences brought forward — what your application is actually exposed to under READ COMMITTED, and how to reason about it. Read after this chapter to bind the names you've learned to production reality.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
