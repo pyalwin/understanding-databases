@@ -22,15 +22,17 @@ export function StepThrough({ steps, initial = 0, onStepChange }: Props) {
 
   return (
     <div className="font-sans text-[color:var(--color-fig-fg)]">
-      <div className="mb-3">{steps[i].content}</div>
-      <div className="flex items-center gap-3 text-xs">
+      <div className="mb-4">{steps[i].content}</div>
+      <div className="flex items-center gap-3 pt-3 border-t border-black/10">
         <button
           type="button"
           onClick={() => go(i - 1)}
-          className="px-2 py-1 rounded bg-[color:var(--color-fig-muted)]/20 hover:bg-[color:var(--color-fig-muted)]/40 disabled:opacity-40"
+          className="fig-btn"
           disabled={i === 0}
           aria-label="Previous step"
-        >Prev</button>
+        >
+          <span aria-hidden="true">←</span> Prev
+        </button>
         <input
           type="range"
           min={0}
@@ -43,12 +45,14 @@ export function StepThrough({ steps, initial = 0, onStepChange }: Props) {
         <button
           type="button"
           onClick={() => go(i + 1)}
-          className="px-2 py-1 rounded bg-[color:var(--color-fig-muted)]/20 hover:bg-[color:var(--color-fig-muted)]/40 disabled:opacity-40"
+          className="fig-btn"
           disabled={i === steps.length - 1}
           aria-label="Next step"
-        >Next</button>
-        <span className="text-[color:var(--color-fig-muted)] tabular-nums w-12 text-right">
-          {i + 1} / {steps.length}
+        >
+          Next <span aria-hidden="true">→</span>
+        </button>
+        <span className="text-[11px] text-[color:var(--color-fig-muted)] tabular-nums w-10 text-right">
+          {i + 1} <span className="opacity-50">/</span> {steps.length}
         </span>
       </div>
     </div>

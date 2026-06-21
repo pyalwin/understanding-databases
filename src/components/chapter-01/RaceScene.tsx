@@ -47,14 +47,14 @@ const frames: Frame[] = [
 
 function Pane({ title, users, color }: { title: string; users: FileState | null; color: string }) {
   return (
-    <div className="rounded-md border border-[color:var(--color-fig-muted)]/40 p-3 min-h-[110px]">
-      <div className="text-[10px] uppercase tracking-wider font-sans mb-2" style={{ color }}>{title}</div>
+    <div className="fig-card p-4 min-h-[120px]">
+      <div className="text-[10px] uppercase tracking-[0.12em] font-sans font-semibold mb-3" style={{ color }}>{title}</div>
       {users ? (
-        <ul className="font-mono text-sm space-y-1">
-          {users.map((u) => <li key={u}>· {u}</li>)}
+        <ul className="font-mono text-sm space-y-1.5">
+          {users.map((u) => <li key={u}><span className="opacity-40 mr-1">·</span>{u}</li>)}
         </ul>
       ) : (
-        <p className="text-[color:var(--color-fig-muted)] text-xs italic">empty / not yet read</p>
+        <p className="text-[color:var(--color-fig-muted)] text-xs italic opacity-70">empty · not yet read</p>
       )}
     </div>
   );

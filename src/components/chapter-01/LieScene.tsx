@@ -48,31 +48,32 @@ export function LieScene() {
             { name: 'Page cache', v: world.pageCache,color: 'var(--color-fig-orange)' },
             { name: 'Disk',       v: world.disk,     color: 'var(--color-fig-green)' },
           ].map((layer) => (
-            <div key={layer.name} className="rounded-md border border-[color:var(--color-fig-muted)]/40 p-3 min-h-[88px]">
-              <div className="text-[10px] uppercase tracking-wider font-sans mb-1" style={{ color: layer.color }}>{layer.name}</div>
+            <div key={layer.name} className="fig-card p-4 min-h-[96px]">
+              <div className="text-[10px] uppercase tracking-[0.12em] font-sans font-semibold mb-2" style={{ color: layer.color }}>{layer.name}</div>
               <div className="font-mono text-sm">
-                {layer.v ?? <span className="text-[color:var(--color-fig-muted)] italic">—</span>}
+                {layer.v ?? <span className="text-[color:var(--color-fig-muted)] italic opacity-60">—</span>}
               </div>
             </div>
           ))}
         </div>
-        <div className="flex items-center gap-4 flex-wrap">
+        <div className="flex items-center gap-3 flex-wrap pt-3 border-t border-black/10">
           <Toggle label="fsync after write" value={fsync} onChange={setFsync} />
+          <span className="text-black/20">·</span>
           <button
             type="button"
             onClick={write}
-            className="px-3 py-1.5 text-xs font-sans rounded bg-[color:var(--color-fig-blue)] text-black"
+            className="fig-btn fig-btn-primary"
           >write("balance=200")</button>
           <button
             type="button"
             onClick={crash}
             disabled={phase === 'idle'}
-            className="px-3 py-1.5 text-xs font-sans rounded bg-[color:var(--color-fig-red)] text-black disabled:opacity-40"
-          >pull the plug</button>
+            className="fig-btn fig-btn-danger"
+          >⚡ pull the plug</button>
           <button
             type="button"
             onClick={reset}
-            className="px-3 py-1.5 text-xs font-sans rounded bg-[color:var(--color-fig-muted)]/30"
+            className="fig-btn"
           >reset</button>
         </div>
         {phase === 'cached' && (

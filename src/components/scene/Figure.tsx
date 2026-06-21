@@ -13,10 +13,10 @@ export function Figure({ number, caption, breakout = true, children }: Props) {
     <figure
       className={
         (breakout ? 'figure-column' : 'prose-column') +
-        ' my-10 rounded-xl overflow-hidden border border-[color:var(--color-fig-bg)]/30 shadow-sm'
+        ' my-10 rounded-xl overflow-hidden border border-[color:var(--color-rule)] shadow-sm'
       }
     >
-      <div className="bg-[color:var(--color-fig-bg)] text-[color:var(--color-fig-fg)] p-6">
+      <div className="figure-surface bg-[color:var(--color-fig-bg)] text-[color:var(--color-fig-fg)] p-6">
         {children}
       </div>
       <figcaption className="bg-[color:var(--color-page)] border-t border-[color:var(--color-rule)] px-5 py-3 text-sm text-[color:var(--color-ink-soft)] font-sans">

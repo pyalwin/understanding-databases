@@ -72,17 +72,17 @@ export function TearScene() {
           value={crashAt ?? TOTAL}
           onChange={(v) => setCrashAt(v === TOTAL ? null : v)}
         />
-        <div className="flex gap-2">
+        <div className="flex gap-2 pt-1">
           <button
             type="button"
             onClick={start}
             disabled={running}
-            className="px-3 py-1.5 text-xs font-sans rounded bg-[color:var(--color-fig-blue)] text-black disabled:opacity-40"
-          >Start</button>
+            className="fig-btn fig-btn-primary"
+          >▶ Start</button>
           <button
             type="button"
             onClick={reset}
-            className="px-3 py-1.5 text-xs font-sans rounded bg-[color:var(--color-fig-muted)]/30"
+            className="fig-btn"
           >Reset</button>
         </div>
       </div>

@@ -8,6 +8,12 @@ import tailwindcss from '@tailwindcss/vite';
 export default defineConfig({
   adapter: cloudflare(),
   integrations: [react(), mdx()],
+  markdown: {
+    shikiConfig: {
+      theme: 'github-light',
+      wrap: true,
+    },
+  },
   vite: {
     plugins: [tailwindcss()],
   },

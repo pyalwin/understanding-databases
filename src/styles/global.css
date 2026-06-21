@@ -15,14 +15,14 @@
   --color-callout-warning: #fdf6e3;
   --color-callout-danger: #fdecea;
 
-  /* Figure (dark) palette — 3B1B-flavor */
-  --color-fig-bg: #0e1116;
-  --color-fig-fg: #e6e6e6;
-  --color-fig-muted: #8a8f99;
-  --color-fig-blue: #5b9dff;
-  --color-fig-orange: #ffae5b;
-  --color-fig-green: #7ad99a;
-  --color-fig-red: #ff7a7a;
+  /* Figure (light) palette — soft card on the cream page */
+  --color-fig-bg: #f3ecd8;      /* warmer than page, sets the card apart */
+  --color-fig-fg: #1c1917;      /* same ink as body */
+  --color-fig-muted: #78706a;
+  --color-fig-blue: #1e4fa5;
+  --color-fig-orange: #b04a14;
+  --color-fig-green: #2f6b3a;
+  --color-fig-red: #a91e1e;
 
   /* Typography */
   --font-serif: 'Source Serif 4', 'Charter', 'Iowan Old Style', 'Source Serif Pro', Georgia, serif;
@@ -59,6 +59,25 @@
     border-radius: 3px;
     font-size: 0.92em;
   }
+  /* Block code in prose (Shiki uses .astro-code, plain MDX uses bare <pre>). */
+  pre, pre.astro-code {
+    background: var(--color-code-bg);
+    color: var(--color-ink);
+    border: 1px solid var(--color-rule);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 1.25em 0;
+    font-size: 14.5px;
+    line-height: 1.6;
+    overflow-x: auto;
+    box-shadow: 0 1px 0 rgba(0, 0, 0, 0.02);
+  }
+  pre code {
+    background: transparent;
+    padding: 0;
+    font-size: inherit;
+    color: inherit;
+  }
   a {
     color: var(--color-accent);
     text-decoration-thickness: 1px;
@@ -70,4 +89,161 @@
   .prose-column { max-width: 660px; margin-inline: auto; }
   .figure-column { max-width: 880px; margin-inline: auto; }
   .page-column   { max-width: 1080px; margin-inline: auto; }
+}
+
+/* Interactive widgets inside figure cards (light palette) */
+.figure-surface input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  height: 4px;
+  background: rgba(0, 0, 0, 0.10);
+  border-radius: 999px;
+  outline: none;
+  cursor: pointer;
+}
+.figure-surface input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--color-fig-blue);
+  border: 2px solid var(--color-fig-bg);
+  cursor: grab;
+  box-shadow: 0 0 0 1px rgba(30, 79, 165, 0.45);
+  transition: transform 120ms ease;
+}
+.figure-surface input[type="range"]::-webkit-slider-thumb:hover {
+  transform: scale(1.15);
+}
+.figure-surface input[type="range"]::-webkit-slider-thumb:active {
+  cursor: grabbing;
+}
+.figure-surface input[type="range"]::-moz-range-thumb {
+  width: 16px;
+  height: 16px;
+  border-radius: 999px;
+  background: var(--color-fig-blue);
+  border: 2px solid var(--color-fig-bg);
+  cursor: grab;
+  box-shadow: 0 0 0 1px rgba(30, 79, 165, 0.45);
+}
+.figure-surface input[type="range"]::-moz-range-track {
+  height: 4px;
+  background: rgba(0, 0, 0, 0.10);
+  border-radius: 999px;
+}
+
+/* Buttons inside figure cards */
+.figure-surface .fig-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4em;
+  padding: 6px 12px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--color-fig-fg);
+  background: rgba(0, 0, 0, 0.04);
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 120ms ease, border-color 120ms ease;
+}
+.figure-surface .fig-btn:hover:not(:disabled) {
+  background: rgba(0, 0, 0, 0.08);
+  border-color: rgba(0, 0, 0, 0.22);
+}
+.figure-surface .fig-btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.figure-surface .fig-btn-primary {
+  background: var(--color-fig-blue);
+  color: #fff;
+  border-color: var(--color-fig-blue);
+}
+.figure-surface .fig-btn-primary:hover:not(:disabled) {
+  background: #173d80;
+  border-color: #173d80;
+}
+.figure-surface .fig-btn-danger {
+  background: rgba(169, 30, 30, 0.08);
+  color: var(--color-fig-red);
+  border-color: rgba(169, 30, 30, 0.30);
+}
+.figure-surface .fig-btn-danger:hover:not(:disabled) {
+  background: rgba(169, 30, 30, 0.14);
+  border-color: rgba(169, 30, 30, 0.50);
+}
+
+/* Inner card surfaces inside figure cards (panes used by scenes) */
+.figure-surface .fig-card {
+  background: rgba(0, 0, 0, 0.025);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 8px;
+}
+
+/* Disclosure widgets (e.g. "Show the real local version") */
+.chapter-section details > summary {
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+.chapter-section details > summary::-webkit-details-marker { display: none; }
+.chapter-section details > summary::marker { content: ''; }
+.chapter-section details > summary::before {
+  content: '▸';
+  flex-shrink: 0;
+  font-size: 0.85em;
+  color: var(--color-accent);
+  transition: transform 200ms ease;
+}
+.chapter-section details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+/* Click-to-copy button on prose code blocks */
+.code-copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 3px 10px;
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--color-ink-soft);
+  background: var(--color-page);
+  border: 1px solid var(--color-rule);
+  border-radius: 4px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 120ms ease, color 120ms ease, border-color 120ms ease;
+}
+pre:hover .code-copy-btn,
+.code-copy-btn:focus-visible {
+  opacity: 1;
+}
+.code-copy-btn:hover {
+  color: var(--color-ink);
+  border-color: var(--color-ink-soft);
+}
+.code-copy-btn.is-success {
+  opacity: 1;
+  color: var(--color-fig-green);
+  border-color: var(--color-fig-green);
+}
+
+/* Override prose <pre> styling when inside a figure (e.g., TearScene's disk display) */
+.figure-surface pre {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--color-fig-fg);
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 6px;
+  padding: 12px 14px;
+  margin: 0;
+  font-size: 13.5px;
+  line-height: 1.55;
+  box-shadow: none;
 }

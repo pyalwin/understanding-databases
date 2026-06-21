@@ -23,7 +23,7 @@ export function ContractSynthesis() {
             whileInView={{ opacity: 1, y: 0 }}
             viewport={{ once: true }}
             transition={{ delay: i * 0.15, duration: 0.5 }}
-            className="rounded-md border border-[color:var(--color-fig-muted)]/40 p-4 text-center"
+            className="fig-card p-5 text-center"
           >
             <div className="text-5xl font-serif" style={{ color: c.color }}>{c.letter}</div>
             <div className="font-sans text-sm mt-1 font-semibold">{c.word}</div>

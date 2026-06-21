@@ -27,12 +27,12 @@ export function InvariantScene() {
     >
       <div className="space-y-4">
         <div className="grid grid-cols-2 gap-3 font-mono text-sm">
-          <div className="rounded-md border border-[color:var(--color-fig-muted)]/40 p-3">
-            <div className="text-[10px] uppercase tracking-wider font-sans" style={{ color: 'var(--color-fig-blue)' }}>Account A</div>
+          <div className="fig-card p-4">
+            <div className="text-[10px] uppercase tracking-[0.12em] font-sans font-semibold" style={{ color: 'var(--color-fig-blue)' }}>Account A</div>
             <div className="text-2xl mt-1">${state.a}</div>
           </div>
-          <div className="rounded-md border border-[color:var(--color-fig-muted)]/40 p-3">
-            <div className="text-[10px] uppercase tracking-wider font-sans" style={{ color: 'var(--color-fig-orange)' }}>Account B</div>
+          <div className="fig-card p-4">
+            <div className="text-[10px] uppercase tracking-[0.12em] font-sans font-semibold" style={{ color: 'var(--color-fig-orange)' }}>Account B</div>
             <div className="text-2xl mt-1">${state.b}</div>
           </div>
         </div>
