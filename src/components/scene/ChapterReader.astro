@@ -1,0 +1,542 @@
+---
+interface Props {
+  chapterId: string;
+}
+const { chapterId } = Astro.props;
+---
+
+<div class="reader-shell" data-chapter-id={chapterId}>
+  {/* Sticky progress bar */}
+  <div
+    class="sticky top-0 z-30 -mx-6 mb-10 border-b border-[color:var(--color-rule)] px-6 py-3 backdrop-blur"
+    style="background: color-mix(in srgb, var(--color-page) 95%, transparent);"
+  >
+    <div class="page-column flex items-center gap-4">
+      <div class="font-sans text-[11px] text-[color:var(--color-ink-soft)] tabular-nums whitespace-nowrap font-medium">
+        <span class="text-[color:var(--color-accent)] font-semibold" data-progress-count>0</span>
+        <span class="opacity-50"> / <span data-progress-total>0</span> checkpoints</span>
+      </div>
+      <div class="flex-1 h-1.5 bg-[color:var(--color-rule)] rounded-full overflow-hidden">
+        <div
+          class="h-full transition-all duration-500"
+          style="width: 0%; background: var(--color-accent);"
+          data-progress-bar
+        ></div>
+      </div>
+      <div
+        class="font-sans text-[11px] font-semibold tabular-nums w-10 text-right"
+        style="color: var(--color-accent);"
+        data-progress-pct
+      >0%</div>
+    </div>
+  </div>
+
+  <div class="flex gap-12 items-start">
+    {/* Sidebar TOC */}
+    <aside class="hidden lg:block w-56 flex-shrink-0 sticky top-24 self-start max-h-[calc(100vh-7rem)] overflow-y-auto pr-1">
+      <div class="font-sans text-[10px] uppercase tracking-[0.18em] text-[color:var(--color-ink-soft)] font-semibold mb-3">
+        Checkpoints
+      </div>
+      <ol class="space-y-1.5" data-reader-toc></ol>
+      <div
+        class="mt-6 p-3 rounded-md text-center font-sans text-xs hidden"
+        data-reader-trophy
+        style="background: var(--color-callout-tip); border: 1px solid var(--color-fig-green); color: var(--color-fig-green);"
+      >
+        <div class="text-base mb-1">🏆</div>
+        Chapter mastered
+      </div>
+    </aside>
+
+    {/* Main column — the slot includes all <section.chapter-section> blocks */}
+    <main class="flex-1 min-w-0 max-w-[660px]" data-reader-main>
+      <slot />
+    </main>
+  </div>
+
+  {/* Quiz modal */}
+  <div
+    class="fixed inset-0 z-50 bg-black/35 backdrop-blur-sm items-center justify-center p-4"
+    style="display: none;"
+    data-quiz-modal
+  >
+    <div
+      class="rounded-xl max-w-xl w-full p-7 shadow-2xl border border-[color:var(--color-rule)]"
+      style="background: var(--color-page);"
+      data-quiz-card
+    >
+      <p
+        class="font-sans text-[11px] tracking-[0.18em] uppercase font-semibold mb-3"
+        style="color: var(--color-accent);"
+      >
+        Checkpoint question
+      </p>
+      <h3 class="text-xl font-semibold mb-6 leading-snug" data-quiz-question></h3>
+      <ul class="space-y-2 mb-6" data-quiz-options></ul>
+      <p
+        class="text-sm mb-4 font-sans hidden"
+        style="color: var(--color-fig-red);"
+        data-quiz-feedback
+      >
+        Not quite — re-read the section and try again.
+      </p>
+      <div class="flex items-center justify-between gap-3">
+        <button
+          type="button"
+          data-quiz-close
+          class="text-sm font-sans text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)]"
+        >
+          ← Back to reading
+        </button>
+        <button
+          type="button"
+          data-quiz-action
+          class="px-5 py-2.5 text-sm font-sans font-semibold rounded-md text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          style="background: var(--color-accent);"
+        >
+          Check answer
+        </button>
+      </div>
+    </div>
+  </div>
+
+  {/* Celebration toast */}
+  <div class="fixed inset-x-0 bottom-6 z-40 justify-center pointer-events-none hidden" data-celebrate>
+    <div
+      class="pointer-events-auto px-6 py-3 rounded-full shadow-xl font-sans text-sm font-semibold flex items-center gap-2"
+      style="background: var(--color-fig-green); color: #fff;"
+    >
+      <span class="text-lg">🏆</span>
+      Chapter mastered — every checkpoint complete.
+    </div>
+  </div>
+</div>
+
+<script>
+  interface QuizOption { text: string; correct?: boolean }
+  interface QuizSpec { question: string; options: QuizOption[] }
+  interface SectionRef {
+    id: string;
+    title: string;
+    quiz: QuizSpec | null;
+    el: HTMLElement;
+  }
+
+  function bootReader(shell: HTMLElement) {
+    const chapterId = shell.getAttribute('data-chapter-id') || 'unknown';
+    const storageKey = `chapter-progress:${chapterId}`;
+
+    const mainEl = shell.querySelector<HTMLElement>('[data-reader-main]');
+    if (!mainEl) return;
+
+    const sectionEls = Array.from(mainEl.querySelectorAll<HTMLElement>('.chapter-section'));
+    if (sectionEls.length === 0) return;
+
+    const sections: SectionRef[] = sectionEls.map((el) => {
+      const quizAttr = el.getAttribute('data-checkpoint-quiz');
+      let quiz: QuizSpec | null = null;
+      if (quizAttr) {
+        try { quiz = JSON.parse(quizAttr); } catch { quiz = null; }
+      }
+      return {
+        id: el.getAttribute('data-checkpoint-id') || '',
+        title: el.getAttribute('data-checkpoint-title') || '',
+        quiz,
+        el,
+      };
+    });
+    const total = sections.length;
+
+    // Stamp each section with its checkpoint number and total
+    sections.forEach((s, i) => {
+      const num = s.el.querySelector<HTMLElement>('[data-section-num]');
+      const tot = s.el.querySelector<HTMLElement>('[data-section-total]');
+      if (num) num.textContent = String(i + 1);
+      if (tot) tot.textContent = String(total);
+    });
+
+    let currentIndex = 0;
+    let completed = new Set<string>();
+
+    try {
+      const raw = localStorage.getItem(storageKey);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed.completed)) completed = new Set(parsed.completed);
+        if (typeof parsed.currentIndex === 'number') {
+          currentIndex = Math.min(Math.max(parsed.currentIndex, 0), total - 1);
+        }
+      }
+    } catch { /* ignore */ }
+
+    const persist = () => {
+      try {
+        localStorage.setItem(storageKey, JSON.stringify({
+          completed: Array.from(completed),
+          currentIndex,
+        }));
+      } catch { /* ignore */ }
+    };
+
+    const $ = <T extends Element = HTMLElement>(sel: string) => shell.querySelector<T>(sel);
+
+    /* Sidebar TOC */
+    const tocList = $<HTMLOListElement>('[data-reader-toc]');
+    const renderTOC = () => {
+      if (!tocList) return;
+      tocList.innerHTML = '';
+      const currentDone = completed.has(sections[currentIndex].id);
+      sections.forEach((s, i) => {
+        const li = document.createElement('li');
+        const done = completed.has(s.id);
+        const active = i === currentIndex;
+        const accessible =
+          done || i <= currentIndex || (i === currentIndex + 1 && currentDone);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.disabled = !accessible;
+        btn.className =
+          'w-full text-left flex items-start gap-2.5 py-1.5 text-[13.5px] font-sans rounded ' +
+          (accessible ? 'cursor-pointer hover:opacity-80 ' : 'cursor-not-allowed ') +
+          (active ? 'font-semibold' : '');
+        btn.style.color = active
+          ? 'var(--color-accent)'
+          : done
+          ? 'var(--color-ink)'
+          : accessible
+          ? 'var(--color-ink-soft)'
+          : 'color-mix(in srgb, var(--color-ink-soft) 40%, transparent)';
+
+        const badge = document.createElement('span');
+        badge.className = 'flex-shrink-0 w-5 h-5 rounded-full text-[10px] flex items-center justify-center font-mono mt-0.5';
+        badge.style.background = done
+          ? 'var(--color-accent)'
+          : active
+          ? 'var(--color-accent-soft)'
+          : 'transparent';
+        badge.style.border = !done ? '1px solid var(--color-rule)' : 'none';
+        badge.style.color = done ? '#fff' : active ? 'var(--color-accent)' : 'var(--color-ink-soft)';
+        badge.textContent = done ? '✓' : String(i + 1);
+
+        const label = document.createElement('span');
+        label.className = 'flex-1 leading-snug';
+        label.textContent = s.title;
+
+        btn.appendChild(badge);
+        btn.appendChild(label);
+        btn.addEventListener('click', () => goTo(i));
+        li.appendChild(btn);
+        tocList.appendChild(li);
+      });
+    };
+
+    /* Progress bar */
+    const trophyEl = $<HTMLDivElement>('[data-reader-trophy]');
+    const progressCount = $<HTMLSpanElement>('[data-progress-count]');
+    const progressTotal = $<HTMLSpanElement>('[data-progress-total]');
+    const progressBar = $<HTMLDivElement>('[data-progress-bar]');
+    const progressPct = $<HTMLDivElement>('[data-progress-pct]');
+    if (progressTotal) progressTotal.textContent = String(total);
+
+    const updateProgress = () => {
+      const count = completed.size;
+      const pct = Math.round((count / total) * 100);
+      if (progressCount) progressCount.textContent = String(count);
+      if (progressBar) progressBar.style.width = pct + '%';
+      if (progressPct) progressPct.textContent = pct + '%';
+      if (trophyEl) {
+        if (count === total) trophyEl.classList.remove('hidden');
+        else trophyEl.classList.add('hidden');
+      }
+    };
+
+    /* Section visibility & CTA */
+    const updateSectionUI = () => {
+      sections.forEach((s, i) => {
+        const isActive = i === currentIndex;
+        if (isActive) s.el.removeAttribute('hidden');
+        else s.el.setAttribute('hidden', '');
+
+        const completeTag = s.el.querySelector<HTMLElement>('[data-section-complete-tag]');
+        if (completeTag) {
+          if (completed.has(s.id)) completeTag.classList.remove('hidden');
+          else completeTag.classList.add('hidden');
+        }
+
+        const prevBtn = s.el.querySelector<HTMLButtonElement>('[data-prev-checkpoint]');
+        if (prevBtn) prevBtn.disabled = i === 0;
+
+        const ctaBtn = s.el.querySelector<HTMLButtonElement>('[data-primary-cta]');
+        if (ctaBtn) {
+          const isLast = i === total - 1;
+          const isComplete = completed.has(s.id);
+          ctaBtn.disabled = false;
+          ctaBtn.style.background = 'var(--color-accent)';
+          if (isComplete && !isLast) {
+            ctaBtn.textContent = 'Next checkpoint →';
+          } else if (isComplete && isLast) {
+            ctaBtn.textContent = 'Chapter complete ✓';
+            ctaBtn.disabled = true;
+          } else if (s.quiz) {
+            ctaBtn.textContent = 'Mark complete & continue →';
+          } else if (isLast) {
+            ctaBtn.textContent = 'Finish chapter';
+          } else {
+            ctaBtn.textContent = 'Mark complete & continue →';
+          }
+        }
+      });
+    };
+
+    /* Quiz */
+    const quizModal = $<HTMLDivElement>('[data-quiz-modal]');
+    const quizQuestion = $<HTMLHeadingElement>('[data-quiz-question]');
+    const quizOptions = $<HTMLUListElement>('[data-quiz-options]');
+    const quizFeedback = $<HTMLParagraphElement>('[data-quiz-feedback]');
+    const quizAction = $<HTMLButtonElement>('[data-quiz-action]');
+    const quizClose = $<HTMLButtonElement>('[data-quiz-close]');
+    let quizSelected: number | null = null;
+    let quizSubmitted = false;
+
+    const showQuiz = () => {
+      const cur = sections[currentIndex];
+      if (!cur.quiz || !quizModal) return;
+      quizSelected = null;
+      quizSubmitted = false;
+      if (quizQuestion) quizQuestion.textContent = cur.quiz.question;
+      if (quizFeedback) quizFeedback.classList.add('hidden');
+      renderQuizOptions();
+      renderQuizAction();
+      quizModal.style.display = 'flex';
+    };
+
+    const hideQuiz = () => {
+      if (!quizModal) return;
+      quizModal.style.display = 'none';
+    };
+
+    const renderQuizOptions = () => {
+      const cur = sections[currentIndex];
+      if (!cur.quiz || !quizOptions) return;
+      quizOptions.innerHTML = '';
+      cur.quiz.options.forEach((opt, i) => {
+        const li = document.createElement('li');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        const isThis = quizSelected === i;
+        const showRight = quizSubmitted && isThis && opt.correct === true;
+        const showWrong = quizSubmitted && isThis && opt.correct !== true;
+        btn.className =
+          'w-full text-left px-4 py-3 rounded-md border font-sans text-[15px] leading-snug transition-colors flex items-start gap-3';
+        if (showRight) {
+          btn.style.borderColor = 'var(--color-fig-green)';
+          btn.style.background = 'var(--color-callout-tip)';
+        } else if (showWrong) {
+          btn.style.borderColor = 'var(--color-fig-red)';
+          btn.style.background = 'var(--color-callout-danger)';
+        } else if (isThis) {
+          btn.style.borderColor = 'var(--color-accent)';
+          btn.style.background = 'var(--color-accent-soft)';
+        } else {
+          btn.style.borderColor = 'var(--color-rule)';
+          btn.style.background = 'transparent';
+        }
+        btn.disabled = quizSubmitted && isThis && opt.correct === true;
+        const letter = document.createElement('span');
+        letter.className = 'font-mono text-xs mt-0.5 w-4 text-[color:var(--color-ink-soft)]';
+        letter.textContent = String.fromCharCode(65 + i);
+        const text = document.createElement('span');
+        text.textContent = opt.text;
+        btn.appendChild(letter);
+        btn.appendChild(text);
+        btn.addEventListener('click', () => {
+          quizSelected = i;
+          quizSubmitted = false;
+          if (quizFeedback) quizFeedback.classList.add('hidden');
+          renderQuizOptions();
+          renderQuizAction();
+        });
+        li.appendChild(btn);
+        quizOptions.appendChild(li);
+      });
+    };
+
+    const renderQuizAction = () => {
+      if (!quizAction) return;
+      const cur = sections[currentIndex];
+      const correct =
+        quizSelected !== null && cur.quiz?.options[quizSelected].correct === true;
+      if (quizSubmitted && correct) {
+        quizAction.textContent = '✓ Correct — continue →';
+        quizAction.style.background = 'var(--color-fig-green)';
+        quizAction.onclick = () => advance();
+        quizAction.disabled = false;
+      } else {
+        quizAction.textContent = 'Check answer';
+        quizAction.style.background = 'var(--color-accent)';
+        quizAction.disabled = quizSelected === null;
+        quizAction.onclick = () => {
+          if (quizSelected === null) return;
+          quizSubmitted = true;
+          const isCorrect = cur.quiz?.options[quizSelected].correct === true;
+          if (!isCorrect && quizFeedback) quizFeedback.classList.remove('hidden');
+          renderQuizOptions();
+          renderQuizAction();
+        };
+      }
+    };
+
+    if (quizClose) quizClose.addEventListener('click', hideQuiz);
+    if (quizModal) {
+      quizModal.addEventListener('click', (e) => {
+        if (e.target === quizModal) hideQuiz();
+      });
+    }
+
+    /* Navigation */
+    const advance = () => {
+      const cur = sections[currentIndex];
+      completed.add(cur.id);
+      if (completed.size === total) showCelebrate();
+      if (currentIndex < total - 1) currentIndex++;
+      persist();
+      hideQuiz();
+      renderTOC();
+      updateProgress();
+      updateSectionUI();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
+    const goTo = (i: number) => {
+      if (i < 0 || i >= total) return;
+      const target = sections[i];
+      // Accessible if it's behind us, already completed in the past,
+      // or it's the immediate next section and the current one is done.
+      const currentDone = completed.has(sections[currentIndex].id);
+      const accessible =
+        i <= currentIndex ||
+        completed.has(target.id) ||
+        (i === currentIndex + 1 && currentDone);
+      if (!accessible) return;
+      currentIndex = i;
+      persist();
+      hideQuiz();
+      renderTOC();
+      updateProgress();
+      updateSectionUI();
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    };
+
+    /* Wire up per-section CTA + prev buttons via delegation */
+    sections.forEach((s, i) => {
+      const prevBtn = s.el.querySelector<HTMLButtonElement>('[data-prev-checkpoint]');
+      if (prevBtn) prevBtn.addEventListener('click', () => goTo(i - 1));
+      const ctaBtn = s.el.querySelector<HTMLButtonElement>('[data-primary-cta]');
+      if (ctaBtn) {
+        ctaBtn.addEventListener('click', () => {
+          const isLast = i === total - 1;
+          const isComplete = completed.has(s.id);
+          if (isComplete) {
+            if (!isLast) goTo(i + 1);
+            return;
+          }
+          if (s.quiz) {
+            showQuiz();
+          } else {
+            advance();
+          }
+        });
+      }
+    });
+
+    /* Celebrate */
+    const celebrateEl = $<HTMLDivElement>('[data-celebrate]');
+    const showCelebrate = () => {
+      if (!celebrateEl) return;
+      celebrateEl.classList.remove('hidden');
+      celebrateEl.style.display = 'flex';
+      setTimeout(() => {
+        celebrateEl.style.display = '';
+        celebrateEl.classList.add('hidden');
+      }, 4000);
+    };
+
+    /* Escape closes quiz */
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') hideQuiz();
+    });
+
+    /* Intercept footnote anchor clicks. When the user clicks a footnote
+       marker inside one section, jump the reader to whichever section
+       contains the matching anchor (typically the Sources section) and
+       scroll to it. Unlocks that section if it wasn't yet reached. */
+    shell.addEventListener('click', (e) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      const anchor = target.closest('a[href^="#fn-"]') as HTMLAnchorElement | null;
+      if (!anchor) return;
+      const href = anchor.getAttribute('href') || '';
+      const id = href.slice(1);
+      const dest = document.getElementById(id);
+      if (!dest) return;
+      const destSection = dest.closest('.chapter-section') as HTMLElement | null;
+      if (!destSection) return;
+      const destIndex = sections.findIndex((s) => s.el === destSection);
+      if (destIndex === -1) return;
+      if (destIndex !== currentIndex) {
+        e.preventDefault();
+        currentIndex = destIndex;
+        persist();
+        hideQuiz();
+        renderTOC();
+        updateProgress();
+        updateSectionUI();
+        requestAnimationFrame(() => {
+          const el = document.getElementById(id);
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        });
+      }
+    });
+
+    /* Decorate prose code blocks with a copy button. Skip blocks inside
+       interactive figures (sandboxes, scene components) where editing or
+       cloning would break behaviour. */
+    const decorateCodeBlocks = () => {
+      shell.querySelectorAll<HTMLPreElement>('pre').forEach((pre) => {
+        if (pre.dataset.copyBtnAttached === '1') return;
+        if (pre.closest('.figure-column, astro-island')) return;
+        pre.dataset.copyBtnAttached = '1';
+        pre.style.position = 'relative';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'code-copy-btn';
+        btn.setAttribute('aria-label', 'Copy code to clipboard');
+        btn.textContent = 'Copy';
+        pre.appendChild(btn);
+        btn.addEventListener('click', async () => {
+          const codeEl = pre.querySelector('code');
+          const text = (codeEl ? codeEl.textContent : pre.textContent) || '';
+          try {
+            await navigator.clipboard.writeText(text);
+            btn.textContent = '✓ Copied';
+            btn.classList.add('is-success');
+          } catch {
+            btn.textContent = 'Press Ctrl+C';
+          }
+          setTimeout(() => {
+            btn.textContent = 'Copy';
+            btn.classList.remove('is-success');
+          }, 1600);
+        });
+      });
+    };
+
+    /* Initial paint */
+    renderTOC();
+    updateProgress();
+    updateSectionUI();
+    decorateCodeBlocks();
+  }
+
+  document.querySelectorAll<HTMLElement>('[data-chapter-id]').forEach(bootReader);
+</script>

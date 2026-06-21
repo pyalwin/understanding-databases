@@ -1,0 +1,48 @@
+---
+interface QuizOption {
+  text: string;
+  correct?: boolean;
+}
+interface Props {
+  id: string;
+  title: string;
+  quiz?: {
+    question: string;
+    options: QuizOption[];
+  };
+}
+const { id, title, quiz } = Astro.props;
+---
+<section
+  class="chapter-section"
+  data-checkpoint-id={id}
+  data-checkpoint-title={title}
+  data-checkpoint-quiz={quiz ? JSON.stringify(quiz) : undefined}
+  hidden
+>
+  <p class="font-sans text-[11px] tracking-[0.18em] uppercase font-semibold mb-3" style="color: var(--color-accent);">
+    Checkpoint <span data-section-num>1</span> of <span data-section-total>1</span>
+    <span class="ml-2 opacity-75 hidden" data-section-complete-tag>✓ completed</span>
+  </p>
+  <h2 class="text-3xl font-semibold mb-8 leading-tight">{title}</h2>
+  <div class="space-y-5 text-[18px]">
+    <slot />
+  </div>
+  <div class="mt-14 pt-6 border-t border-[color:var(--color-rule)] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+    <button
+      type="button"
+      data-prev-checkpoint
+      class="font-sans text-sm text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)] disabled:opacity-30 disabled:cursor-not-allowed text-left"
+    >
+      ← Previous checkpoint
+    </button>
+    <button
+      type="button"
+      data-primary-cta
+      class="px-6 py-3 text-sm font-sans font-semibold rounded-md text-white transition-opacity disabled:opacity-50 disabled:cursor-default"
+      style="background: var(--color-accent);"
+    >
+      Mark complete & continue →
+    </button>
+  </div>
+</section>
