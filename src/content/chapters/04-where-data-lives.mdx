@@ -1,0 +1,333 @@
+---
+title: Where Data Actually Lives
+chapterNumber: 4
+summary: The JSON blob you've been rewriting whole falls apart the moment the file gets big. Build a page, a heap, and a B-tree by hand — then watch a real SQLite use the exact same machinery, by name.
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import { SqlSandboxReact } from '@/components/SqlSandboxReact';
+import PageLayoutScene from '@/components/chapter-04/PageLayoutScene';
+import ScanScene from '@/components/chapter-04/ScanScene';
+import BTreeScene from '@/components/chapter-04/BTreeScene';
+import FanoutScene from '@/components/chapter-04/FanoutScene';
+import IndexKindsScene from '@/components/chapter-04/IndexKindsScene';
+import { PAGE_SANDBOX, HEAP_SANDBOX, SCAN_SANDBOX } from '@/components/chapter-04/sandboxes';
+import { BTREE_SANDBOX } from '@/components/chapter-04/btree-sandbox';
+import { SQL_PAYOFF } from '@/components/chapter-04/sql-payoff';
+
+<ChapterReader chapterId="04-where-data-lives">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Your database is a single JSON file you rewrite whole on every change. Someone moves $50 between two of forty million accounts. What did that one transfer actually cost?",
+    options: [
+      { text: "Re-serializing and re-writing the entire file — tens of megabytes of IO to change 16 bytes.", correct: true },
+      { text: "16 bytes of IO, because only the two balances changed." },
+      { text: "Nothing measurable, because the OS only flushes the dirty bytes." },
+    ],
+  }}
+>
+
+You can commit now. You can isolate. The thing underneath still doesn't know how to store a row.
+
+Look at what the last two chapters bought you. Chapter 02 built a write-ahead log by hand, and with it the two hardest guarantees in the book: a transaction either happened or it didn't, and once you've been told it happened, a power cut can't take it back. Chapter 03 put a second transaction in the room and worked out, anomaly by anomaly, exactly what each one is allowed to see of the other's in-flight work. Durability, atomicity, isolation — earned, built, demonstrated. You could walk into a room of database people and hold your own.
+
+And the "database" underneath all of that is still `users.json`. A single file. Every change rewrites the whole thing.
+
+That was a deliberate choice, not an oversight — the JSON file is the only version where you can *see* the WAL dance happen, and chapters 02 and 03 needed you to see it. But it has been quietly lying to you about cost the entire time, and chapter 04 is where the bill comes due. Picture the bank from chapter 02, grown up: forty million accounts, one file. Someone transfers fifty dollars. Your beautifully correct WAL appends a tiny record, fsyncs it, and then — to apply the change — re-serializes forty million account objects to a temp file and renames it over the old one. Tens of megabytes of disk IO. To move sixteen bytes. Do that a thousand times a second and you don't have a bank; you have a space heater.
+
+We hit the edge of this in chapter 02 and named the way out in a single sentence: *real databases pack many rows per file and write only the bytes that changed; we'll meet that idea, called the page, in chapter 04.* This is chapter 04. We are going to cash that promise.
+
+Here is the plan, and it is the chapter-02 plan all over again: you build the thing, by hand, in Python, in your browser, and you feel each version break before you fix it. First a **page** — a fixed-size block that holds many rows and can be rewritten on its own. Then a **heap file** — a stack of pages that a whole table lives in, where inserts are cheap. Then you ask it a question, and watch the lookup read the entire file, because the heap has no idea where anything is. That pain is the whole motivation for the back half of the chapter: a **B-tree**, the structure every relational database reaches for to turn "read everything" into "read four pages." You'll build that too — search, insert, and the node **split** that keeps it balanced — and then watch why it stays only three or four levels deep even for billions of rows. We close by opening a real SQLite and watching it print the exact words you just built, by their real names.
+
+By the end you won't have read about a storage engine. You'll have written one.
+
+</Section>
+
+<Section
+  id="the-page"
+  title="The page"
+  quiz={{
+    question: "You build a 4KB page with a slot directory, fill it, then delete the row in slot 3. What does the page do with slot 3 — and why that, instead of shifting the later rows down to reclaim the bytes?",
+    options: [
+      { text: "It leaves slot 3 in the directory as a tombstone (length 0); shifting bytes would change every other row's offset and break every (page, slot) address pointing into the page.", correct: true },
+      { text: "It removes slot 3 from the directory and renumbers the remaining slots so they stay contiguous." },
+      { text: "It shifts all later rows down immediately, because a page must never contain free space in the middle." },
+    ],
+  }}
+>
+
+Start with the smallest unit that isn't a row. Ask why it exists.
+
+When your program reads from a disk, it does not get to ask for sixteen bytes. The disk doesn't deal in bytes and neither does the operating system sitting on top of it; they deal in fixed-size **blocks** — historically 512 bytes, today usually 4KB at the hardware level and 4KB or larger at the filesystem level. Ask for one byte and the machinery underneath reads the whole block that contains it and hands you the byte you wanted. IO is *block-granular* whether you like it or not. A database that wants its costs to be predictable does the obvious thing: it stops fighting the grain and matches it. It picks a fixed size — SQLite defaults to 4KB, PostgreSQL to 8KB, plenty of engines to 16KB — and makes that block the atom of everything it does.<Footnote n={5} /> That atom is the **page**. The database doesn't read rows from disk. It reads pages, and finds rows inside them.
+
+So a page is a fixed-size block — say 4096 bytes — and the question becomes: how do you pack a handful of variable-length rows into a fixed box so that you can find them, delete them, and reuse the space, without rewriting the whole box every time? The answer is one of the oldest tricks in systems programming, and once you see it you'll see it everywhere.
+
+<PageLayoutScene client:visible />
+
+You grow from both ends. At the top of the page sits a small header, and just below it an array that grows *downward*: the **slot directory**. Each entry — a slot — is a tiny fixed-size record, just an (offset, length) pair, pointing at where a row's bytes actually live. The row bytes themselves go at the *bottom* of the page and grow *upward*. Between the directory creeping down and the row data creeping up is the free space, and a single pointer marks the boundary. To insert a row, you copy its bytes into the free space at the bottom, write an (offset, length) slot at the top, and move the free pointer. When the directory and the data meet, the page is full. That's it. That's a page.
+
+The indirection is the whole point, and it's worth being precise about *why* you need it. Rows are variable-length — "Bob" and "Maximilian" are not the same number of bytes — so you cannot find row number five by multiplying five by a fixed row size. You need a lookup: *row five lives at offset 3,072, length 24.* The slot directory is that lookup. And because a row is addressed by its **slot number**, not by its byte offset, the bytes are free to move without anything outside the page noticing. That's what makes deletes and compaction cheap.
+
+Which brings us to the delete, and the most important small decision in the whole layout. When you delete the row in slot 3, you do *not* shift the rows after it down to fill the hole. You leave the slot in the directory and set its length to zero — a **tombstone**. Why leave a dead slot lying around? Because the slot number *is the address*. In the next section, a row's permanent physical address will be the pair (page number, slot number), and pointers all over the database — indexes, especially — will hold those addresses. If deleting slot 3 renumbered slots 4 and 5 down to 3 and 4, every pointer to those rows would now point at the wrong row. So the slot stays. The byte space it pointed at can be reclaimed later by a compaction pass that slides the live rows together and rewrites the directory offsets — but the *slot numbers* are sacred. Tombstone now, reclaim the bytes later, never renumber.
+
+The sandbox below is a page in about thirty lines: a fixed `bytearray`, a slot directory, a free-space pointer, `insert`, `read`, and `delete`. Run it. It inserts 200-byte rows until the page refuses one — proving, concretely, that a page is *finite*, which is the fact the entire next section is built on. Then it deletes a slot and shows you the tombstone.
+
+<PythonSandbox client:only="react" initialCode={PAGE_SANDBOX} />
+
+Notice what you've actually built. A database file is not a stream of rows. It is an array of fixed-size pages, and each page is a tiny self-describing heap — header, directory, data, free space — that knows how to manage its own little patch of disk without consulting anyone. That self-containment is going to matter twice more: once in a moment, when we stack pages into a file, and once in the last chapter's tease, when these same pages turn out to live in memory while you use them, and the page becomes the unit of *caching* as well as the unit of IO. One block, one read, one cached thing. The page is the noun the rest of the storage engine is written in.
+
+</Section>
+
+<Section
+  id="the-heap"
+  title="The heap"
+  quiz={{
+    question: "A heap file appends each new row to the last page (or a fresh page when that one is full) and hands back a (page_no, slot) address. What did you just make cheap, and what did you defer the cost of?",
+    options: [
+      { text: "Inserts are now O(1) appends with no reorganization; the deferred cost is lookup-by-value, because the heap keeps no order and has no idea which page a given id lives on.", correct: true },
+      { text: "Both inserts and lookups are now O(1), because the (page_no, slot) address is returned at insert time." },
+      { text: "Lookups got cheap because rows are stored in sorted order; inserts got expensive because each one must find its sorted position." },
+    ],
+  }}
+>
+
+One page holds a few dozen rows. A table holds millions. So you need more than one page — and the simplest possible way to have more than one page is to put them in a row.
+
+Stack them. A **heap file** is exactly that: an ordered array of pages, page 0 then page 1 then page 2, all in one file on disk. When you want to insert a row, you try to drop it into the last page. If the last page has room, done. If it's full, you allocate a new page at the end and put the row there. That's the entire allocation strategy, and the name tells you the philosophy: it's a *heap*, a pile, rows tossed wherever there's space, in no particular order. "Heap" is the real term — it's the default table storage in PostgreSQL, and the mental model behind the basic table in most engines.
+
+Because a row now lives at a specific spot in a specific page, it gets a permanent physical address: the pair **(page number, slot number)**. Page 7, slot 3. That pair is the row's home, and it is stable — remember, slot numbers never get renumbered, which is what makes the address safe to hand out and store. This is a real thing with a real name. PostgreSQL calls it the `ctid` — the tuple identifier — and it is, almost exactly, a (block number, slot number) pair. Other engines call it a row id or a record id. Whatever the name, it's the answer to "where, physically, is this row," and we're going to lean on it hard in two sections when an index needs something to point at.
+
+<PythonSandbox client:only="react" initialCode={HEAP_SANDBOX} />
+
+Run the sandbox and watch the page count climb as you pour rows in. The `Heap` class is almost embarrassingly simple — it wraps a list of the pages you already built, and `insert` is "try the last page; if it's full, make a new one." Five hundred rows land across some handful of pages, each row's (page_no, slot) address handed back as it goes in. Pull row 123 back out by its address and there it is. No searching. You knew exactly where it was, because you were told when you put it there.
+
+And that simplicity is the entire trade you just made, so look at it squarely. Inserts are *cheap*: an append to the last page, no scanning, no sorting, no shuffling existing rows around. O(1), give or take a page allocation. This is why the heap is such a popular default — a table you mostly append to is a table the heap serves beautifully, and you never pay to keep anything in order because nothing is in order.
+
+But "nothing is in order" is a debt, not a gift, and the bill arrives the instant someone asks a question that *isn't* "give me the row at this exact address." Because here is the thing the heap cannot do: if you know a row's *value* — `WHERE id = 8675309` — but not its address, the heap has no idea which page it's on. None. The rows are in insertion order, which is to say no order you can search. The id you want could be on page 0 or page 4,000 and the only way to find out is to go look. We made insert cheap by refusing to maintain any structure. The lookup is where we find out what that refusal costs.
+
+</Section>
+
+<Section
+  id="the-scan"
+  title="The full scan"
+  quiz={{
+    question: "Using the scan you built: a heap of 4,000 pages answers `WHERE id = 8675309` for an id that is present, and again for an id that is absent. How do the two costs compare?",
+    options: [
+      { text: "Identical in the worst case — both may read all 4,000 pages; the absent id is guaranteed to, and a present id does on average half the file. The heap can't stop early because it has no order to rule anything out.", correct: true },
+      { text: "The absent id is cheaper, because the scan can detect early that the value is out of range and stop." },
+      { text: "The present id is O(1) and the absent id is O(n); only misses require a full scan." },
+    ],
+  }}
+>
+
+So you ask your heap a question. `SELECT balance FROM accounts WHERE id = 8675309`.
+
+There are forty million rows in this file and the row you want is, as far as the file is concerned, nowhere in particular. So the heap does the only thing it knows how to do: it starts at page 0 and it reads. Page after page after page, pulling each one off disk, walking its slot directory, comparing every id in it to the one you're looking for, moving to the next page, until it either finds the row or falls off the end of the file. The database did exactly what you asked. It just had to read the entire table to do it.
+
+That's a **full scan** — a *sequential scan*, in the vocabulary you'll see a real engine print in a few minutes — and its cost is O(n) in the number of pages. Not the number of matching rows. The number of *pages in the table*. Double the table, double the work. The figure below lets you feel that scaling in your hands: pick a target, watch the cursor walk the pages one at a time, lighting each as it's read, the pages-read counter climbing. Then drag the table-size slider and watch the worst case grow right along with it.
+
+<ScanScene client:visible />
+
+Two things about that counter are worth sitting with, because they're the whole argument.
+
+The first: **a miss costs exactly as much as a hit.** Run the scan for an id that doesn't exist and the counter doesn't stop early — it reads every single page and only then can it tell you "not found." Of course it does. To *know* a value is absent, the heap has to rule out every page, and with no order, ruling out a page means reading it. There is no "this value would be over here if it existed," because there is no "over here." The heap has no geography.
+
+The second: this isn't the database being dumb. Given *only a heap*, the full scan is not just the best strategy, it's the *only* strategy. Every page is equally likely to hold your row, so every page has to be checked. The O(n) cost is not a bug in the algorithm; it's the direct, unavoidable consequence of the trade we made in the last section, where we bought cheap inserts by keeping no order. The database is being perfectly rational. It just has nothing to work with.
+
+<PythonSandbox client:only="react" initialCode={SCAN_SANDBOX} />
+
+The sandbox makes it undeniable. `scan` walks every page and every slot, counting pages touched, and the count comes back equal to the page count — every time, hit or miss. There's the O(n), in a number you can read off the screen.
+
+Which tells you *exactly* what's missing, and naming it precisely is the hinge of the whole chapter. The heap's problem is not that it's slow; it's that it has no way to know which page a value lives on without reading them all. What we need is a way to answer "which page is id 8675309 on?" *without* touching the data. We need order we can search — a structure off to the side that, given a value, tells you the address. Small enough to be cheap to consult, smart enough to rule out almost everything in a step or two. That structure is an **index**, and the rest of this chapter is the single best one ever invented for the job.
+
+</Section>
+
+<Section
+  id="the-btree"
+  title="The B-tree"
+  quiz={{
+    question: "In the B-tree you build, you insert into a leaf that's already at capacity. What happens — and why does that specific procedure keep the tree balanced, so every leaf stays the same distance from the root?",
+    options: [
+      { text: "The leaf splits in two, the median key is pushed up into the parent as a separator, and if that pushes the root over capacity the root splits and the tree grows a level — at the top, so all leaves move down together and stay equidistant from the root.", correct: true },
+      { text: "The leaf grows beyond its capacity for that one insert, and a background pass rebalances later; depth temporarily varies between leaves." },
+      { text: "The new key is placed in a sibling leaf that has room, so no split is needed and the tree never grows taller." },
+    ],
+  }}
+>
+
+Here is the structure the last section asked for. It is the most important data structure in this entire book, and you are about to build it.
+
+Before the tree, the honest question: why not just sort the rows? If the heap's problem is "no order you can search," sort it. Keep the table in id order and a lookup becomes a binary search — halve the range, halve again, find the row in log n comparisons. And for *lookups* that's perfect. The problem is *inserts*. A sorted array means every new row has to go in its sorted position, which means shoving every later row over to make room. Insert id 500 into a sorted million-row table and you might move half a million rows. We made inserts cheap two sections ago and we are not about to make them O(n) again. A sorted array fixes reads by breaking writes. We need a structure that keeps *both* cheap.
+
+That structure is the **B-tree**, and the way it keeps both cheap is by being *balanced* and *node-granular*. Instead of one giant sorted array, it's a tree of small sorted nodes. Each **node** is a little block holding a sorted run of keys — sized, not coincidentally, to fit in one page. The leaves at the bottom hold the actual keys (and, in the flavor we're building, the row addresses they point to). The internal nodes above them hold nothing but *separator keys* that route you down: "looking for something less than 500? go left. Otherwise go right." You descend from the root, following separators, narrowing the range at every level, until you land in the one leaf that can possibly hold your key. A handful of steps, no matter how big the tree.
+
+<BTreeScene client:visible />
+
+Play with the scene before reading on, because the magic is in the *insert*, and the magic is the **split**. Insert keys one at a time and watch what happens. Most inserts are boring: descend to the right leaf, drop the key into its sorted spot, done. But a node has a fixed capacity — it's a page, and a page is finite, which is the fact you proved with your own hands two sections ago. So eventually you insert into a leaf that's already full, and the leaf can't just grow. Instead it **splits**: the full node breaks into two half-full nodes, and the *median key* — the one in the middle — gets pushed *up* into the parent as a new separator between the two halves. Now the parent has one more key. If that was enough to overflow the parent, the parent splits too, and pushes *its* median up. And if the overflow climbs all the way to the root and the root splits, a brand-new root is created above it, and **the tree grows a level.**
+
+That last detail is the entire trick, so let it land: the tree only ever grows *at the top*, by the root splitting. It never grows at the bottom. Which means every leaf is always at the exact same depth — when a new level appears, *all* the leaves get pushed down by one, together. The tree is *balanced* by construction, automatically, as a side effect of how splits propagate, with no separate rebalancing pass. "Balanced" means precisely this: every leaf is the same distance from the root, so every lookup costs the same — the height of the tree — whether you're fetching the first key or the millionth. That guarantee is the whole reason it's worth the bookkeeping. Bayer and McCreight published the splitting algorithm in 1972, and it is, remarkably, still the algorithm; every B-tree in every database you will ever touch is a descendant of that paper.<Footnote n={1} />
+
+A note on flavors, paid honestly in one breath: what you're building is really a **B+-tree**, the variant databases actually use. The distinction is small and load-bearing. In a plain B-tree, keys and their data live in *every* node. In a B+-tree, the internal nodes hold *only* separator keys for routing, and *all* the real entries — keys plus row addresses — live in the leaves, which are usually linked left-to-right so you can walk a range by hopping leaf to leaf. That's why the internal nodes can fan out so widely (they store nothing but skinny separators) and why range scans are easy (read a leaf, follow the link to the next). When people say "B-tree" about a database index, they almost always mean this. Comer's 1979 survey, *The Ubiquitous B-Tree*, is the place to understand why this variant won.<Footnote n={2} />
+
+<PythonSandbox client:only="react" initialCode={BTREE_SANDBOX} />
+
+Now the build. The sandbox is a real B-tree in about seventy lines: a small `order` (the node capacity — kept small, so splits happen after only a handful of keys and the structure has to grow fast), `insert(key, row_id)`, `search(key)`, and the leaf-and-internal split logic that does everything the scene just animated. It loads a couple hundred accounts in *random* id order, then prints the tree's height and top levels so you can see the structure that emerged from all those splits — and there's a `show()` method to dump the full shape whenever you want to watch one happen. Run it and the height comes back as a single small number against two hundred scattered keys; that flatness is the splitting algorithm earning its keep.
+
+Then the payoff that ties the whole chapter together: the sandbox wires the B-tree to the **heap from §2**. The tree maps `id → (page_no, slot)` — it stores, in its leaves, exactly the physical addresses you learned about two sections ago. A `lookup(id)` now does two things: search the tree to find the address, then fetch that one page from the heap. And it counts the pages touched. Watch that number. Against the full scan's *hundreds* of pages read, the indexed lookup touches a single-digit number: a few pages to walk down the tree, plus one page to grab the row. That collapse — from O(n) pages to O(log n) pages — is the reason indexes exist, and you just watched it happen with a counter you can read.
+
+Here's the thing to carry out of this section, because the next one is built on it. The lookup is O(log n) — logarithmic in the number of keys. But "logarithmic" badly *undersells* what's actually going on, because the base of that logarithm is not 2. Each node is a whole page, and a page holds not two keys but *hundreds*. So each level of the tree doesn't halve the search space — it cuts it by a factor of hundreds. That's why the tree is so shallow, and how shallow it really is — three levels, four levels, for tables that don't fit on a single machine — is a number worth computing carefully. That's the next section.
+
+</Section>
+
+<Section
+  id="fan-out"
+  title="Fan-out and height"
+  quiz={{
+    question: "Using the height model from the scene: with a fan-out of ~400 keys per node, a 3-level B-tree addresses tens of millions of rows. Drag the fan-out slider down to 2 (a binary tree) for the same row count. What happens to the height, and why does that make the case for wide nodes?",
+    options: [
+      { text: "Height explodes from ~3 to ~25, because height ≈ log_fanout(N) and shrinking the base from 400 to 2 multiplies the number of levels — and since each level is one page read, height is the IO count you're trying to minimize.", correct: true },
+      { text: "Height stays about the same; fan-out only affects how much memory each node uses, not the number of levels." },
+      { text: "Height roughly halves, because a binary tree is the most efficient possible shape for search." },
+    ],
+  }}
+>
+
+The B-tree's real superpower isn't that it's logarithmic. Plenty of structures are logarithmic. It's that the *base* of the logarithm is enormous, and that single fact is what makes it the right answer for data on disk.
+
+Here's the math in plain words. A tree's height — the number of levels from root to leaf — is roughly `log_fanout(N)`: the logarithm of the row count, with the base being the **fan-out**, the number of children each node points to. For a binary tree the fan-out is 2, so a billion rows needs about 30 levels (2 to the 30th is roughly a billion). Thirty levels means thirty steps to find a row. But a B-tree node is a *page*, and a page holds hundreds of keys, so the fan-out isn't 2 — it's hundreds. Change the base from 2 to 400 and the height collapses, because now each level multiplies your reach by 400 instead of by 2. One level reaches 400 rows. Two levels: 160,000. Three levels: 64 *million*. Four levels: 25 *billion*. A four-level tree, for any table you are realistically going to build, is enough.
+
+<FanoutScene client:visible />
+
+The scene makes this tactile, and the move to actually do is the one in the quiz: drag the fan-out down to 2 and watch the height detonate. At fan-out 400 the pyramid is three or four squat levels; at fan-out 2 the same row count needs twenty-five or thirty, and the visual is the whole argument for wide nodes in one gesture. Then drag it back up and watch the tree flatten. *That* is why databases want big pages full of keys: every key you cram into a node widens the fan-out, and every bit of fan-out flattens the tree.
+
+So where does the fan-out actually come from? It's set by arithmetic you can do on a napkin: **page size divided by key size.** An 8KB page, with separator entries of around 20 bytes each (a key plus a child pointer), holds roughly 400 of them — there's the 400. This is why the two ways to get a shallower tree are exactly what you'd now predict: *bigger pages* (more keys per node) or *smaller keys* (more keys per page). It's also why indexing a fat composite key is more expensive than indexing a single integer — the fatter the key, the lower the fan-out, the taller the tree. Fan-out isn't a tuning knob you set; it's a consequence of what you chose to index and how big your pages are.
+
+And now the number that actually matters, the one this whole section exists to deliver: **height is the IO count.** Each node is one page; reading a node is (at most) one page read from disk; so the number of levels *is* the number of disk reads a lookup costs. A three-level tree is three page reads to find any row in sixty-four million. That's not "logarithmic" in the hand-wavy sense — that's *three*. For practical table sizes, a B-tree is effectively constant-depth, and that is the entire reason every relational database on earth reaches for one. "Read the whole table" became "read three pages," and the three doesn't grow until your table grows by *another factor of hundreds*.
+
+<Callout type="note" title="And it's even better than three reads">
+Height is the *worst-case* IO, the number you pay if every level has to come from cold disk. In practice it's lower, because the top of the tree is small, hot, and almost always already in memory. The root is one page; the second level is a few hundred pages — kilobytes to a few megabytes — and gets accessed on *every single lookup*, so it lives permanently in the cache. The disk reads you actually pay for are usually just the bottom level or two. The thing deciding which pages stay in memory and which get evicted is the **buffer pool**, and it's the subject of §8 and the next chapter. For now: three is the ceiling, and the real number is often one or two.
+</Callout>
+
+</Section>
+
+<Section
+  id="index-kinds"
+  title="Clustered and secondary indexes"
+  quiz={{
+    question: "You have a secondary index on `email`. A query does `SELECT name, email WHERE email = ?`. Then you add `name` to the index so it covers the query. What changed about the access path?",
+    options: [
+      { text: "Before, the lookup descended the index to a leaf that held a row address, then did an extra hop to the heap to fetch `name`. After, `name` lives in the index leaf itself, so the descent ends at the leaf — the heap hop is skipped entirely. That's a covering index.", correct: true },
+      { text: "Nothing changed in the access path; adding a column to an index only affects how much disk the index uses." },
+      { text: "After, the query must read both the index and the full heap, because covering indexes require a full scan to assemble all columns." },
+    ],
+  }}
+>
+
+You now know how to attach a B-tree to a table. It turns out there are *two* ways to do it, they have different costs, and "should I add an index" is really a question about which one — and where, as a result, the row data actually lives.
+
+The split is about what sits in the leaves of the tree.
+
+In a **clustered index**, the leaves of the B-tree *are the table*. The full rows live in the index, stored in key order, and there's no separate heap at all — the tree *is* the storage. A lookup descends to a leaf and the row is right there; the descent *is* the fetch. One structure, one access path, and as a bonus the rows are physically in key order, so a range scan (`WHERE id BETWEEN 100 AND 200`) is a single walk along the linked leaves. InnoDB, MySQL's engine, clusters every table on its primary key by default — in InnoDB, the primary key *is* the table.
+
+In a **secondary index**, the leaves don't hold rows; they hold *keys plus a pointer back to where the row really lives* — the (page_no, slot) row address from §2, the `ctid`. The table is a separate heap; the index is an auxiliary structure off to the side. A lookup descends the index to a leaf, finds the row address, and then does **one more hop**: go to the heap, fetch that page, read the row. This is the default shape in PostgreSQL — the table is a heap, and every index, including the one on the primary key, is a secondary index pointing into it.
+
+<IndexKindsScene client:visible />
+
+The scene puts the two access paths side by side. Toggle a query and watch: the clustered lookup is a single clean descent that ends at the leaf; the secondary lookup is a descent *plus* that extra hop out to the heap. That hop is the cost of the secondary index, and it's a real one — it's a second random page read, often to a completely different part of the disk, on top of the index descent. For a lookup of one row it's one extra read; for a query that matches ten thousand rows it's ten thousand extra random reads, and that's where query plans go to die.
+
+Which sets up the optimization that removes it. If the *only* columns a query needs are columns already sitting in the index, the database never has to make the hop — it can answer the entire query from the index leaf and stop. That's a **covering index**: an index that *covers* a query because it contains every column the query asks for. Watch it in the scene — toggle the covering case and the heap hop vanishes; the access path ends at the leaf, same as the clustered case, even though the table is still a heap. The standard move is to add the extra columns to a secondary index precisely so it covers your hottest query. You're trading index size for the elimination of the hop.
+
+So "add an index" was never one decision. It's a choice about where the row lives relative to the search structure, and like everything in storage it's a read/write trade:
+
+- A **clustered index** makes reads great — no hop, and range scans on the cluster key are sequential — but you get only *one* per table, because the rows can only be physically ordered one way. And inserts can hurt: keeping rows in key order means an insert into the middle can split a *data* page, not just an index page, shuffling real rows around.
+- A **secondary index** is cheap to add and you can have many, each ordering the same table a different way — but each pays the hop unless it covers the query. And every secondary index is another structure every write has to keep up to date.<Footnote n={3} />
+
+There is no free index. There is only choosing which queries to make fast and paying for it on the writes, or in disk, or in the one clustering order you only get to spend once.
+
+</Section>
+
+<Section
+  id="the-payoff"
+  title="The payoff"
+  quiz={{
+    question: "You run `EXPLAIN QUERY PLAN` on `WHERE owner = ?` and SQLite reports `SCAN accounts`. You then `CREATE INDEX` on owner and re-run it. Which output confirms the engine is now doing the §4 index descent instead of the §3 full scan?",
+    options: [
+      { text: "`SEARCH accounts USING INDEX ...` — SEARCH (not SCAN) means it descended an index to the matching rows instead of reading every page.", correct: true },
+      { text: "`SCAN accounts USING INDEX ...` — the word INDEX anywhere in the line means the scan is now indexed." },
+      { text: "It still says `SCAN accounts`, because SQLite always scans but does it faster once an index exists." },
+    ],
+  }}
+>
+
+Everything you built by hand now appears, by its real name, in a real database. Same query, same structures, same words — printed by a shipping engine instead of your own `print` statements.
+
+The sandbox below is a real SQLite, compiled to WebAssembly, running in your browser — the same engine from chapter 03.<Footnote n={6} /> It creates a table, fills it with a few thousand rows, and then uses SQLite's own X-ray tool: `EXPLAIN QUERY PLAN`. That command doesn't run your query; it tells you *how* SQLite intends to run it — which structures it will touch and in what way. It is the engine narrating its own access path, in exactly the vocabulary you've spent this chapter building.
+
+<SqlSandboxReact client:only="react" initialSql={SQL_PAYOFF} />
+
+Read the plan output and you'll recognize every line, because you built every concept it names.
+
+**`SCAN accounts`.** Run `EXPLAIN QUERY PLAN` on `WHERE owner = ?` with no index and this is what comes back. `SCAN` is SQLite's word for the §3 full scan — read every page of the table, check every row. The engine isn't being lazy; it's in the exact position your heap was in, with no ordered structure to consult and no choice but to look at everything. This line is the O(n) you measured with your own counter, printed by a production database.
+
+**`SEARCH accounts USING INDEX ...`.** Now run `CREATE INDEX` on the owner column and re-run the *identical* query. The plan changes one word, and the word is everything: `SCAN` becomes `SEARCH`. That swap is the entire chapter. `SEARCH` means SQLite is descending a B-tree — the §4 structure, the one whose splits you watched and whose height you computed in §5 — to land on the matching rows directly, instead of reading the whole table. It built the same tree you built. It's doing the same O(log n) descent. It even tells you which index it chose and on which column. The `SCAN → SEARCH` flip is your full-scan-to-index-seek collapse, confirmed by the engine.
+
+**`USING COVERING INDEX ...`.** The third query asks only for columns that live in the index, and the plan adds the word `COVERING`. That's §6's covering index, recognized by the planner: the query can be answered entirely from the index leaves, so SQLite skips the hop out to the table. The word `COVERING` is the engine telling you it noticed the hop wasn't necessary and declined to make it.
+
+That's the whole arc, named back to you in three plan lines. `SCAN` is the heap you built in §2 and the scan you suffered through in §3. `SEARCH ... USING INDEX` is the B-tree you built in §4 and the shallow descent you sized in §5. `USING COVERING INDEX` is the leaf-versus-pointer trade you toggled in §6. You have now seen the same machinery from both ends — assembled by hand in Python, and printed by name from a database that ships to billions of devices. The query planner's output, which on day one of this book would have read like an incantation, is now a sentence you can read. Nothing in it is a black box, because you built every box.<Footnote n={6} />
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+We've been saying "read a page" as if reading a page were free. It isn't, and pretending it is has been the one quiet lie holding this whole chapter together.
+
+Every cost in this chapter was counted in *pages read* — the scan touched hundreds, the index touched three or four, the secondary index paid for one extra hop. We treated every one of those reads as a flat, identical unit. But a page read from a spinning disk is several milliseconds; a page read from RAM is tens of nanoseconds; the gap between them is a factor of a hundred thousand. They are not the same operation, and a storage engine that treated them as the same would be unusable. So the pages don't actually live on disk while you use them. They live in **memory** — pulled in on first touch, kept around in case you need them again, written back when they change. That's why the §5 callout could promise the top of the B-tree is "almost always already in memory": *something* is keeping it there.
+
+That something is the **buffer pool**, and it's the next chapter. It's the part of the engine that decides which pages are in memory right now, which to evict when memory fills up, and — this is the hard part — how to never lose a write that only made it as far as RAM when the power cuts out. That last question is where the two halves of this book finally meet: the **WAL from chapter 02**, which knows how to make a write durable, and the **pages from chapter 04**, which is where the write actually lands. The buffer pool is the room where the log and the page sit down at the same table.<Footnote n={4} /> We've pointed at it. Next, we build it.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+The seven entries below are the ones to chase next. Each carries a one-line note on why it's worth the time.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Bayer &amp; McCreight, 1972 — "Organization and Maintenance of Large Ordered Indices."</strong> The original B-tree paper. Short and surprisingly readable; the node-splitting algorithm in §4 is theirs, essentially unchanged in fifty years.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Douglas Comer, 1979 — "The Ubiquitous B-Tree" (ACM Computing Surveys).</strong> The best single survey of B-trees and B+-trees: what the variants are, and why the B+-tree (values in the leaves, internal nodes routing) is the one databases actually use.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Goetz Graefe, 2011 — "Modern B-Tree Techniques."</strong> Everything that happened to the B-tree after Comer — prefix compression, latching for concurrency, write optimization, the clustered/secondary trade in production depth. Read after this chapter, when you want the version with all the engineering put back in.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Hellerstein, Stonebraker, Hamilton, 2007 — "Architecture of a Database System," §3 (Storage) and §4 (Access Methods).</strong> Where pages, heaps, and indexes sit relative to the buffer pool and the rest of the engine. The map for the next several chapters of this book.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>PostgreSQL documentation — "Database Page Layout."</strong> <a href="https://www.postgresql.org/docs/current/storage-page-layout.html">postgresql.org/docs/current/storage-page-layout.html</a>. The §1 slot directory in production, with the names Postgres uses — line pointers, the item identifier array, and the `ctid` that is your (page_no, slot) address.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>SQLite — "The SQLite Database File Format"</strong> (<a href="https://www.sqlite.org/fileformat2.html">sqlite.org/fileformat2.html</a>) <strong>and "The Query Planner"</strong> (<a href="https://www.sqlite.org/queryplanner.html">sqlite.org/queryplanner.html</a>). The page format behind §1 and the exact `EXPLAIN QUERY PLAN` output behind §7 — `SCAN`, `SEARCH ... USING INDEX`, and `USING COVERING INDEX`, defined by the engine that prints them.
+  </Footnote>
+  <Footnote n={7}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 3 ("Storage and Retrieval").</strong> The same material one notch up, with B-trees and LSM-trees set side by side. The natural next read — and where the LSM-tree contrast this chapter deferred actually lives.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
