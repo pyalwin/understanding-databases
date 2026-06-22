@@ -1,0 +1,346 @@
+---
+title: Locking & Concurrency
+chapterNumber: 8
+summary: "Chapter 01 lost an update on a flat file and promised a real database's locking subsystem would fix it; Chapter 03 named every anomaly that overlapping transactions can cause and named — but did not build — the mechanism that prevents them. This is the build. A lock is a way to make one transaction wait so another can finish: correctness bought with waiting. Construct the machine by hand in Python — shared and exclusive locks and the compatibility matrix, two-phase locking that turns lock discipline into serializability, the lock manager as a hash table of granted sets and wait queues, and the dramatic failure where two transactions wait on each other forever — the deadlock — detected by a cycle in a wait-for graph and broken by aborting a victim."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import LockCompatScene from '@/components/chapter-08/LockCompatScene';
+import TwoPhaseScene from '@/components/chapter-08/TwoPhaseScene';
+import LockManagerScene from '@/components/chapter-08/LockManagerScene';
+import DeadlockScene from '@/components/chapter-08/DeadlockScene';
+import { CONFLICT_SANDBOX, LOCKS_SANDBOX } from '@/components/chapter-08/lock-sandboxes';
+import { TWOPL_SANDBOX, LOCKMANAGER_SANDBOX } from '@/components/chapter-08/twopl-sandboxes';
+import { DEADLOCK_SANDBOX, LATCH_SANDBOX } from '@/components/chapter-08/deadlock-sandboxes';
+
+<ChapterReader chapterId="08-locking-and-concurrency">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 01 lost an update on a flat file and reached for `fcntl.flock`; Chapter 03 named the lost update, the dirty read, the phantom, and write skew, then named two families of fix — locking and MVCC — without building either. What is this chapter's job, stated precisely?",
+    options: [
+      { text: "To build the first of those two mechanisms — a real lock manager — that makes conflicting transactions take turns: it grants a lock when it's safe, makes a transaction *wait* when it isn't, and breaks the standoff when the waiting becomes a cycle. Correctness is bought with waiting, and the chapter is the machinery of who waits for whom.", correct: true },
+      { text: "To make `fcntl.flock` work across multiple machines, so the file-locking approach from Chapter 01 scales to a distributed deployment without any new concepts.", },
+      { text: "To re-derive the isolation levels from Chapter 03 as a pure SQL feature, with no underlying enforcement mechanism — the levels are a contract the application honors voluntarily.", },
+    ],
+  }}
+>
+
+Two chapters left you holding a promissory note, and it's time to pay both at once.
+
+Chapter 01 opened on a race. Two processes, both reading `users.json`, both appending a record, both writing the file back — and one record silently vanishing, because nothing made them take turns. The fix that chapter reached for was `fcntl.flock`: hold an exclusive lock across the whole read-modify-write, and the two processes serialize, whichever grabs the lock first finishing before the other can start. But that chapter was honest about the lock's limits in the same breath: `flock` is *advisory* (a misbehaving process can ignore it), *single-host* (useless the moment your app runs on three machines), and coarse (it locks the whole file, not the one row that's contended). It closed with a promise stated almost as a forward address: a real database's locking subsystem "fixes both gaps and adds row-level granularity, deadlock detection, and a few other things you'd rather not implement yourself" — in Chapter 8.
+
+This is Chapter 8. We are going to implement exactly those things you'd rather not.
+
+Chapter 03 raised the stakes and then, deliberately, stopped short. It put two transactions in one room and catalogued everything that can go wrong in the gap between a read and a write: the dirty read, the non-repeatable read, the phantom, the lost update, the write skew. It named the SQL isolation levels that defend against each. And it named — but did not build — the two mechanisms a real engine uses to enforce those levels: a *lock manager* ("chapter 08," it said, in those words), and multiversion concurrency control. It described lock-based `REPEATABLE READ` as "take a shared lock on every row you read and hold it until commit," and it described predicate locks defending against phantoms, and it left all of that as description. The machine that does the locking was a black box labelled *later*.
+
+Now we open the box. And the bargain inside it is worth stating plainly before we build a single component, because every design decision in the chapter follows from it: **a lock is a mechanism for making one transaction wait while another finishes.** That's it. That's the whole idea. Where Chapter 03's anomalies all came from conflicting accesses happening in an uncontrolled order, a lock imposes an order by forcing the second accessor to *stop* until the first is done. Correctness is purchased with waiting. Everything else in this chapter — the two lock modes, the compatibility rules, the two-phase discipline, the lock table, the deadlock detector — is the engineering of that single transaction: *who waits, for what, for how long, and what happens when the waiting forms a loop with no exit.*
+
+So the reveal that organizes the chapter is this: concurrency control under locking is the engineering of **who waits for whom**. We'll build it from the bottom. First re-stage Chapter 01's lost update as a concrete two-transaction schedule, so the conflict is in front of us as data (§1). Then the two lock modes and the compatibility matrix that is the entire grant-or-wait rule (§2). Then *two-phase locking*, the discipline on *when* you may release that turns a pile of locks into a guarantee of serializability (§3). Then the *lock manager* itself — the hash table that tracks who holds what and who's queued behind them (§4). Then the dramatic failure, the chapter's hero: *deadlock*, where two transactions wait on each other forever, and the wait-for graph that detects the cycle and the victim we abort to break it (§5). Then the practical refinements — lock granularity, and the crucial distinction between *latches* and *locks* that Chapters 04 and 05 quietly leaned on (§6). And finally the payoff: Chapter 03's isolation levels, re-derived as nothing more than choices about how long and how widely you hold your locks (§7).
+
+By the end you'll have built, by hand, the subsystem Chapter 01 told you not to implement yourself — and you'll understand precisely why it told you that.
+
+</Section>
+
+<Section
+  id="the-conflict"
+  title="The conflict"
+  quiz={{
+    question: "Two transactions both read `balance = 100`, both add 50 in their own private register, both write the result back. Run serially the account ends at 200; interleaved as R1 R2 A1 A2 W1 W2 it ends at 150. What exactly did the interleaving fail to do, and what would a lock supply?",
+    options: [
+      { text: "It failed to *order* the two conflicting accesses to `balance` — T2 read the stale 100 before T1's write landed, so T2's write clobbered T1's. A lock would force T2 to wait until T1 finished its whole read-modify-write, imposing an order on the conflicting pair.", correct: true },
+      { text: "It failed to make each individual write durable — one of the two writes never reached disk, so a lock is needed to fsync the second write before the first.", },
+      { text: "It failed to compute the arithmetic correctly — `100 + 50` was evaluated as 150 in one transaction and the lock would fix the addition by recomputing it atomically.", },
+    ],
+  }}
+>
+
+Start by making the bug concrete, the way Chapter 03 made it concrete: not as a warning but as a *schedule* you can read off the page.
+
+Two transactions, T1 and T2, both want to deposit \$50 into the same account, which starts at \$100. Run them one after another and the answer is not in doubt: the first reads 100, writes 150; the second reads 150, writes 200. Two deposits, \$100 of new money, final balance 200. The serial order is correct by construction — that's the whole appeal of running things serially, and it's the standard we'll spend the chapter trying to recover.
+
+Now interleave them the way two real, uncoordinated processes interleave. Each transaction does three steps: **read** the balance into a private register, **add** 50 to the register, **write** the register back to the account. Lay the six steps out in this order — call it R1 R2 A1 A2 W1 W2:
+
+- **R1**: T1 reads `balance` → its register holds 100.
+- **R2**: T2 reads `balance` → *its* register also holds 100, because T1 hasn't written anything yet.
+- **A1**: T1 adds 50 → T1's register is 150.
+- **A2**: T2 adds 50 → T2's register is 150.
+- **W1**: T1 writes 150 to `balance`.
+- **W2**: T2 writes 150 to `balance` — overwriting T1's 150 with its own 150.
+
+Final balance: 150. One deposit evaporated. This is Chapter 01's lost update and Chapter 03's lost update, the same anomaly each time, here reduced to its irreducible cause: **two writes to the same item with nothing ordering them.** T2 read `balance` before T1's write landed, so T2's view of the world was already stale by the time it wrote — and the write engine, faithfully, recorded the stale value as fact. Notice what is *not* broken. The arithmetic is right (both registers correctly compute 150 from 100). The writes are both durable (Chapter 02's WAL would fsync each one honestly). Atomicity holds (each transaction ran start to finish). The flaw is purely one of *order*: the schedule allowed T2 to read a value that T1 was in the middle of changing.
+
+That observation is the seed of the entire mechanism. If the database could force T2 to **wait** — to hold its read until T1 had finished its complete read-modify-write — the interleaving R1 A1 W1 R2 A2 W2 would be the only one possible, and that's just the serial order, which we already know is correct. The job of a lock is to make exactly that waiting happen, and to make it happen *only* when two accesses actually conflict, so that transactions touching different accounts never wait on each other at all. A lock is the database's answer to "you don't get to read that yet."
+
+<PythonSandbox client:only="react" initialCode={CONFLICT_SANDBOX} />
+
+The sandbox models the two transactions as lists of steps and hands a *scheduler* the damaging interleaving explicitly, so you can see the lost update fall out of the order alone — no locks anywhere, the balance ending at 150 when it should be 200. Read the printed schedule and watch where it goes wrong: it's the R2 immediately after R1, T2 taking its snapshot of the world before T1 has changed it. Reorder those steps so each transaction's read-add-write runs as a block and the bug disappears. That's the target. The rest of the chapter builds the machinery that *forces* the blocking order without us hand-writing the schedule — because in a real system nobody gets to choose the interleaving; the only control you have is the lock.
+
+</Section>
+
+<Section
+  id="shared-exclusive"
+  title="Shared & exclusive locks"
+  quiz={{
+    question: "T1 holds a shared (S) lock on row R. T2 requests an S lock on R; T3 requests an exclusive (X) lock on R. Using the compatibility matrix (S/S compatible; S/X, X/S, X/X conflict), what happens to each request?",
+    options: [
+      { text: "T2's S lock is granted immediately — S and S are compatible, so readers share. T3's X lock conflicts with T1's (and now T2's) S lock, so T3 must wait until every S holder releases. Read-read is free; anything touching a write serializes.", correct: true },
+      { text: "Both T2 and T3 are granted immediately, because a lock that is already held can always be shared by any later requester regardless of mode — holding any lock means the row is 'open'.", },
+      { text: "Both T2 and T3 must wait, because once T1 holds any lock on R the row is fully exclusive to T1 and no other transaction may hold a lock of any mode until T1 releases.", },
+    ],
+  }}
+>
+
+The §1 sandbox showed *that* conflicting accesses need ordering. Now we build the thing that orders them — and the first design choice is that not all accesses conflict, so not all of them should wait.
+
+Think about what two transactions can do to one row. They can both *read* it: T1 reads Alice's balance to print a statement, T2 reads it to compute interest. Those two reads don't conflict at all — neither changes the value, so it doesn't matter which goes first or whether they overlap; both see the same correct number. Forcing them to take turns would be pure waste. But the moment one of them *writes*, order matters: a read concurrent with a write might see the old value or the new one (non-repeatable), and two concurrent writes are exactly the §1 lost update. So a single all-or-nothing lock — held or not held — is too blunt. It would serialize the harmless reader-reader case along with the dangerous ones.
+
+The classic solution, from System R's 1975 locking paper,<Footnote n={1} /> is **two lock modes**. A **shared lock** (mode **S**) is what you take to *read* an item. Many transactions can hold S on the same item at the same time — readers share. An **exclusive lock** (mode **X**) is what you take to *write* an item. Only one transaction can hold X, and only when no one else holds anything on that item. The rule that decides whether a requested lock can be granted alongside what's already held is the **compatibility matrix**, and it is small enough to memorize:
+
+|              | request **S** | request **X** |
+|--------------|:-------------:|:-------------:|
+| holder **S** |  ✓ compatible | ✗ conflict    |
+| holder **X** |  ✗ conflict   | ✗ conflict    |
+
+Read it as four cells. **S over S: compatible** — two readers coexist, the only "yes" in the table. **S requested while X held, and X requested while S held: conflict** — a reader and a writer cannot overlap, in either order. **X over X: conflict** — two writers cannot overlap. That single "yes" in the top-left corner is the entire reason locking doesn't collapse into "one transaction at a time": read-heavy workloads, which most are, get to run their reads concurrently, and only the writes serialize.
+
+The protocol built on the matrix is **acquire-or-wait**. Before a transaction touches an item it must hold the right mode of lock on that item — S to read, X to write. When it requests the lock, the lock checks the request against everything currently granted. If the matrix says *compatible*, the lock is granted and the transaction proceeds. If the matrix says *conflict*, the transaction does not get the lock and does not get to proceed — it **waits**, parked in a queue, until the conflicting holders release and the matrix turns green for it. Waiting is not an error or a failure; it is the mechanism doing its job. The §1 lost update is prevented precisely because T2's write-lock request conflicts with T1's, so T2 waits until T1 is done — exactly the blocking we hand-wrote into the schedule, now enforced by the matrix instead.
+
+<LockCompatScene client:visible />
+
+Figure 8.1 is the matrix made interactive. Request locks from two transactions on a single item and watch each request resolve against what's already held: two S requests both light up green and coexist; an X request against a held S goes amber and parks in the queue; release the S holders and the waiting X turns green and is granted. Flip the modes around and you can walk every cell of the table — the one compatible corner and the three that conflict. The scene is the matrix as a live decision: every grant-or-wait in the whole chapter is this lookup, repeated.
+
+<PythonSandbox client:only="react" initialCode={LOCKS_SANDBOX} />
+
+The sandbox builds a single-item `Lock` with `acquire(txn, mode)` and `release(txn)` that enforces the matrix directly: it keeps a *granted set* (who holds the item, in what mode) and a *wait queue* (who's blocked, in arrival order), grants a request when `compatible()` says yes, and parks it otherwise. Run it and watch two readers share an S lock, a writer's X request queue up behind them, and then — as each reader releases — the writer finally wake and acquire once the item is free. The `compatible()` function *is* the table above, in four lines of Python. This is the atom of the lock manager; §4 will replicate it across a whole hash table of items, but the per-item logic never gets more complicated than what you see here.
+
+</Section>
+
+<Section
+  id="two-phase-locking"
+  title="Two-phase locking"
+  quiz={{
+    question: "A transaction runs: lock-X(A), write A, unlock(A), lock-X(B), write B, unlock(B). It takes each lock right before using it and releases right after. Why does this violate two-phase locking, and what could go wrong as a result?",
+    options: [
+      { text: "It acquires lock B *after* releasing lock A — there's no single point where it holds all its locks, so it has a release followed by an acquire. That breaks the 2PL rule (no acquire after the first release) and admits non-serializable schedules: another transaction can slip in on A after the early unlock and interleave in a way no serial order would produce.", correct: true },
+      { text: "It violates 2PL because it uses exclusive locks for writes instead of shared locks; writes should take S locks so that other writers can proceed concurrently, and that's what makes the schedule serializable.", },
+      { text: "It violates 2PL because it locks A before B — locks must always be acquired in reverse alphabetical order, and acquiring A first is what admits the non-serializable schedule.", },
+    ],
+  }}
+>
+
+Here's the uncomfortable fact the §2 matrix doesn't tell you: **locks alone don't guarantee correctness.** You can take the right mode on every item you touch and still produce a schedule no serial order could ever produce. The matrix controls *whether* two transactions can hold conflicting locks simultaneously. It says nothing about *when* you release — and *when you release* turns out to be the whole game.
+
+Watch how releasing too early reopens the §1 hole even with locks in place. Suppose T1 wants to move money: read A, read B, write A, write B. If T1 takes a lock on A, uses it, *releases it*, and only later takes a lock on B, then in the window after A is released and before B is locked, another transaction T2 can swoop in, lock A, change it, and commit — and now T1 is working from a value of A that no longer matches the B it's about to touch. Each transaction held the correct lock at the moment it touched each item. The schedule is still a mess, because the locks didn't *overlap* in a way that pinned down a consistent order. Grab-use-drop, item by item, is not enough.
+
+The discipline that fixes this is **two-phase locking** (2PL), and it is a rule about the *shape* of a transaction's lock lifetime, not about any individual lock. Every transaction must pass through two phases, in order:
+
+1. A **growing phase**, during which it may *acquire* locks but may not *release* any.
+2. A **shrinking phase**, during which it may *release* locks but may not *acquire* any.
+
+Equivalently, in one sentence: **once a transaction releases its first lock, it may never acquire another.** The moment of the first release is the transaction's **lock point** — the instant it holds the maximum set of locks it will ever hold, the peak of the mountain. Before the lock point it's climbing (acquiring); after, it's descending (releasing); it never climbs again once it has started down.
+
+Why does this single rule produce serializability? Because the lock points impose a serial order. The classic theorem (Eswaran et al., 1976<Footnote n={2} />) is that any schedule produced by transactions all obeying 2PL is *conflict-serializable* — equivalent to running the transactions one at a time in the order of their lock points. The intuition: at its lock point, a 2PL transaction holds every lock it will ever need, so for that instant it has exclusive-enough access to its entire footprint; no other transaction can hold a conflicting lock on anything the transaction touches. That's as good as having run alone. Order the transactions by when they reach that all-locks-held instant and you have a serial schedule the interleaved execution is provably equivalent to. The matrix prevents conflicting locks from *coexisting*; 2PL forces the non-conflicting acquisitions to *nest* the way a serial order would. Together they give you serializability — the gold standard Chapter 03 named.
+
+There's a stronger version you almost always want in practice. Plain 2PL lets the shrinking phase begin before commit — a transaction can release a lock, then keep running, then commit later. That permits a nasty failure: T1 releases its X lock on A after writing it, T2 reads the new A, and *then* T1 aborts — so T2 read a value that never committed (a dirty read), and worse, if T2 has already acted on it you get a *cascade* of aborts rippling outward. **Strict 2PL** closes this by adding one constraint: **hold all exclusive (X) locks until the transaction commits or aborts.** No write lock is released early — every X lock drops at commit, all at once. This makes the schedule **cascadeless**: no transaction can read another's uncommitted write, because the writer's X lock is still held, so nobody else can read that item until the writer is safely committed. Strict 2PL is what real engines implement, and it's the reason a transaction's writes become visible to others exactly at commit and not a moment before. (It also, as §5 will show, makes deadlock *more* likely — because locks held longer overlap more — which is the price of the guarantee.)
+
+<TwoPhaseScene client:visible />
+
+Figure 8.2 draws one transaction's lock count over time: a line that rises through the growing phase as locks are acquired, peaks at the lock point, then falls through the shrinking phase as they're released. The lock point is marked — the single instant of maximum locks held. Toggle *strict* mode and watch the exclusive locks refuse to descend until the commit marker, the X-lock line staying flat at its peak all the way to the end while shared locks may drain earlier. Seeing the shape is the point: serializability is a property of that *curve* — one peak, no second climb — not of any single lock in it.
+
+<PythonSandbox client:only="react" initialCode={TWOPL_SANDBOX} />
+
+The sandbox wraps the §2 locks in a `Transaction` that enforces the 2PL rule directly: it tracks whether the transaction has entered its shrinking phase, and *raises* if you try to acquire a lock after releasing one — the violation made into an exception you can trip. Then it runs the §1 lost-update workload under 2PL and shows the lost update prevented: T2's lock request on the contended item conflicts with T1's still-held lock, T2 waits, T1 finishes and releases at commit, T2 proceeds from the correct post-T1 value, and the balance lands at 200. Try rewriting a transaction to release early and re-acquire — the wrapper throws, and you've reproduced the violation from the quiz. The reveal is that serializability didn't come from the locks; it came from the *discipline on when they're released*.
+
+</Section>
+
+<Section
+  id="the-lock-manager"
+  title="The lock manager"
+  quiz={{
+    question: "A lock manager is a hash table from resource id → {granted set, wait queue}. T1 holds X on row 7. T2 then T3 request X on row 7 and are enqueued (FIFO). T1 releases. The manager wakes waiters from the front of the queue while the next is compatible. What happens, and why FIFO?",
+    options: [
+      { text: "T1's release empties the granted set; the manager pops T2 (front of queue), finds X now compatible with the empty set, grants it; T3 stays queued because X conflicts with T2's X. FIFO order ensures T2 — which waited longest — isn't starved by later arrivals jumping ahead.", correct: true },
+      { text: "T1's release grants both T2 and T3 simultaneously, because once the X holder leaves, every queued request is compatible with the now-empty granted set regardless of mode.", },
+      { text: "T1's release wakes T3 first because the most recent requester has the freshest need; FIFO would be wrong here because it favors stale requests over current ones.", },
+    ],
+  }}
+>
+
+So far we've talked about *a* lock — one item, one granted set, one queue. A real database has millions of items and can't keep a permanent lock object sitting next to every row. It needs one structure that manages locking for *every* resource on demand, creating lock state only for the items actually contended and discarding it when contention clears. That structure is the **lock manager**, and underneath all the policy of §2 and §3 it is something refreshingly concrete: a hash table.
+
+The key is a **resource id** — whatever names the thing being locked: a row id, a page number, a table name, a key range. The value is the per-item lock state we already built in §2, promoted to a named entry:
+
+- a **granted set** — the transactions currently holding the resource, each tagged with its mode (S or X), and
+- a **wait queue** — the transactions blocked on the resource, in the order they arrived (FIFO).
+
+That's the entire data structure. `lock(txn, resource, mode)` hashes to the resource's entry (creating it if this is the first request), checks the requested mode against the granted set using the §2 compatibility matrix, and either **joins the granted set** (if compatible) or **enqueues on the wait queue and blocks** (if not). `unlock(txn, resource)` removes the transaction from the granted set and then **wakes waiters**: it walks the wait queue from the front, granting each request whose mode is now compatible with the (shrinking) granted set, stopping at the first one that still conflicts. And because strict 2PL releases everything at commit, the manager needs a `release_all(txn)` that drops every lock a transaction holds in one sweep — which is also exactly the operation §5 will call when it aborts a deadlock victim.
+
+Two design points carry real weight. First, **why FIFO**, and why stop waking at the first conflict. Imagine T1 holds X on a row, with T2 (wanting X) and then T3 (wanting X) queued behind it. When T1 releases, the manager could in principle scan the whole queue for *any* grantable request — but that path leads to **starvation**: a steady stream of compatible requests could keep jumping ahead of a poor X-waiter that never gets its turn. Granting strictly from the front, in arrival order, guarantees the longest-waiting transaction goes next, so everyone eventually gets served. In our example T1's release lets T2 (front of queue) take X against the now-empty granted set; T3 stays parked because its X conflicts with T2's freshly granted X. Order preserved, nobody starved.
+
+Second, the manager waking *multiple* compatible waiters at once is the read-read win made systemic. If T1 holds X and behind it the queue is S, S, S, then T1's release wakes *all three* shared readers together — they're mutually compatible, so they all join the granted set in one wake-up and run concurrently. The manager grants as many from the front as remain compatible and stops at the first conflict. This is the §2 matrix operating not on a single pair but on a whole queue, draining as much of it as the rules allow each time a holder leaves.
+
+<LockManagerScene client:visible />
+
+Figure 8.3 visualizes the lock table itself: a handful of resources as rows, each showing its granted set (colored by mode — readers clustered, a writer alone) and its wait queue trailing behind. Step transactions issuing `lock` and `unlock` and watch entries light up: a resource granting an S to a second reader, a resource queuing an X behind held S locks, and — the satisfying moment — a release draining the front of a queue, compatible waiters flipping from queued to granted as the holder leaves. The structure that looked abstract in prose is just rows of {held, waiting}, mutating as requests arrive and clear.
+
+<PythonSandbox client:only="react" initialCode={LOCKMANAGER_SANDBOX} />
+
+The sandbox is the accumulation point of the chapter: a `LockManager` with `lock`, `unlock`, and `release_all`, a `dict` from resource → `{granted, queue}`, the §2 matrix deciding each grant, and FIFO wakeups draining the queue on release. The §3 2PL transactions now run against *this* manager instead of a single hand-made lock, locking multiple resources by id, and the lost-update workload still comes out at 200 — now through the same machinery a real engine uses. Everything above this — the modes, the matrix, the two-phase discipline, the isolation levels still to come — is *policy layered on this one table*. The lock manager is the mechanism; the rest is rules about how to call it.
+
+</Section>
+
+<Section
+  id="deadlock"
+  title="Deadlock"
+  quiz={{
+    question: "T1 holds X on A and waits for X on B; T2 holds X on B and waits for X on A. In the wait-for graph (edge Tᵢ → Tⱼ when Tᵢ waits for a lock Tⱼ holds), what's present, and how does the database recover?",
+    options: [
+      { text: "There's a cycle T1 → T2 → T1: each waits on a lock the other holds, so neither can ever proceed. The detector finds the cycle, picks a victim (say the younger transaction, or the one holding fewer locks), aborts it to release its locks, and the survivor proceeds; the victim retries from the top.", correct: true },
+      { text: "There's no cycle — the graph is a simple chain T1 → T2, which resolves on its own as soon as the lock manager processes the wait queue in FIFO order; no abort is needed.", },
+      { text: "There's a cycle, and the database resolves it by waiting longer, since deadlocks are transient and one of the two transactions will eventually release its lock voluntarily without being aborted.", },
+    ],
+  }}
+>
+
+We bought correctness with waiting. Now collect the bill. The deepest property of waiting is that it can form a loop — and a loop of waiting is a standstill that never resolves on its own. This is **deadlock**, the dramatic failure of locking and the chapter's hero scene, because it's the place where "who waits for whom" stops being a metaphor and becomes a graph you can draw and a cycle you can point at.
+
+The canonical deadlock needs only two transactions and two resources. T1 locks A (X), intending to also lock B. T2 locks B (X), intending to also lock A. Now T1 requests B — held by T2 — and waits. T2 requests A — held by T1 — and waits. Neither will release what it holds until it commits; neither can commit until it acquires the lock it's waiting for; and each is waiting for the other. They will wait forever. No amount of patience resolves it; waiting longer is the one thing guaranteed not to help, because the condition is *mutual* and *stable*. And here's the cruel irony: strict 2PL, which §3 told you to want, makes deadlock *more* likely, not less — holding every X lock to commit means locks overlap for longer, so more transactions are simultaneously holding-and-wanting, which is exactly the soil deadlock grows in. Locking traded the lost update for the deadlock. That's not a regression; it's a different, *survivable* problem — and surviving it is what this section builds.
+
+The tool for seeing deadlock is the **wait-for graph**. Draw one node per active transaction. Add a directed edge **Tᵢ → Tⱼ** whenever Tᵢ is *waiting for* a lock that Tⱼ currently *holds*. The graph is a live picture of the blocking relationships in the lock manager: every transaction parked in a wait queue contributes edges to whoever holds the locks it's blocked on. And the theorem is clean: **a deadlock exists if and only if the wait-for graph contains a cycle.** Our two-transaction case is the smallest cycle, T1 → T2 → T1. A three-way deadlock (T1 waits for T2 waits for T3 waits for T1) is a triangle. Detecting deadlock is therefore *cycle detection* on a directed graph — a depth-first search that finds a back-edge, run periodically or whenever a transaction has waited suspiciously long.
+
+Once you've found a cycle you must *break* it, and a cycle has only one cure: remove a node. The database picks a **victim** — one transaction in the cycle — and **aborts** it. Aborting releases all of the victim's locks (that `release_all` from §4), which deletes its edges from the graph, which breaks the cycle, which lets the survivors acquire what they were waiting for and proceed. The victim's work is rolled back (recovery's job — Chapter 11) and the transaction is typically *retried* from the top, where this time it usually succeeds because the contention has cleared. Which transaction to victimize is a policy choice with real consequences: abort the **youngest** (least work lost, the common default), or the one **holding the fewest locks** (cheapest to roll back), or the one that's done the least work — anything but a rule that could repeatedly pick the same unlucky transaction and starve it. The detection is mechanical; the victim selection is a heuristic balancing fairness against wasted work (Agrawal, Carey & Livny showed this is fundamentally a *performance* question, not just a correctness one<Footnote n={4} />).
+
+Detection-and-recovery is one school. The other is **prevention**: never let a cycle form in the first place, by ordering transactions with timestamps and refusing the requests that could close a loop. Two classic schemes, both using transaction age:
+
+- **Wait-die** (non-preemptive): if an *older* transaction requests a lock held by a *younger* one, it waits; if a *younger* one requests a lock held by an *older* one, it *dies* (aborts and retries). Older transactions wait; younger ones die rather than make an older one wait.
+- **Wound-wait** (preemptive): if an *older* transaction wants a lock held by a *younger* one, it *wounds* the younger (aborts it and takes the lock); if a *younger* one wants a lock held by an *older* one, it waits.
+
+Both guarantee no cycle, because waiting only ever goes one way along the age ordering — and a consistent one-way ordering can't loop. They prevent deadlock at the cost of aborting transactions that *might* not actually have deadlocked (a false-positive abort). And the crude, ubiquitous third option is the **lock timeout**: don't build a graph at all, just abort any transaction that's waited longer than N seconds and assume it was probably deadlocked. Cheap, simple, and wrong often enough (it kills slow-but-not-deadlocked transactions too) that serious engines prefer real detection — but it's the fallback everyone ships as a backstop.
+
+<DeadlockScene client:visible />
+
+Figure 8.4 is the chapter's centerpiece. Watch two transactions acquire locks until the cycle snaps shut: T1 takes A, T2 takes B, T1 reaches for B and parks, T2 reaches for A and parks — and the wait-for graph, drawn live, completes its loop. The cycle lights up. Then the detector fires: a victim is chosen, its node and edges vanish as it's aborted, the survivor's wait edge turns to a grant, and the standstill dissolves into forward progress. Trigger the classic A/B–B/A deadlock yourself and watch detection catch it; add a third transaction and watch a three-node cycle form and break. The wait-for graph *is* the chapter's defining image — concurrency control as a graph of who-waits-for-whom, and deadlock as the moment that graph eats its own tail.
+
+<PythonSandbox client:only="react" initialCode={DEADLOCK_SANDBOX} />
+
+The sandbox extends the §4 lock manager with a wait-for graph and a `detect_deadlock()` that returns a cycle if one exists. Stage the A/B–B/A scenario: T1 and T2 each grab one resource and request the other, the manager records the wait edges, `detect_deadlock()` finds the cycle, a victim is chosen and `release_all`'d, and the survivor completes — the deadlock resolved in front of you, the final state showing one transaction committed and the other flagged for retry. The reveal is the one to carry out of the chapter: **deadlock is not a bug to be eliminated but a condition to be detected and recovered from.** You can't design it away (any lock-based system can deadlock); you can only catch it and break it. Locking trades the silent lost update for the loud, survivable deadlock — and that trade is the deal.
+
+</Section>
+
+<Section
+  id="granularity-and-latches"
+  title="Granularity & latches"
+  quiz={{
+    question: "While Chapter 04's B-tree splits a node and Chapter 05's buffer pool swaps a page, the engine protects those in-memory structures with a *latch*, not a lock. A row a transaction updates is protected by a *lock*. What's the essential difference?",
+    options: [
+      { text: "A latch is a short, cheap mutex protecting an in-memory structure for the microseconds of one operation — not transactional, not tracked by the lock manager, not deadlock-managed. A lock protects logical data (a row) for the whole transaction's duration and is tracked by the lock manager, where it can wait and deadlock.", correct: true },
+      { text: "There's no real difference — 'latch' and 'lock' are two words for the same lock-manager entry, and the engine uses them interchangeably depending on which subsystem is calling.", },
+      { text: "A latch is held longer than a lock and is always exclusive, while a lock is short-lived and always shared; latches are the transactional ones and locks protect memory.", },
+    ],
+  }}
+>
+
+Two practical refinements before we cash out the isolation levels — one about *how big* a lock is, one about a different mutual-exclusion mechanism the engine runs alongside locks that Chapters 04 and 05 quietly depended on.
+
+First, **granularity**. We've been locking "rows," but a lock manager can key its hash table on any resource id, so the unit of locking is a choice. You can lock a single **row**, a whole **page** (a slot of rows, in Chapter 04's terms), or an entire **table**. The trade-off is direct and it's the one Chapter 01 named at the very end: lock *finely* (per row) and unrelated transactions touching different rows never block each other — maximum concurrency — but the lock manager tracks a huge number of small locks, and that bookkeeping has real cost. Lock *coarsely* (per table) and the bookkeeping is trivial — one lock — but you've serialized every transaction that touches the table, including ones that would never have conflicted. Fine granularity buys concurrency with overhead; coarse granularity buys low overhead with lost concurrency. Real engines let both coexist and even *escalate* (promote thousands of row locks into one table lock when a transaction is clearly going to touch everything).
+
+Coexistence raises a puzzle: if T1 holds a row lock deep inside a table and T2 wants to lock the *whole* table, how does T2 find out there's a conflict without scanning every row for locks? The answer is **intention locks**. Before locking a row, a transaction takes an **intention** lock (IS or IX) on the table *above* it — a flag that says "I hold, or will hold, fine-grained locks somewhere below this node." Now a table-level lock request just checks the table's own lock state: an IX on the table tells a would-be table-X-locker "someone's writing a row in here, you must wait," without anyone walking the rows. Intention locks make multi-granularity locking efficient by surfacing fine-grained conflicts at the coarse level. We'll name them and stop there — the full intention-lock matrix is more than this chapter needs.
+
+Now the distinction Chapters 04 and 05 leaned on without ever naming: **latches versus locks.** They sound like synonyms and they are emphatically not. Everything this chapter has built — modes, matrix, 2PL, the manager, deadlock detection — is about **locks**: they protect *logical data* (a row, a key range), they're held for the *duration of a transaction* (to commit, under strict 2PL), they're tracked by the lock manager, and they can wait and deadlock. A **latch** is a different animal entirely. It's a short, cheap mutex — often just a single atomic compare-and-swap — that protects an *in-memory data structure* for the *microseconds of one operation*. When Chapter 04's B-tree splits a node, it latches the affected nodes so a concurrent reader doesn't observe the half-finished split; when Chapter 05's buffer pool evicts a page or updates the page table, it latches that structure so two threads don't corrupt it. Those latches are taken and released *within a single operation* — they never span transaction boundaries. They are not transactional, not tracked by the lock manager, and not deadlock-managed (latch ordering is enforced by careful coding, not a runtime graph). The whole point of a latch is to be *fast*, because it's taken constantly on the hot path; the whole point of a lock is to be *correct over a transaction*, because it enforces isolation.
+
+The mnemonic, from Hellerstein, Stonebraker & Hamilton's engine anatomy:<Footnote n={5} /> **locks protect the database's logical contents; latches protect the engine's physical data structures.** Locks are about *what the user sees* (isolation); latches are about *what the implementation needs* (not crashing its own in-memory state). Confusing them is a classic source of bugs — hold a latch for a transaction's duration and you'll throttle the engine to a crawl; use a lock to guard a B-tree node split and you'll deadlock on something that should have taken a microsecond. Chapter 04's nodes and Chapter 05's pages were guarded by the cheap, short one all along; this chapter built the expensive, long one.
+
+<PythonSandbox client:only="react" initialCode={LATCH_SANDBOX} />
+
+The sandbox contrasts the two directly: a **latch** taken and released inside a single `split_node`-style operation (acquire → mutate the structure → release, all within one call, never escaping it), against a **lock** held across several transaction steps (acquired on first touch, kept through reads and writes, released only at commit). Watch the timescales in the printed trace: the latch blinks on and off around one mutation; the lock stretches across the whole transaction. Same word in English, two completely different mechanisms at two different timescales — and the engine runs both at once.
+
+</Section>
+
+<Section
+  id="isolation-revisited"
+  title="Isolation, revisited"
+  quiz={{
+    question: "Chapter 03's isolation levels, under locking, are mostly a choice about lock *duration* and *scope*. A transaction takes an S lock to read a row, releases it the instant the read returns, and holds X locks to commit. Which level is that, and what does holding the S locks to commit instead get you?",
+    options: [
+      { text: "Releasing read locks immediately = READ COMMITTED (no dirty reads, but a re-read can change — non-repeatable). Holding S locks to commit (strict 2PL on reads too) = REPEATABLE READ: a row read once reads the same all transaction. Add range/predicate locks on the gap a new row would fall into and you reach SERIALIZABLE (no phantoms).", correct: true },
+      { text: "Releasing read locks immediately = SERIALIZABLE, because short locks mean less contention and therefore stronger guarantees; holding them longer weakens the level down to READ COMMITTED by increasing the chance of conflict.", },
+      { text: "Both are READ UNCOMMITTED — lock duration doesn't affect the isolation level at all, which is determined solely by whether the engine uses MVCC; locking always yields the same single level regardless of when locks release.", },
+    ],
+  }}
+>
+
+Now the payoff Chapter 03 was waiting for. That chapter presented the isolation levels as a contract — a list of which anomalies each level forbids — and left the enforcement as a black box. Open the box with everything this chapter built and the levels turn out to be almost embarrassingly simple: under locking, **an isolation level is mostly a choice about how long you hold your read locks and how wide a region they cover.** Same lock manager, same matrix, same 2PL — dialed up or down. The exclusive locks barely move (strict 2PL holds X to commit at every level, because nobody wants dirty writes); it's the *read* locks whose duration and scope define the ladder.
+
+Walk it rung by rung:
+
+- **READ COMMITTED.** Take a shared lock just long enough to read the row, then release it *immediately* — don't hold it. Exclusive locks are still held to commit (strict 2PL on writes), so you never read another transaction's uncommitted write: **no dirty reads.** But because you drop the read lock the instant you're done, the row is free to change before you read it again — so a second read can return a different value: **non-repeatable reads are allowed.** This is the cheap, common floor, and it's exactly what Chapter 03 said it was, now expressed as a lock-duration rule: read locks are instantaneous.
+
+- **REPEATABLE READ.** Change one thing: **hold the shared locks to commit, too** — strict 2PL on reads as well as writes. Now any row you've read is locked against modification for the rest of your transaction, so re-reading it always returns the same value: **non-repeatable reads are prevented.** This is the lock-based reading of Chapter 03's "take a shared lock on every row you read and hold it until commit" — that sentence was a one-line spec for this level, and you've now built the machine that executes it. But notice what these row locks *can't* cover: a row that doesn't exist yet. You locked the rows you read; you couldn't lock the *absence* of rows. So a concurrent insert of a new row matching your predicate slips through — **phantoms are still allowed** (Chapter 03's phantom, exactly: row-level read locks protect rows that exist, not the space where a new one could appear).
+
+- **SERIALIZABLE.** Close the phantom hole by locking not just the rows but the *gap they live in*. A query like `WHERE balance > 500` is, as Chapter 04 showed, a **range scan** down a B-tree — walk to the first matching key, read along the leaves to the last. To stop a phantom, take a **range lock** (or **predicate lock**) over that span of keys, so any concurrent insert whose key would fall *inside* the range must wait. You're no longer locking rows; you're locking a *region of the key space* — the predicate maps to a range in the B-tree, and that range is what you lock. Lock the gaps and no new row can appear inside your predicate: **phantoms prevented, and with them the last anomaly — SERIALIZABLE.** This is Chapter 03's predicate-lock discussion made mechanical, and it connects straight to Chapter 04's range scans: the thing you scan is the thing you lock.
+
+That's the whole ladder, and it's the same mechanism throughout. READ COMMITTED releases read locks early; REPEATABLE READ holds them to commit; SERIALIZABLE additionally locks the gaps. Duration and scope — that's the dial.
+
+<Callout type="note" title="Why SERIALIZABLE is expensive under locking">
+Range and predicate locks are why `SERIALIZABLE` has a reputation for being slow under a locking engine. A row lock conflicts with at most the handful of transactions touching that exact row. A range lock conflicts with *every transaction that wants to insert anywhere in the range* — and the range can be large (`WHERE created_at > '2020-01-01'` might lock the entire recent history of a table). So serializability under locking serializes huge swaths of work that never actually conflicted, just because they fell in the same key range, and it drives up contention and deadlock rates besides. This is precisely the cost Chapter 03 hinted at when it said `SERIALIZABLE` is the level you reach for only when a multi-row invariant demands it — and it's a big part of why modern engines reached for a completely different mechanism (the snapshot-based SSI of Chapter 03's write-skew section) to deliver serializability without locking every gap. Locking *can* give you SERIALIZABLE. It just makes you pay for it in waiting.
+</Callout>
+
+The reveal: Chapter 03's isolation hierarchy isn't a separate feature bolted on top of locking — it *is* locking, observed at different durations and scopes. The mechanism you built across §2–§6 is the whole hierarchy. Turn the read-lock duration knob and slide the predicate-lock scope knob and you've reproduced every level in Chapter 03's matrix, with the lock manager doing all the work underneath.
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+Stand back and look at what locking costs. It is *correct* — strict 2PL gives you serializability, the gold standard, and the deadlock detector keeps it survivable. But its currency is waiting, and waiting has a brutal property under load: **a reader blocks a writer, and a writer blocks a reader.** Look back at the §2 matrix and see it plainly — S conflicts with X in both directions. A long-running report that holds shared locks stalls every writer touching the same rows; a single writer holding an exclusive lock stalls every reader. Under light contention this is invisible. Under heavy contention it's a catastrophe: transactions pile into wait queues, deadlocks multiply (strict 2PL holding locks to commit, as §5 warned), and throughput collapses not because the machine is busy but because everyone is *waiting* on everyone else. The whole chapter was the engineering of who waits for whom — and the bill for that engineering is that, under a crowd, almost everyone waits.
+
+So a radical question. What if readers never had to wait for writers, ever? Locking forces a reader and a writer on the same row to take turns because there's only *one* copy of the row, and they fight over it. But what if there were more than one? What if every write, instead of overwriting the row in place, created a *new version* alongside the old — so a writer could install the new value while readers kept reading the old one, each transaction seeing a consistent snapshot of the database frozen at the moment it began? Then a read would never need a lock at all. It would just look at the version that was current when it started, regardless of what writers are doing now. No shared locks, no reader-writer conflict, no waiting on the read path.
+
+> What if readers never had to wait for writers, ever? What if a write didn't block a read because the old value was still lying around?
+
+That's **multiversion concurrency control**, and it's why most modern databases barely take read locks at all — it's the mechanism behind the snapshot isolation Chapter 03 kept pointing at, the `REPEATABLE READ` that Postgres implements as a snapshot rather than as the read locks you built in §7. Keeping multiple versions isn't free (someone has to clean up the old ones, which is what Chapter 03's vacuum aside was about), and it has its own sharp edge — the write skew that snapshot isolation gets wrong, which §6 of Chapter 03 spent its words on. But the trade is one of the most consequential in all of database engineering: trade storage and bookkeeping for the disappearance of read-write contention.
+
+That's **Chapter 9 — multiversion concurrency control.** Locking makes everyone take turns. Next we keep the past around so the readers never have to.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Six places to go deeper, each with a line on why it earns the detour. The first two are the foundation — the paper that defined the lock modes and the paper that defined two-phase locking; the rest carry you through the lock manager, the performance of deadlock handling, the engine-level latches-vs-locks distinction, and the bridge to Chapter 9.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Gray, Lorie, Putzolu &amp; Traiger, 1975 — "Granularity of Locks and Degrees of Consistency in a Shared Data Base" (IBM Research).</strong> The foundational paper and the source of most of §2, §6, and §7: the shared/exclusive lock modes, the compatibility matrix, the intention locks (IS/IX) that make multi-granularity locking work, and the original "degrees of consistency" that the SQL standard later renamed isolation levels. Nearly everything this chapter calls "the lock" traces to here.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Eswaran, Gray, Lorie &amp; Traiger, 1976 — "The Notions of Consistency and Predicate Locks in a Database System" (CACM).</strong> The theory behind §3 and §7: two-phase locking and the proof that it yields serializable schedules, plus predicate locks — the mechanism §7's SERIALIZABLE leans on to defeat phantoms. Read it to see <em>why</em> the shape of the lock-lifetime curve, not the locks themselves, is what guarantees correctness.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Gray &amp; Reuter, 1992 — "Transaction Processing: Concepts and Techniques," ch. 7–8.</strong> The encyclopedic treatment of the lock manager (§4), deadlock detection and the wait-for graph (§5), and lock granularity (§6) — the reference this whole chapter compresses. 1100 pages, three decades old, still the bible; when a detail here was glossed, this is where the full version lives.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Agrawal, Carey &amp; Livny, 1987 — "Concurrency Control Performance Modeling: Alternatives and Implications" (ACM TODS).</strong> The backbone of §5's claim that deadlock <em>detection vs prevention vs timeouts</em> is a performance question, not just a correctness one. Measures when detection beats prevention beats blind timeouts, and why victim-selection policy matters — the empirical case for treating deadlock as a tuning problem.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Hellerstein, Stonebraker &amp; Hamilton, 2007 — "Architecture of a Database System," §4 (Concurrency Control) &amp; §6.</strong> Where the lock manager sits in a real engine and the source of §6's latches-vs-locks distinction: locks protect logical contents (isolation), latches protect physical data structures (the B-tree nodes of Chapter 04, the buffer-pool pages of Chapter 05). The engine-wide map this book has drawn chapter by chapter, with locking placed in the whole.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, ch. 7 ("Transactions").</strong> The same material one notch up, framing 2PL and serializability directly against the MVCC and serializable-snapshot-isolation alternatives — the bridge into Chapter 9. Read it to see why "everyone takes turns" (this chapter) and "keep the past around" (the next) are the two great answers to the same question, and what each one costs.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
