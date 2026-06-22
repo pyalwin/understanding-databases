@@ -10,6 +10,15 @@ export async function getStaticPaths() {
 const { entry } = Astro.props;
 const { Content } = await render(entry);
 const num = String(entry.data.chapterNumber).padStart(2, '0');
+
+const ordered = (await getCollection('chapters'))
+  .filter((c) => c.id !== '_test')
+  .sort((a, b) => a.data.chapterNumber - b.data.chapterNumber);
+const idx = ordered.findIndex((c) => c.id === entry.id);
+const prev = idx > 0 ? ordered[idx - 1] : null;
+const next = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
+const label = (c: (typeof ordered)[number]) =>
+  `Chapter ${String(c.data.chapterNumber).padStart(2, '0')}`;
 ---
 
 <Layout title={entry.data.title}>
@@ -24,5 +33,32 @@ const num = String(entry.data.chapterNumber).padStart(2, '0');
       </p>
     </header>
     <Content />
+
+    <nav class="prose-column mt-16 sm:mt-20 pt-8 border-t border-[color:var(--color-rule)] flex gap-4 justify-between">
+      {prev ? (
+        <a class="group flex-1 max-w-[48%]" href={`/chapters/${prev.id}`}>
+          <span class="block font-sans text-[11px] tracking-[0.16em] uppercase text-[color:var(--color-ink-soft)] mb-1">
+            &larr; {label(prev)}
+          </span>
+          <span class="block font-serif italic text-[15px] sm:text-[17px] leading-snug group-hover:text-[color:var(--color-accent)]">
+            {prev.data.title}
+          </span>
+        </a>
+      ) : (
+        <span class="flex-1 max-w-[48%]"></span>
+      )}
+      {next ? (
+        <a class="group flex-1 max-w-[48%] text-right" href={`/chapters/${next.id}`}>
+          <span class="block font-sans text-[11px] tracking-[0.16em] uppercase text-[color:var(--color-ink-soft)] mb-1">
+            {label(next)} &rarr;
+          </span>
+          <span class="block font-serif italic text-[15px] sm:text-[17px] leading-snug group-hover:text-[color:var(--color-accent)]">
+            {next.data.title}
+          </span>
+        </a>
+      ) : (
+        <span class="flex-1 max-w-[48%]"></span>
+      )}
+    </nav>
   </article>
 </Layout>

@@ -2,28 +2,17 @@
 import Layout from '@/layouts/Layout.astro';
 import { getCollection } from 'astro:content';
 
-const published = (await getCollection('chapters'))
+const chapters = (await getCollection('chapters'))
   .filter((c) => c.id !== '_test')
   .map((c) => ({
     num: c.data.chapterNumber,
     title: c.data.title,
     summary: c.data.summary,
-    status: c.data.status,
     href: `/chapters/${c.id}`,
-  }));
+  }))
+  .sort((a, b) => a.num - b.num);
 
-const planned = [
-  {
-    num: 4,
-    title: 'Where Data Actually Lives',
-    summary: 'Pages, heaps, B-trees, indexes — from first principles, drawn in CSS.',
-    status: 'planned',
-    href: null,
-  },
-];
-
-const chapters = [...published, ...planned].sort((a, b) => a.num - b.num);
-const firstReadable = chapters.find((c) => c.status === 'published');
+const firstReadable = chapters[0];
 ---
 
 <Layout title="Understanding Databases">
@@ -69,24 +58,14 @@ const firstReadable = chapters.find((c) => c.status === 'published');
       <ol class="toc">
         {chapters.map((c) => {
           const num = String(c.num).padStart(2, '0');
-          const linkable = c.status === 'published' && c.href;
           return (
-            <li class={`toc-row toc-row--${c.status}`}>
-              {linkable ? (
-                <a class="toc-link" href={c.href}>
-                  <span class="toc-num">{num}</span>
-                  <span class="toc-title">{c.title}</span>
-                  <span class="toc-leader" aria-hidden="true"></span>
-                  <span class="toc-status">{c.status}</span>
-                </a>
-              ) : (
-                <div class="toc-link toc-link--inert">
-                  <span class="toc-num">{num}</span>
-                  <span class="toc-title">{c.title}</span>
-                  <span class="toc-leader" aria-hidden="true"></span>
-                  <span class="toc-status">{c.status}</span>
-                </div>
-              )}
+            <li class="toc-row">
+              <a class="toc-link" href={c.href}>
+                <span class="toc-num">{num}</span>
+                <span class="toc-title">{c.title}</span>
+                <span class="toc-leader" aria-hidden="true"></span>
+                <span class="toc-arrow" aria-hidden="true">&rarr;</span>
+              </a>
               <p class="toc-summary">{c.summary}</p>
             </li>
           );
@@ -244,7 +223,7 @@ const firstReadable = chapters.find((c) => c.status === 'published');
     color: var(--color-ink);
     transition: color 0.2s ease;
   }
-  .toc-link:hover:not(.toc-link--inert) { color: var(--color-accent); }
+  .toc-link:hover { color: var(--color-accent); }
 
   .toc-num {
     font-family: var(--font-mono);
@@ -271,24 +250,17 @@ const firstReadable = chapters.find((c) => c.status === 'published');
     align-self: flex-end;
   }
 
-  .toc-status {
-    font-family: var(--font-sans);
-    font-size: 0.66rem;
-    font-weight: 500;
-    text-transform: uppercase;
-    letter-spacing: 0.18em;
+  .toc-arrow {
+    font-family: var(--font-serif);
+    font-size: 0.95rem;
     color: var(--color-ink-soft);
     flex-shrink: 0;
+    transition: transform 0.2s ease, color 0.2s ease;
   }
-
-  .toc-row--published .toc-status { color: var(--color-accent); }
-
-  .toc-row--planned .toc-title,
-  .toc-row--planned .toc-status,
-  .toc-row--planned .toc-num {
-    color: var(--color-ink-soft);
+  .toc-link:hover .toc-arrow {
+    color: var(--color-accent);
+    transform: translateX(3px);
   }
-  .toc-row--planned .toc-title { opacity: 0.7; }
 
   .toc-summary {
     font-family: var(--font-serif);

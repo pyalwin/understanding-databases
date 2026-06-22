@@ -16,19 +16,13 @@ const chapters = (await getCollection('chapters'))
     <ol class="space-y-3 list-none p-0">
       {chapters.map((c) => {
         const num = String(c.data.chapterNumber).padStart(2, '0');
-        const isDraft = c.data.status === 'draft';
         return (
-          <li class="flex items-baseline gap-4 border-b border-[color:var(--color-rule)] py-2">
-            <span class="font-mono text-xs text-[color:var(--color-ink-soft)] w-8">{num}</span>
-            {isDraft ? (
-              <span class="flex-1 text-[color:var(--color-ink-soft)]">
-                {c.data.title} <span class="ml-2 text-xs uppercase tracking-wider">draft</span>
-              </span>
-            ) : (
-              <a class="flex-1 hover:text-[color:var(--color-accent)]" href={`/chapters/${c.id}`}>
-                {c.data.title}
-              </a>
-            )}
+          <li class="border-b border-[color:var(--color-rule)] py-2">
+            <a class="group flex items-baseline gap-4 hover:text-[color:var(--color-accent)]" href={`/chapters/${c.id}`}>
+              <span class="font-mono text-xs text-[color:var(--color-ink-soft)] w-8 group-hover:text-[color:var(--color-accent)]">{num}</span>
+              <span class="flex-1">{c.data.title}</span>
+              <span class="text-[color:var(--color-ink-soft)] transition-transform group-hover:translate-x-1 group-hover:text-[color:var(--color-accent)]" aria-hidden="true">&rarr;</span>
+            </a>
           </li>
         );
       })}
