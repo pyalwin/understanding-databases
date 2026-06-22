@@ -1,0 +1,287 @@
+---
+title: Group Commit & Log-Structured Storage
+chapterNumber: 10
+summary: "Chapter 02 said a transaction commits when its log record is on disk, and Chapter 09 turned the database into a firehose of new versions — but forcing the disk with an fsync on every single commit caps throughput at the disk's sync rate, a few hundred commits a second no matter how fast the machine. This chapter makes the log fast and then lets the log become the database. First group commit: batch many transactions into one fsync and pay the expensive disk sync once for the whole group. Then the deeper idea — sequential appends are the disk's favorite access pattern, so build the whole storage engine as an append-only log: writes land in an in-memory memtable backed by a write-ahead log, full memtables flush to immutable sorted SSTables, and compaction periodically merges the SSTables, dropping superseded values and tombstones. Build it all by hand in Python — a group-commit batcher and a working LSM-tree — and weigh the write, read, and space amplification that is the price of never updating in place."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import GroupCommitScene from '@/components/chapter-10/GroupCommitScene';
+import SSTableScene from '@/components/chapter-10/SSTableScene';
+import CompactionScene from '@/components/chapter-10/CompactionScene';
+import AmplificationScene from '@/components/chapter-10/AmplificationScene';
+import { FSYNC_SANDBOX, GROUPCOMMIT_SANDBOX, SEQUENTIAL_SANDBOX } from '@/components/chapter-10/groupcommit-sandboxes';
+import { MEMTABLE_SANDBOX, SSTABLE_SANDBOX, AMPLIFICATION_SANDBOX } from '@/components/chapter-10/lsm-sandboxes';
+import { COMPACTION_SANDBOX } from '@/components/chapter-10/compaction-sandboxes';
+
+<ChapterReader chapterId="10-group-commit-and-log-structured-storage">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 02 defined commit as 'the log record is durably on disk,' which in practice means an fsync. Why does that definition, taken literally per transaction, become a throughput wall — and what are this chapter's two responses?",
+    options: [
+      { text: "An fsync forces the disk and costs on the order of milliseconds, so one fsync per commit caps the whole system at the disk's sync rate (a few hundred per second) regardless of CPU. The two responses: group commit (amortize one fsync across a batch of transactions) and log-structured storage (make every write a fast sequential append, so the log itself becomes the database).", correct: true },
+      { text: "The definition is wrong — commit actually means the data page is overwritten in place, and the fix is to overwrite pages faster by buying more RAM, after which no log is needed at all.", },
+      { text: "fsync is cheap; the wall is CPU spent computing checksums, and the two responses are to disable checksums and to skip the log entirely for read-only transactions.", },
+    ],
+  }}
+>
+
+Two chapters ago you built a write-ahead log; one chapter ago you turned every update into a brand-new version. Both rested on a single word we have used a hundred times and never once priced: **commit.**
+
+Chapter 02 gave commit its meaning. A transaction is committed, it said, when its log record is *durably on disk* — when a crash a microsecond later would still find the transaction's effects on restart. That durability is the **D** in ACID, and the mechanism was the write-ahead log: append a record describing the change, and before you tell the client "committed," make sure that record has physically reached stable storage. The instruction that makes "physically reached stable storage" true is `fsync` (or its kin) — a system call that forces the operating system to stop buffering and actually push the bytes down to the device and wait for the device to confirm. Chapter 02 was right about all of it. What it left unpriced is that `fsync` is *catastrophically* slow compared to everything else the database does. Appending a log record to an in-memory buffer takes well under a microsecond. Forcing that buffer to durable storage takes *milliseconds* — thousands of times longer. And if you take Chapter 02's definition at its most literal — one `fsync` per commit, so each transaction's durability is its own — then the whole database can commit no faster than the disk can sync, which is a few hundred times a second, on a machine that can do billions of operations in that same second. The CPU sits idle; the cores spin; throughput flatlines against a wall made entirely of one slow system call.
+
+Chapter 09 made the wall taller. Multiversion concurrency control means every update *appends a new version* rather than overwriting, so a busy database under MVCC is a firehose of small writes, each of which wants to be durable, each of which — naively — wants its own `fsync`. The mechanism that freed readers from waiting has made the commit path busier than ever. So the question this chapter opens on is sharp and practical: **how do you make commit fast when commit means forcing a slow disk?**
+
+There are two answers, and they're the two halves of the chapter. The first is local and almost obvious once you see it: if one `fsync` is expensive, don't do one per transaction — do one per *group* of transactions. Let commits pile up for a few milliseconds and flush them together, so fifty transactions share the cost of a single disk sync. That's **group commit**, and it's the cheapest large win in all of transaction processing (§1–§2). The second answer is deeper and reorganizes the entire storage engine around a single observation: the reason a disk is slow is mostly that you keep asking it to write in *different places*, and the log never does — a log only ever appends to the end, the one access pattern every storage device is fastest at. Push that observation all the way and you stop treating the log as a sidecar to the "real" data and start treating the log *as* the data. That's **log-structured storage**, and its dominant modern form is the **LSM-tree**: writes land in memory, spill to immutable sorted files, and a background merge keeps the pile tidy (§4–§7). It is how RocksDB, Cassandra, LevelDB, and a large fraction of the databases written this century actually store their bytes.
+
+The through-line connecting both answers is the same instinct you've now met twice — once in Chapter 02's append-only log, once in Chapter 09's append-a-new-version store: **appending is cheap and overwriting is expensive, so arrange never to overwrite.** This chapter is that instinct, applied first to the commit path and then to the whole storage engine. We'll build a group-commit batcher by hand, watch it turn fifty `fsync`s into one, then build a working LSM-tree — memtable, write-ahead log, immutable SSTables, and the compaction that merges them — and end by weighing the bill, because turning every write into an append is not free either: it pays in *amplification*, the same data written and read and stored several times over. By the end you'll understand why the fastest way to write to a disk is to stop pretending you can change what's already on it.
+
+</Section>
+
+<Section
+  id="the-fsync-problem"
+  title="The fsync problem"
+  quiz={{
+    question: "A machine can append a log record to a page-cache buffer in well under a microsecond, but an fsync that forces that buffer to durable storage costs ~5 ms. If every transaction commits with its own append+fsync, what bounds throughput, and to what?",
+    options: [
+      { text: "The fsync bounds it: at ~5 ms each, serial per-commit fsyncs cap throughput near 1/0.005 ≈ 200 commits/second, no matter how fast the CPU appends — the disk sync, not the computation, is the ceiling.", correct: true },
+      { text: "The append bounds it: since appends are sub-microsecond, throughput is millions of commits/second and fsync is irrelevant to the rate.", },
+      { text: "Nothing bounds it — committing is embarrassingly parallel, so throughput scales linearly with core count and the fsync cost cancels out across threads.", },
+    ],
+  }}
+>
+
+Make the wall concrete, because its height is the whole motivation and it's easy to under-feel from prose alone.
+
+Put numbers on the two operations a commit involves. *Appending* a log record — copying a few dozen bytes into a buffer the operating system already has in memory — costs a fraction of a microsecond; call it negligible. *Forcing* that buffer to durable storage with `fsync` costs, on a typical setup, somewhere around five milliseconds: the call has to get the bytes out of the OS page cache, onto the device, and wait for the device to acknowledge that they're on stable media and not just sitting in a volatile cache that a power cut would erase. Five milliseconds is an eternity to a CPU — in that window a modern core executes something like ten million instructions — but it is the honest price of the word *durable*. You cannot tell a customer their money transferred and then lose it to a crash; the `fsync` is the promise made physical.
+
+Now do the arithmetic that defines the wall. If every transaction commits by appending its record and then calling its own `fsync`, and each `fsync` takes five milliseconds, and they happen one after another, then the maximum number of commits per second is one divided by five milliseconds: **about two hundred.** Two hundred. Not two hundred thousand — two hundred. It does not matter that the CPU could have processed a hundred thousand transactions' worth of logic in that second; the transactions can only become *durable* as fast as the disk can sync, and the disk syncs two hundred times a second. Add cores and the number barely moves, because they all queue behind the same physical act of forcing the same device. This is the signature of an I/O-bound bottleneck: the expensive resource isn't computation, it's the count of times you make the disk promise. **The number of `fsync`s, not the number of commits and not the speed of the machine, is the ceiling.**
+
+<PythonSandbox client:only="react" initialCode={FSYNC_SANDBOX} />
+
+The sandbox models the commit path with a tiny write-ahead log whose only expensive operation is `fsync`, and a cost model that charges five milliseconds per sync. Commit a thousand transactions the naive way — append, `fsync`, append, `fsync` — and it counts a thousand `fsync`s and reports the throughput ceiling that falls straight out of them: a few hundred commits a second, the CPU never the limiting factor. The number to fix your eyes on is `fsyncs`, because the next section changes *only that number* and watches everything else improve for free. Nothing about the transactions changes; nothing about durability weakens; we just stop paying the disk-sync toll once per traveler.
+
+</Section>
+
+<Section
+  id="group-commit"
+  title="Group commit"
+  quiz={{
+    question: "Under group commit, 50 transactions arrive within the same few-millisecond window, each appends its log record, and then a single fsync forces all 50 at once. What is gained and what is the cost?",
+    options: [
+      { text: "Gained: 50 commits made durable for the price of ONE fsync, so throughput rises roughly with batch size (≈ 50× here). Cost: each transaction must WAIT for the shared fsync before it's told 'committed,' so individual commit latency goes up — throughput is bought with a little latency.", correct: true },
+      { text: "Gained: each transaction skips its fsync entirely and is durable immediately with zero disk I/O. Cost: nothing — group commit is a pure win with no latency or durability tradeoff.", },
+      { text: "Gained: the 50 transactions are merged into one transaction, so only one ever commits and the other 49 are discarded. Cost: 49 transactions are lost.", },
+    ],
+  }}
+>
+
+The fix is the kind of idea that seems too simple to be worth a name, and it has saved more transaction-processing systems than almost any other trick: **don't sync once per commit — sync once per batch of commits.**
+
+Here is the insight. An `fsync` forces *everything* in the log buffer that hasn't been forced yet, not just one transaction's record. The cost is per-*call*, not per-*byte* — flushing one record and flushing fifty records cost almost exactly the same, because the expense is the round-trip to the device and back, not the handful of bytes that ride along. So if fifty transactions all append their records to the log buffer and *then* a single `fsync` fires, all fifty become durable at once, for the price of one sync. Fifty commits, one disk toll. The throughput ceiling that was `1 / fsync_time` becomes `batch_size / fsync_time` — multiply your two hundred commits a second by a batch of fifty and you're at ten thousand, on the same disk, with the same durability guarantee, having changed nothing but *when* you call `fsync`. This is **group commit**, and the engines that pioneered it in the 1980s found exactly this multiplier waiting to be collected.<Footnote n={1} />
+
+Nothing about durability is weakened, and that's the part worth dwelling on, because it sounds like a cheat. Each of the fifty transactions is told "committed" only *after* the shared `fsync` returns — not before. No transaction hears "committed" until its record is genuinely on stable media. If the power fails while the batch is still accumulating in the buffer, none of the fifty had been promised durability yet, so losing them violates nothing; on restart they simply never happened, which is a perfectly legal outcome for a transaction that was never acknowledged. The guarantee is preserved exactly. What changes is *latency*. A transaction that could have synced immediately now has to *wait* for the batch — wait for a few more transactions to arrive, or for a short timer to expire, before the group flush carries it to disk. So group commit buys throughput with latency: each individual commit takes a little longer (it waits for company), but the system as a whole commits far more per second. Under heavy load this is a spectacular trade, because under heavy load there's always a batch forming and the wait is tiny; the busier the system, the better group commit works, which is precisely the property you want from a throughput optimization. (It's a knob in every serious engine — Postgres exposes it as `commit_delay`/`commit_siblings`; MySQL's `binlog_group_commit` does the same job.)
+
+<GroupCommitScene client:visible />
+
+Figure 10.1 runs the batch on a timeline. Watch transactions arrive and append their records into a forming group; a short window passes; then one `fsync` fires and the *entire* group flips to "committed" together. Turn the batch-size dial up and watch two things move in opposite directions: throughput climbs (more commits per sync) while each commit's latency stretches (longer to wait for the group). The crossing curves *are* the tradeoff — there's no batch size that wins on both axes, and the right one depends on whether you're optimizing for commits-per-second or for how long any one client waits.
+
+<PythonSandbox client:only="react" initialCode={GROUPCOMMIT_SANDBOX} />
+
+The sandbox builds the batcher directly: transactions append to a shared log buffer, and a single `fsync` durably commits the whole group at once. Run it and watch fifty commits cost one `fsync` where §1 spent fifty, the throughput number jumping by the batch factor while the `fsync` count collapses. Vary the batch size and read the two columns — throughput up, per-commit latency up — and you've measured the trade with your own numbers. The reveal is that the wall from §1 was never about the transactions or the machine; it was about how often you chose to force the disk, and *that* was a choice all along. Group commit is the first and cheapest way to make commit fast. The rest of the chapter makes *writing* fast, which turns out to require rethinking what "the data" even is.
+
+</Section>
+
+<Section
+  id="sequential-vs-random"
+  title="Sequential vs random"
+  quiz={{
+    question: "Chapter 04's B-tree updates a row by seeking to its page and rewriting it in place. A log-structured engine instead appends the new value to the end of a log. On the storage device, why does the append-only approach win on writes?",
+    options: [
+      { text: "In-place updates scatter writes across the device — each is a random access (a seek on a spinning disk; a read-modify-write of an erase block on an SSD). Appends are all sequential, the device's fastest and most wear-friendly pattern, so turning random writes into one growing sequential stream is a large write-throughput win.", correct: true },
+      { text: "Appends win because they require no log at all, so there is simply less total data to write than the B-tree produces.", },
+      { text: "They are identical at the device level; 'sequential vs random' is a logical distinction with no effect on real disks or SSDs, so the choice is purely about code simplicity.", },
+    ],
+  }}
+>
+
+Group commit sped up the *commit*. Now widen the lens to *all* writes, because the same physical fact that made `fsync` expensive has a much larger consequence hiding behind it.
+
+Ask why a disk is slow, precisely. For a spinning disk the answer is mechanical and brutal: to read or write a particular spot, a physical arm must *seek* to the right track and the platter must *rotate* until the right sector passes under the head. That mechanical positioning costs several milliseconds, and it is the same few milliseconds whether you then transfer one byte or a megabyte. So the disk has two completely different personalities. Ask it to write data scattered across the platter — here, then way over there, then back — and every write pays the full seek tax; you get maybe a few hundred such *random* writes per second, the same wall we already hit. Ask it to write data *sequentially* — one long stream to consecutive sectors — and it pays the seek once and then writes at the full speed of the spinning media, hundreds of megabytes a second. Sequential and random writes to the same disk differ in throughput by **two or three orders of magnitude.** SSDs soften the gap but don't close it: they have no arm to move, but they can only erase in large blocks, so scattered small in-place updates force expensive read-modify-write cycles on whole erase blocks, while sequential appends pack cleanly and wear the flash evenly. On every storage medium ever shipped, *sequential beats random*, often by a lot.
+
+Now lay Chapter 04's B-tree against that fact and wince. When the B-tree updates a row, it seeks to the leaf page that holds it and rewrites that page *in place* — and over a workload of updates landing on different rows, those page writes are scattered all over the device. The B-tree's whole design optimizes for fast *reads* (a shallow tree, a handful of seeks to any key) and pays for it with *random writes*. That was the right trade for decades of read-heavy workloads on the assumption that you must overwrite data where it lives. But notice what the write-ahead log has been doing the entire time, sitting right next to the B-tree: only ever *appending*, one sequential stream to the end of a file, the disk's favorite pattern. The log is fast precisely because it never goes back to change what it already wrote. Which raises the heretical question that organizes the rest of the chapter: if appending is this much faster than overwriting, why is the log a mere *journal* of changes we then laboriously apply to the slow update-in-place B-tree? Why not let the log-shaped, append-only structure *be* the database, and never update in place at all?<Footnote n={2} />
+
+<PythonSandbox client:only="react" initialCode={SEQUENTIAL_SANDBOX} />
+
+The sandbox puts a cost model on the contrast: charge one "seek" unit per random in-place write the way a B-tree scatters them, versus one seek for an entire sequential run of appends. Write the same batch of records both ways and read the two costs — the random path paying per write, the append path paying once — and the order-of-magnitude gap is right there in the totals. It's a toy model (real devices are subtler), but the shape is exactly right and it's the shape that justifies everything that follows: turn random writes into sequential ones and the disk stops being the enemy. The next four sections build the structure that does exactly that.
+
+</Section>
+
+<Section
+  id="the-memtable"
+  title="The memtable"
+  quiz={{
+    question: "In a log-structured engine, a write does two things: appends the record to an on-disk write-ahead log, and inserts it into an in-memory memtable. Why both, and what serves reads?",
+    options: [
+      { text: "The WAL append makes the write durable immediately (survives a crash via replay); the memtable holds the same data in memory in sorted order so reads are fast and so it can later be flushed as a sorted file. Reads are served from the memtable (newest data), falling through to on-disk structures only on a miss.", correct: true },
+      { text: "The WAL is for reads and the memtable is for durability; reads scan the WAL from the beginning each time, and the memtable is never consulted on the read path.", },
+      { text: "Both are redundant copies for replication to other machines; a single local write would suffice, and reads go directly to disk pages as in Chapter 04.", },
+    ],
+  }}
+>
+
+So we commit to the heresy: never update in place. Every write is an append. The structure that makes this work as a real key-value store is the **log-structured merge-tree**, the LSM-tree,<Footnote n={3} /> and it has exactly three moving parts, which the next three sections build in order. This one builds the first: the **memtable**, where writes land.
+
+A write enters the engine and immediately does two things. First, it *appends* a record to a write-ahead log on disk — the same WAL idea from Chapter 02, the same sequential-append speed from §3 — and that append is what makes the write **durable**: if the machine crashes one instant later, restart replays the log and the write is recovered. Second, it inserts the key and value into an in-memory data structure called the **memtable**, kept sorted by key (a balanced tree or skip list in a real engine; a sorted dictionary in ours). The WAL is for *durability*; the memtable is for *speed and order*. Reads consult the memtable first, so the freshest data — which is the data most likely to be read again — is served straight from memory at memory speed, no disk touched at all. The division of labor is clean and worth memorizing: **the log is the durable record of what happened; the memtable is the fast, sorted, in-memory view of the current state.** Both hold the same writes; they just serve different masters.
+
+Notice what this buys on the write path. Every on-disk write is a sequential append to the WAL — no seeks, no in-place updates, the disk's fastest pattern. The expensive, random, update-in-place work that the B-tree did on *every* write simply doesn't happen here; the in-memory memtable absorbs the updates for free (overwriting a key in memory costs nothing), and the disk only ever sees the append-only log. We have turned the random-write workload of §3 into a pure sequential stream. The cost, of course, is that the memtable lives in volatile memory and can't grow forever — which is the cliff the *next* section walks up to. But for now, with writes appending to the log and updating the memtable, and reads served from the memtable, we have a working (if amnesiac) store whose writes are as fast as the disk can append.
+
+<PythonSandbox client:only="react" initialCode={MEMTABLE_SANDBOX} />
+
+The sandbox builds the first two parts of the `LSMTree`: a `put` that appends to the WAL (durability first) and then writes the memtable, and a `get` served straight from the memtable. Run it and watch a write land in both places — the WAL recording it as a durable fact, the memtable holding it for fast lookup — and a read answered from memory. Update a key and the memtable simply overwrites it in place (in memory, where in-place is free) while the WAL keeps *both* records, because the WAL is a history, not a snapshot. That asymmetry — append-only on disk, overwrite-in-memory — is the whole trick, and it's also the seed of the next problem: the memtable can't grow without bound, so eventually it has to go to disk, and disk, we've decided, is append-only.
+
+</Section>
+
+<Section
+  id="sstables"
+  title="SSTables"
+  quiz={{
+    question: "When the memtable fills, it is flushed to disk as an immutable, sorted SSTable, and the memtable is cleared. A key written twice (an update) can now have an old value in an older SSTable and a new value in a newer one. How does a read return the right value?",
+    options: [
+      { text: "Reads consult sources newest-first: the memtable, then SSTables from newest to oldest, and return the FIRST occurrence found. The newer SSTable shadows the older one, so the update wins; the old value is never deleted in place — it just stops being the first hit.", correct: true },
+      { text: "Flushing rewrites every existing SSTable to physically delete the old value, so at most one copy of any key exists on disk and reads find it directly.", },
+      { text: "Reads scan SSTables oldest-first and return the first hit, so the original value wins and updates are invisible until a background process applies them.", },
+    ],
+  }}
+>
+
+The memtable fills. Memory is finite, and a store that only grows in RAM is a store with a built-in crash. So when the memtable reaches some size threshold, the engine **flushes** it: writes its entire sorted contents out to disk as a single file and starts a fresh, empty memtable. The crucial design choices are what that file *is* and what happens to it *afterward*, and both follow from the no-overwrite rule.
+
+The file is an **SSTable** — a Sorted String Table — and it has two defining properties. It is **sorted** by key (which is free, because the memtable was already sorted, so flushing is one sequential write of keys in order — fast, and it makes later merging and range-scanning easy). And it is **immutable**: once written, an SSTable is *never modified*. Not updated, not appended to, not edited. If a key in it later changes, the new value goes into the memtable and eventually into a *newer* SSTable; the old SSTable keeps its stale value untouched, frozen. This immutability is what keeps every disk write sequential — you only ever write a *whole new* SSTable start to finish, never seek back into an existing one — and it's what makes the files safe to read without locks while compaction rearranges things in the background. Flushing the memtable, then, is the second sequential-write win: a big batched dump of sorted data, no seeks, after which the memtable's WAL can be discarded because its contents are now safely in an SSTable.<Footnote n={4} />
+
+But immutability creates a puzzle the §5 quiz turns on: if you never modify an old SSTable, then *updating* a key leaves its old value sitting in an older file and its new value in a newer one, and *both are on disk at once*. Which does a read return? The rule is **newest wins, by recency of source**. A read checks the memtable first (the very newest data); on a miss it checks SSTables from **newest to oldest**, and returns the **first** occurrence it finds. Because the newer SSTable is checked before the older one, the update shadows the stale value — the old value is still physically there, but no read ever reaches it, because a fresher copy is always found first. A *delete* works the same way, with a twist: since you can't go erase the key from the old immutable file, you instead write a **tombstone** — a special marker meaning "this key is deleted" — into the memtable, which flushes to a newer SSTable, which shadows the real value underneath. A read that hits the tombstone first reports "not found," exactly as if the key were gone. The data isn't removed; it's *buried* under a newer marker. Everything is append-only, even deletion.
+
+<SSTableScene client:visible />
+
+Figure 10.2 shows the memtable filling and then flushing into an immutable sorted SSTable that drops onto a stack of older ones, newest on top. Then it traces a read down the stack: into the memtable, miss; into the top SSTable, miss; into the next, *hit* — and stop. Watch an updated key light up in two different SSTables and see the read return the one nearer the top, the older copy sitting there shadowed and unreachable. The stack-with-newest-on-top *is* the read path, and the picture makes vivid both why reads still work (newest-first finds the current value) and the cost quietly accruing underneath (the stack keeps growing, and a read might have to descend a long way).
+
+<PythonSandbox client:only="react" initialCode={SSTABLE_SANDBOX} />
+
+The sandbox grows the `LSMTree` with `flush`: fill the memtable past its limit and watch it spill into a sorted SSTable, the memtable reset to empty, the WAL truncated. Then it runs the read path — `get` missing the memtable and walking the SSTable stack newest-first — and stages an update whose old value sits in an older table, shadowed by the newer one, the read correctly returning the fresh value. Print the stack and you can see the buried copy: physically present, logically dead. That buried, unreachable data is the problem the next section exists to solve — because every update and every delete leaves another corpse on disk, the stack grows without limit, and reads get slower the deeper they have to dig.
+
+</Section>
+
+<Section
+  id="compaction"
+  title="Compaction"
+  quiz={{
+    question: "After many flushes there are a dozen SSTables, several holding stale versions of the same keys, plus tombstones marking deletes. A read may have to check all of them. What does compaction do, and why can it only now drop a tombstone?",
+    options: [
+      { text: "Compaction merges SSTables into fewer (or one), keeping only the newest value per key and physically discarding shadowed values — cutting read amplification and reclaiming space. A tombstone can be dropped once the merge has passed every older SSTable that might still hold the deleted key, so nothing older can resurrect it.", correct: true },
+      { text: "Compaction deletes the newest SSTable to save space, since the oldest data is the most authoritative; tombstones are dropped immediately on every write.", },
+      { text: "Compaction rewrites the memtable into the WAL and never touches SSTables; tombstones are kept forever because deletes must remain visible permanently.", },
+    ],
+  }}
+>
+
+Every flush adds an SSTable; nothing ever removes one; updates and deletes bury old values and tombstones in the growing pile. Left alone, this kills the design two ways. Reads slow down, because a key that's been updated or, worse, *never written* forces a read to descend through more and more SSTables looking for it (a lookup for an absent key has to check *every* table before giving up). And space leaks, because every superseded value and every tombstone still occupies disk even though no read will ever return it. The append-only trick that made writes fast has a dual: it makes the on-disk state accumulate garbage. The garbage collector that fixes this — and the beating heart of every LSM engine — is **compaction**.
+
+Compaction takes several SSTables and **merges them into fewer** (often one), and because the inputs are all sorted, the merge is a single linear pass — a merge-sort merge, sequential reads in, one sequential write out, the disk's favorite pattern once again. As it merges, it applies two rules that reclaim everything the no-overwrite policy left behind. First, **for each key, keep only the newest value and discard the rest** — when the merge sees the same key in two input tables, the copy from the newer table wins and the older one is simply not written to the output. Every shadowed, buried value from §5 evaporates in this step; the output holds one current value per key instead of a stratified history. Second, **drop tombstones once they've done their job.** A tombstone exists to shadow an older value of a deleted key; once compaction has merged past *every* SSTable old enough to contain that key, there is nothing left underneath to shadow, so the tombstone itself can be discarded and the key truly vanishes. (Drop a tombstone too early — before merging the table that still holds the live value — and the delete is undone, the dead key resurrected, which is why an engine must be careful that a compaction spans the older tables before it retires a tombstone.) The output is a single tidy SSTable: one value per live key, no stale versions, no tombstones for keys that are fully gone. Reads that had to descend a dozen tables now hit one.
+
+This is also where a small, beautiful optimization earns its keep: the **bloom filter.** A read for a key that isn't present still has to ask each SSTable "do you have this?" — and the answer is usually "no," after a wasted lookup. A bloom filter is a tiny probabilistic summary attached to each SSTable that can answer "*definitely* not here" or "*maybe* here" in a few bits of work, never touching the table's data. It can be wrong only in the "maybe" direction (a false positive sends you to look in a table that turns out not to have the key), never in the "no" direction (if it says no, the key is genuinely absent). So a read consults each SSTable's bloom filter first and *skips* every table that definitely lacks the key, collapsing read amplification for absent and rarely-updated keys from "check every table" to "check almost none." It's the cheap insurance that makes LSM reads tolerable between compactions.<Footnote n={5} />
+
+<CompactionScene client:visible />
+
+Figure 10.3 is the chapter's centerpiece: the merge made visible. Several SSTables stand stacked, each a little sorted run of key→value cards, some keys appearing in more than one table with different values, some carrying tombstones. Trigger compaction and watch the merge sweep through them: keys line up by sort order, the newest value of each is kept while its shadowed older copies drop away, tombstones cancel the values beneath them and then themselves vanish, and the several tables collapse into one clean compacted table. Then the payoff, shown side by side: a read that *before* had to scan the whole stack now finds its answer in a single table. Watch the merge re-write the survivors and you also see, in the same animation, the cost — compaction *reads* all those tables and *writes* the result, work that competes with live traffic. That double-edge is the subject of the final section.
+
+<PythonSandbox client:only="react" initialCode={COMPACTION_SANDBOX} />
+
+The sandbox completes the `LSMTree` with `compact()`: it merges the SSTable stack oldest-to-newest so newer values overwrite older, drops the tombstones, and leaves a single compacted table. Build up several SSTables with an update and a delete scattered across them, watch `get` work but scan many tables (the read amplification, counted), then compact and watch the stack collapse to one — the superseded value gone, the deleted key truly removed, the next `get` hitting a single table. With the bloom-filter helper wired in, it even reports how many tables a lookup *skipped*. The reveal is that an LSM-tree is not a static structure but a *process*: writes flow in as appends, pile up as immutable tables, and a background merge continuously distills the pile back down. The database is a log that is forever tidying itself.
+
+</Section>
+
+<Section
+  id="amplification"
+  title="Amplification"
+  quiz={{
+    question: "An LSM-tree trades three kinds of amplification. Which description matches, and how do leveled vs tiered compaction move the tradeoff?",
+    options: [
+      { text: "Write amp: one logical write is physically written several times (WAL, flush, repeated compactions). Read amp: a read may probe several SSTables/levels. Space amp: dead versions linger until compacted. Compacting aggressively (leveled) lowers read and space amp but raises write amp; compacting lazily (tiered) lowers write amp but raises read and space amp.", correct: true },
+      { text: "All three amplifications always rise and fall together, so there is no tradeoff to tune; leveled and tiered are just two names for the identical algorithm.", },
+      { text: "Amplification refers only to network traffic between replicas; leveled compaction sends more packets and tiered sends fewer, with no effect on local reads, writes, or space.", },
+    ],
+  }}
+>
+
+Every design pays for its strengths somewhere, and an honest chapter names the bill. The LSM-tree bought fast sequential writes by never updating in place — and the price shows up as three kinds of **amplification**, a word that means "the work you actually do is some multiple of the work you logically asked for."
+
+**Write amplification.** You logically wrote a key once. Physically, that key's bytes were written *several* times: into the WAL, then into an SSTable when the memtable flushed, then *again* every time a compaction rewrote the SSTable it lived in (and a key can be rewritten by many successive compactions over its life). One logical write becomes a handful of physical writes. Ironic, given that the whole point was to write *less* randomly — and a real risk on SSDs, where physical writes wear the flash.
+
+**Read amplification.** You logically read one key. Physically, a read may have to probe the memtable and then several SSTables before finding it (or before bloom filters let it give up), so one logical read becomes several physical lookups. This is the structural disadvantage versus Chapter 04's B-tree, where a read is a single short root-to-leaf descent: the B-tree is *read-optimized*, the LSM-tree is *write-optimized*, and read amplification is exactly the tax the LSM pays for its write speed.
+
+**Space amplification.** Your live data is some number of bytes. Physically, the disk holds *more* — because superseded values and not-yet-collected tombstones linger in older SSTables until a compaction sweeps them away. One byte of live data costs more than one byte on disk, until compaction catches up.
+
+The three are not independent — they're a *triangle you can't win outright*, and the lever between them is **how aggressively you compact.** Compact often and eagerly (the **leveled** strategy of LevelDB and RocksDB): few SSTables, little stale data, so read and space amplification stay low — but you rewrite data constantly, so write amplification is high. Compact rarely and lazily (the **size-tiered** strategy of Cassandra and others): you rewrite data seldom, so write amplification is low — but SSTables and dead versions pile up, so read and space amplification climb. There is no setting that minimizes all three; tuning an LSM engine *is* choosing where on this triangle your workload should sit. A write-heavy ingest pipeline leans tiered; a read-heavy serving store leans leveled; and the knobs in RocksDB are, more than anything, knobs on this one tradeoff.<Footnote n={6} />
+
+<AmplificationScene client:visible />
+
+Figure 10.4 makes the triangle tangible: three bars — write, read, space amplification — and a toggle between leveled and tiered compaction that moves all three at once. Slide toward leveled and watch read and space shrink while write balloons; slide toward tiered and watch the opposite. A chip alongside marks where Chapter 04's B-tree would sit — low read amplification, but random in-place writes — so you can see the LSM and the B-tree as two ends of one axis: write-optimized versus read-optimized, the same database problem solved from opposite corners.
+
+<PythonSandbox client:only="react" initialCode={AMPLIFICATION_SANDBOX} />
+
+The sandbox instruments the `LSMTree` to count all three: physical writes per logical write (write amp), SSTables touched per read (read amp), and dead-to-live ratio on disk (space amp). Run it once compacting eagerly and once compacting lazily and read the three numbers move against each other — the triangle, measured. There's no row where all three are small.
+
+<Callout type="note" title="So which should you use — LSM or B-tree?">
+Neither wins everywhere, and that's the point. A **B-tree** (Chapter 04) updates in place: one short read path, predictable low read amplification, mature and battle-tested — the default in Postgres, MySQL's InnoDB, SQLite. It pays in random writes. An **LSM-tree** turns every write into a sequential append and merges in the background: superb write throughput and excellent compression of sorted data, at the cost of read and write amplification and the operational reality of compaction competing with live traffic — the default in RocksDB, Cassandra, LevelDB, HBase, and the storage layer under many newer systems. The rule of thumb: **write-heavy or ingest-heavy, space-conscious workloads favor the LSM; read-heavy, latency-sensitive workloads favor the B-tree.** Most of the database world now ships both and lets you pick per table. They are not rivals so much as the two stable answers to one question — *do you optimize the read or the write?* — and Chapters 04 and 10 are the two answers, built by hand.
+</Callout>
+
+</Section>
+
+<Section id="whats-next" title="What's next">
+
+Stand back at what we've built and a debt comes due — the same one Chapter 09 quietly ran up, now impossible to defer. This whole chapter rests on the log. Group commit makes the *log* durable in efficient batches; the LSM keeps its current state in a volatile memtable backed entirely by an on-disk *log* and a set of immutable files. We've said, repeatedly and without elaboration, "if the machine crashes, replay the log and recover." That sentence has been carrying enormous weight. *Which* log records do you replay? The memtable that hadn't been flushed yet is gone — its contents survive only in the WAL, so recovery must replay the WAL to rebuild it. But replay from *where*? From the very beginning of time? That could be terabytes; no system can re-read its entire history on every restart. And what about writes that were in flight — half-flushed SSTables, transactions that had appended a log record but never committed, a compaction interrupted mid-merge? A crash doesn't wait for a clean moment. It can strike with the memtable half-full, a flush half-written, and a group-commit batch half-synced, all at once.
+
+So the durability we've been invoking is not actually finished. We have a fast, append-only log and a strong story about steady-state writes and reads — but the *crash* story, the part where the power fails at the worst possible instant and the database must wake up and reconstruct a consistent state, has been a hand-wave the entire time. Making it real requires machinery we've only named: a way to **bound** how far back replay must go (so restart is fast, not proportional to history), a way to tell **committed** work from **uncommitted** at recovery time and undo the latter, and a careful protocol for what must reach disk **before** what, so that a crash can never leave a state the log can't explain.
+
+> The log says what happened. But after a crash, which of those things actually *count* — and how far back do you have to read to be sure? What had committed, what must be undone, and what was only halfway to disk?
+
+That machinery is **recovery**, and its canonical form is **ARIES**: write-ahead logging taken to its logical end, **checkpoints** that bound replay so you start near the crash rather than at the dawn of the database, a **dirty-page table** tracking which changes had actually reached disk, and the disciplined **redo then undo** passes that rebuild committed work and roll back the rest. Every durability promise this book has made — Chapter 02's commit, Chapter 09's first-committer-wins, this chapter's group commit and replay — finally gets paid in full when we can survive the crash that interrupts all of them.
+
+That's **Chapter 11 — recovery and ARIES.** We've spent three chapters making the log fast, multiversioned, and the database itself. Next we make it *survivable*.
+
+</Section>
+
+<Section id="sources" title="Sources & further reading">
+
+Six places to go deeper, each with a line on why it earns the detour. The first names group commit; the next two are the foundations of log-structured storage; then SSTables in a real system, a survey of the amplification tradeoffs, and the synthesis against the B-tree.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Gawlick &amp; Kinkade, 1985 — "Varieties of Concurrency Control in IMS/VS Fast Path" (IEEE Database Engineering Bulletin); and Helland et al., 1987 — "Group Commit Timers and High Volume Transaction Systems."</strong> The origin of §2's group commit: the observation that an fsync's cost is per-call, not per-record, so batching commits multiplies throughput at the price of a little latency. The IMS Fast Path work is where the technique was first deployed at scale; it's been in every serious transaction engine since.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Rosenblum &amp; Ousterhout, 1992 — "The Design and Implementation of a Log-Structured File System" (ACM TOCS).</strong> The paper behind §3's heresy: treat the log not as a journal but as the primary structure, so that <em>all</em> writes become sequential appends and the disk's random-write penalty disappears. Written about a filesystem, but it is the intellectual source of every log-structured database that followed — including the LSM-tree.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>O'Neil, Cheng, Gawlick &amp; O'Neil, 1996 — "The Log-Structured Merge-Tree (LSM-Tree)" (Acta Informatica).</strong> The structure this chapter builds, named and analyzed: the in-memory component, the on-disk runs, and the merge that ties them together, with the cost model that explains why it wins on write-heavy workloads. §4–§6 are this paper, simplified to a memtable, SSTables, and compaction.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Chang et al., 2006 — "Bigtable: A Distributed Storage System for Structured Data" (Google, OSDI); and the LevelDB / RocksDB lineage that grew from it.</strong> Where §4–§5's memtable-and-SSTable vocabulary comes from as deployed reality: the memtable, the immutable sorted SSTable, the WAL for durability, and compaction, in the system that made the design mainstream. LevelDB (and then Facebook's RocksDB) packaged exactly this as the embeddable storage engine under a large fraction of modern databases.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Luo &amp; Carey, 2020 — "LSM-based storage techniques: a survey" (The VLDB Journal).</strong> The map of §6–§7: leveled vs tiered compaction, the write/read/space amplification triangle, bloom filters and partial-key indexes, and the decades of tuning that sit between the toy in this chapter and a production engine. The single best overview of where the real complexity lives.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, ch. 3 ("Storage and Retrieval").</strong> The synthesis of §7's closing question: LSM-trees versus B-trees as the two great storage-engine designs, write-optimized against read-optimized, with the amplification tradeoffs laid out plainly and the guidance on which workload wants which. Read it to see Chapters 04 and 10 of this book as the two answers to one question, exactly as the chapter framed them.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
