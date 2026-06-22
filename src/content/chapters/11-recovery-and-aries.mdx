@@ -1,0 +1,281 @@
+---
+title: Recovery & ARIES
+chapterNumber: 11
+summary: "Every durability promise this book has made — Chapter 02's commit, Chapter 09's first-committer-wins, Chapter 10's group commit and replay — has rested on a sentence we never cashed: 'if the machine crashes, replay the log and recover.' This chapter cashes it. A crash strikes mid-flight and leaves the disk inconsistent both ways: committed changes that never reached it (no-force) and uncommitted changes that did (steal), exactly the buffer-pool policy from Chapter 05 that bought performance. ARIES is the algorithm that cleans up the mess. Build a working one by hand in Python: a write-ahead log of LSN-stamped records with a per-transaction chain, fuzzy checkpoints and a dirty-page table that bound how far back you replay, and the three recovery passes — Analysis to rebuild the crash-time tables, Redo to repeat history forward, and Undo to roll back the losers backward — with compensation log records that make recovery itself survive a second crash."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import StealNoForceScene from '@/components/chapter-11/StealNoForceScene';
+import LogAndCheckpointScene from '@/components/chapter-11/LogAndCheckpointScene';
+import ThreePassesScene from '@/components/chapter-11/ThreePassesScene';
+import CLRScene from '@/components/chapter-11/CLRScene';
+import { CRASH_SANDBOX, LOG_SANDBOX } from '@/components/chapter-11/recovery-setup-sandboxes';
+import { CHECKPOINT_SANDBOX, ANALYSIS_SANDBOX } from '@/components/chapter-11/recovery-analysis-sandboxes';
+import { REDO_SANDBOX, UNDO_SANDBOX } from '@/components/chapter-11/recovery-passes-sandboxes';
+
+<ChapterReader chapterId="11-recovery-and-aries">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "This book has invoked durability since Chapter 02 — commit means 'the log record is on disk.' Yet every such promise quietly assumed something this chapter must finally build. What was assumed, and what is recovery's job?",
+    options: [
+      { text: "It assumed that 'replay the log and recover' actually works — that after a crash, a database can reconstruct a consistent state from the durable log plus an inconsistent disk. Recovery is that reconstruction: redo the committed work that didn't reach disk, and undo the uncommitted work that did.", correct: true },
+      { text: "It assumed the disk never fails, so recovery's job is to add a second disk and mirror every write to it, after which no log replay is ever needed.", },
+      { text: "It assumed transactions never overlap, so recovery's job is to re-run every transaction serially from the beginning of history on each restart.", },
+    ],
+  }}
+>
+
+This is the chapter where the bill for the word *durable* finally comes due in full.
+
+We have leaned on durability since the very beginning. Chapter 02 built a write-ahead log and defined commit as "the log record is on disk" — the **D** in ACID, made concrete with `fsync`. Chapter 09's snapshot isolation turned on *commit order*; first-committer-wins declared a winner the instant a transaction committed, and we never asked what made that instant survivable. Chapter 10 made commit fast with group commit and then made the log the database itself, all the while repeating a single sentence — *"if the machine crashes, replay the log and recover"* — as if it were obvious. It is not obvious. It is an entire algorithm, and it is the most subtle one in this book, because it has to produce a correct database out of two things that are each, individually, wrong: a **log** that records everything that was *attempted* (committed or not, finished or not), and a **disk** that holds some unpredictable, torn subset of what was *applied*. Recovery is the art of combining a complete record of intentions with an incomplete record of actions to reconstruct the one true state.
+
+Why is the disk torn? Because of a decision Chapter 05 made for performance and we are now going to pay for. The buffer pool, you'll recall, keeps pages in memory and writes them back to disk lazily, on its own schedule — it evicts a dirty page whenever it needs the frame (it does not wait for the transaction to commit), and it does *not* rush every committed page to disk at commit time (that would be far too slow). Those two policies have names we'll formalize in §2 — **steal** and **no-force** — and together they guarantee that at the instant of a crash the disk is wrong in *both* directions at once. Some pages on disk hold changes from transactions that **never committed** (the buffer pool stole their frames and wrote them out before they were done) — those must be **undone**. And some changes from transactions that **did commit** are *not* on disk at all (they were still in memory, not yet forced) — those must be **redone**. A crash, in other words, doesn't lose a clean prefix of history; it leaves a jagged edge with committed work missing and uncommitted work present, and recovery has to file that edge smooth.
+
+The algorithm that does it, the one nearly every serious relational engine implements some version of, is **ARIES** — Algorithms for Recovery and Isolation Exploiting Semantics, from a 1992 IBM paper by Mohan and colleagues. Its genius is a counterintuitive order of operations captured in a phrase we'll earn in §6: **repeat history, then roll back.** Rather than cleverly replaying only the committed work, ARIES first replays *everything* — committed and uncommitted alike — to reconstruct the exact state the database was in at the moment of the crash, and *then* undoes the uncommitted transactions, as if they had run and were now being rolled back live. It sounds wasteful and is in fact the simplest, most robust thing to do, because it means recovery never has to reason about *which* changes reached disk; it just makes the disk match the log and then unwinds the losers.
+
+We'll build a working ARIES by hand, in three movements. First, see the torn disk a crash leaves (§1), and formalize the steal/no-force policy that causes it and the write-ahead rule that tames it (§2). Then build the **log** the whole algorithm reads: records stamped with **Log Sequence Numbers**, chained per transaction, with a `pageLSN` on every page that makes replay idempotent (§3). Then the **checkpoint** and the **dirty-page table** that bound how far back recovery must read, so restart is fast rather than proportional to all of history (§4). Then the three passes themselves: **Analysis**, which rebuilds the crash-time bookkeeping from the log (§5); **Redo**, which repeats history forward (§6); and **Undo**, which rolls back the losers backward, writing **compensation log records** so that recovery itself survives a second crash (§7). By the end you'll have built the machine that makes "it's committed" mean something a power failure cannot revoke — and you'll see that every durability promise this book has made was, all along, a promissory note payable in this one algorithm.
+
+</Section>
+
+<Section
+  id="the-crash"
+  title="The crash"
+  quiz={{
+    question: "At the instant of a crash: transaction T1 committed but its page A was still in memory (never written to disk); transaction T2 never committed but its page B had been evicted to disk. What does the on-disk state look like, and what must recovery do to each page?",
+    options: [
+      { text: "Disk is wrong both ways: A is missing T1's committed change (must be REDONE), and B holds T2's uncommitted change (must be UNDONE). The crash left committed work absent and uncommitted work present — recovery needs both directions.", correct: true },
+      { text: "Disk is correct: A holds T1's change because committed transactions are always flushed first, and B is clean because uncommitted pages are never written. No recovery is needed.", },
+      { text: "Disk holds A's change and B's change both, and since both are on disk the database is consistent; recovery only needs to clear the log.", },
+    ],
+  }}
+>
+
+Before any algorithm, look hard at the wreckage, because the shape of the wreckage dictates the shape of the fix.
+
+Stage the smallest possible disaster, two transactions and two pages. **T1** updates page A — say, credits an account — and then **commits**: it appended its log records, the commit record reached the durable log, the client was told "done." But A itself, the data page, was still sitting in the buffer pool when the lights went out; the buffer manager hadn't gotten around to writing it back, because nothing forces a committed page to disk immediately. So T1 is *committed* — the durability contract says its effect must survive — yet its change is **nowhere on disk.** Meanwhile **T2** updates page B and is still running, uncommitted, when the crash hits. But T2's page B was unlucky: at some earlier moment the buffer pool needed B's frame for another page and evicted B, writing it to disk on the way out. So T2 is *not committed* — by every rule its effect must vanish — yet its change is **sitting on disk** in black and white.
+
+Read the disk now, cold, the way the database will read it on restart, and it lies to you twice. Account A shows its *old* balance, as if T1's commit never happened — a durability violation, a committed transaction's effect lost. Page B shows T2's *new* value, as if a transaction that never committed had succeeded — an atomicity violation, an uncommitted transaction's effect made permanent. Neither error is exotic; both are the *normal* consequence of a buffer pool that writes pages back on its own schedule, which is to say both are the price of the performance Chapter 05 bought. And notice the cruel symmetry: the disk doesn't just lose recent work (which redo could fix) or just leak uncommitted work (which undo could fix) — it does **both at once**, which is exactly why recovery needs *both* a redo pass and an undo pass, and why neither alone suffices.
+
+<PythonSandbox client:only="react" initialCode={CRASH_SANDBOX} />
+
+The sandbox hand-stages this exact scene with plain page dictionaries — no recovery machinery yet, just the disaster. T1 commits but its page is never flushed; T2's page is flushed but T2 never commits; the crash wipes memory. Print the surviving disk and read the two lies directly: the committed change absent, the uncommitted change present. Sit with how *ordinary* this is — it's not a bug, it's Tuesday — and the necessity of what follows becomes obvious. We need a record, written *before* each page change and surviving the crash, that tells us both what to put back (T1's lost commit) and what to take away (T2's leaked update). That record is the write-ahead log, and the discipline that makes it sufficient is the subject of the next section.
+
+</Section>
+
+<Section
+  id="steal-and-no-force"
+  title="Steal & no-force"
+  quiz={{
+    question: "Two buffer-pool policy choices determine which recovery passes you need. Which pairing matches, and why does steal + no-force require both undo and redo?",
+    options: [
+      { text: "Steal (evict an uncommitted dirty page to disk) → uncommitted changes can reach disk → needs UNDO. No-force (don't flush committed pages at commit) → committed changes may not reach disk → needs REDO. Steal + no-force is the fastest policy and needs both — which is what real engines run.", correct: true },
+      { text: "Steal means flushing every page at commit (needs redo); force means never evicting dirty pages (needs undo); the fast choice is no-steal + force, which needs neither pass.", },
+      { text: "Steal and no-force are isolation levels, not buffer policies; they determine lock duration, and recovery is unaffected by either.", },
+    ],
+  }}
+>
+
+The crash in §1 wasn't bad luck; it was *policy*. Two independent decisions the buffer manager makes — each one a performance choice from Chapter 05 — together determine exactly which kinds of mess a crash can leave, and therefore exactly which recovery passes you must build. Naming them precisely is naming the whole problem.<Footnote n={1} />
+
+The first decision is about **eviction of dirty pages belonging to uncommitted transactions.** When the buffer pool needs a frame and the page it wants to evict has been modified by a transaction that hasn't committed yet, it has two options. **No-steal**: refuse to evict it — pin every uncommitted dirty page in memory until its transaction commits. This is clean (no uncommitted change ever reaches disk, so you'd never need to undo anything) but it's a performance straitjacket: a long transaction can pin more dirty pages than fit in memory and wedge the whole pool. **Steal**: allow it — evict and write out the uncommitted page, freeing the frame. Stealing is what real buffer pools do, because it keeps memory fluid, and its consequence is precisely §1's page B: an uncommitted change on disk. **Steal means you need UNDO.**
+
+The second decision is about **committed pages at commit time.** When a transaction commits, does the engine force all of its modified data pages to disk right then? **Force**: yes — flush every page the transaction touched before reporting commit. This guarantees committed work is always on disk (so you'd never need to redo anything) but it's brutally slow: it turns every commit into a flurry of random page writes (the very thing Chapter 10's group commit and sequential logging worked so hard to avoid), and it writes hot pages over and over. **No-force**: don't — let the committed pages drift back to disk lazily on the buffer pool's schedule, and make commit durable by forcing only the small, sequential *log* instead. No-force is what real engines do, and its consequence is precisely §1's page A: a committed change *not* on disk. **No-force means you need REDO.**
+
+Lay the two choices on a grid and you get the four combinations, which is the §2 figure. *No-steal + force* needs neither pass — and is unusably slow. *No-steal + no-force* needs only redo. *Steal + force* needs only undo. And **steal + no-force** — evict freely, flush lazily, the fastest policy and the one every high-performance engine actually runs — needs **both undo and redo.** ARIES is the algorithm for that corner of the grid. We pay for the buffer pool's performance with the complexity of two-directional recovery, and it is a bargain, because the alternative policies trade a tractable recovery algorithm for a crippled cache.
+
+What makes the bargain *safe* — what makes it possible to undo and redo correctly at all — is one ironclad discipline, the **write-ahead logging rule**: the log record describing a change must reach durable storage *before* the changed data page does. Always, no exceptions. Steal a dirty uncommitted page to disk? Fine — but its undo information (the *before* value) must be in the durable log first, so recovery can reverse it. Tell a client a transaction committed? Fine — but its commit record (and all its updates) must be in the durable log first, so recovery can replay it. The WAL rule is the bridge between the torn disk and the complete log: it guarantees that *whatever* a crash leaves on disk, the log already contains enough to both undo and redo it. Every page write is shadowed, in advance, by a durable log record that knows how to take it back or put it back. Get that ordering right and the disk can be as torn as the buffer pool likes; the log will always be able to mend it.
+
+<StealNoForceScene client:visible />
+
+Figure 11.1 is the grid made interactive. Flip the steal and force toggles and watch each cell declare which recovery passes it implies — *undo* lighting up the moment you allow stealing, *redo* the moment you stop forcing — and watch the performance label move opposite the safety: the corner that needs the most recovery machinery (steal + no-force) is the corner that runs the fastest in normal operation. That inversion is the whole reason this chapter exists. The engine chooses speed; recovery pays the bill; ARIES is how it pays.
+
+</Section>
+
+<Section
+  id="the-log"
+  title="The log"
+  quiz={{
+    question: "Every log record has a Log Sequence Number (LSN), and every page stores the LSN of the last change applied to it (its pageLSN). During redo, recovery sees a logged change with LSN 50 and finds the page's pageLSN is already 50. What does it do, and what property does this give redo?",
+    options: [
+      { text: "It skips the change — the page already reflects it (pageLSN ≥ the record's LSN). Comparing pageLSN to the record LSN makes redo idempotent: replaying the log twice (or after a partial earlier replay) can never apply a change twice, so recovery can safely restart.", correct: true },
+      { text: "It applies the change again to be safe, since redo must always reapply every logged change regardless of pageLSN; idempotency comes from the locks held during recovery.", },
+      { text: "It aborts recovery and reports corruption, because a pageLSN equal to a record's LSN means the log and the page disagree and the database is unrecoverable.", },
+    ],
+  }}
+>
+
+Everything ARIES does, it does by reading the log, so the log's structure *is* the algorithm's vocabulary. Build it carefully and the three passes almost write themselves; the design has three load-bearing pieces.<Footnote n={2} />
+
+First, the **Log Sequence Number.** Every record appended to the log gets a unique, monotonically increasing **LSN** — think of it as the record's address and its timestamp at once. Because LSNs only ever increase, they impose a total order on everything that ever happened, and that order is what lets recovery talk about "before" and "after," "where to start replaying," and "the most recent change to this page." Almost every other structure in ARIES is just an LSN pointing at a moment in the log.
+
+Second, the **pageLSN**, and it is the quiet hero of the whole method. Every data page carries, right alongside its data, the LSN of the *most recent log record whose change has been applied to that page.* This single field is what makes redo **idempotent** — safe to run as many times as you like. When redo considers replaying a logged change with LSN 50, it first looks at the page's pageLSN: if the page already says 50 (or higher), the change is *already there*, so redo skips it. The page itself testifies to how much of the log it has already absorbed. This is why a crash *during recovery* is harmless: restart, replay from the beginning of the needed region again, and every change already on disk is silently skipped because its pageLSN proves it landed. Without the pageLSN, replaying the log twice would double every increment; with it, replay is a no-op wherever it's already been applied. It is the same idempotence trick that lets Chapter 10's compaction and Chapter 02's WAL be re-run safely, here made exact.
+
+Third, the **records themselves and the per-transaction chain.** The common record is the **update**: it names the transaction, the page, and — crucially — *both* the **before** image and the **after** image of the change. The after image is what redo reapplies; the before image is what undo reverts; carrying both is what lets a single log serve both passes. There are also **commit** records (the durable mark that says a transaction's effects must survive) and **end** records (that say a transaction is fully done, committed-and-cleaned or aborted-and-undone). And every record carries a **prevLSN**, a pointer to the *previous log record written by the same transaction*. Follow a transaction's prevLSN pointers and you walk its entire history backward, newest change to oldest — which is exactly the path undo will take to roll a loser back. The log looks like one flat sequence, but threaded through it is a separate backward linked list per transaction, and undo rides those lists.
+
+<PythonSandbox client:only="react" initialCode={LOG_SANDBOX} />
+
+The sandbox builds the log half of the canonical `DB`: `update` appends a record (with its before/after images and prevLSN) and stamps the touched page's pageLSN; `commit` writes the commit and end records. Run a couple of interleaved transactions and read the printed log — the LSNs marching upward, each record pointing back to its transaction's previous one, the pageLSN on a page matching the last record that touched it. Trace one transaction's prevLSN chain by hand and you've walked the path undo will automate. Nothing here recovers anything yet; we're assembling the durable record of intentions that the three passes will read. The next piece makes that record *bounded* — so recovery doesn't have to read it from the very beginning.
+
+</Section>
+
+<Section
+  id="checkpoints"
+  title="Checkpoints"
+  quiz={{
+    question: "The dirty-page table maps each dirty page to its recLSN — the LSN of the oldest change to that page not yet known to be on disk. Why does redo start at the minimum recLSN across the table, rather than at the start of the log?",
+    options: [
+      { text: "Any change older than every page's recLSN is already on disk, so replaying it would be wasted work — the page already reflects it. The minimum recLSN is the earliest point at which some dirty page might still be missing a change, so it's the earliest point redo must begin. The checkpoint writes this table to the log so restart starts there, not at LSN 1.", correct: true },
+      { text: "Redo starts at the minimum recLSN because that's where the most recent checkpoint is; the checkpoint always coincides with the oldest dirty page and there is no other reason.", },
+      { text: "It starts at the minimum recLSN to save memory, but correctness would be identical starting from the log's beginning; recLSN is purely a performance hint with no bearing on which changes are on disk.", },
+    ],
+  }}
+>
+
+A log grows without bound, so a recovery that replayed it from the beginning would get slower every day the database stayed up — a year-old database would take a year's worth of log to restart. That's intolerable, and the fix is two small in-memory tables plus a periodic snapshot of them that lets recovery start *near the crash* instead of at the dawn of time.<Footnote n={3} />
+
+The **transaction table** (ATT) tracks the transactions currently *in flight*: for each, its status (running, or committed-but-not-yet-ended) and its **lastLSN** — the LSN of its most recent log record, the head of its prevLSN chain. This is the list of transactions that, if the database crashed right now, would be *losers* (the ones still running, whose work must be undone). The **dirty-page table** (DPT) tracks pages that have been modified in the buffer pool but may not yet be on disk: for each such page, its **recLSN** — the LSN of the *oldest* change to that page that is not yet known to have reached disk. The recLSN is the subtle, essential quantity. It marks, for one page, the earliest point in the log where redo might still have work to do; any change to that page *older* than its recLSN is guaranteed already on disk and need not be replayed.
+
+Put those together and you get the answer to "where does redo begin?" Redo must start at the earliest LSN where *any* dirty page might still be missing a change — which is exactly the **minimum recLSN across the whole dirty-page table.** Everything before that point is already durably applied to every page, so replaying it would be pure waste. That minimum, call it the **redoLSN**, is recovery's starting line, and it's typically *far* later than the start of the log — bounded by how recently pages were flushed, not by how old the database is.
+
+The remaining problem is that the ATT and DPT live in memory and die in the crash, so recovery can't just read them off — it has to *reconstruct* them (that's the Analysis pass, §5). A **checkpoint** is what makes that reconstruction cheap: periodically, the engine writes a copy of the current ATT and DPT *into the log itself*. ARIES uses a **fuzzy checkpoint** — it snapshots the tables without stopping the world or flushing all dirty pages (forcing every dirty page at each checkpoint would reintroduce exactly the stall we're avoiding). The checkpoint record is just a marker saying "here is what the bookkeeping looked like at this LSN." On restart, recovery finds the last checkpoint, takes its tables as a *starting estimate*, and only has to scan the log *forward from the checkpoint* to bring them up to the moment of the crash — a short scan, not a full-history one. The checkpoint is the bookmark that turns "replay everything" into "replay the recent tail."
+
+<LogAndCheckpointScene client:visible />
+
+Figure 11.2 lays the log out as a row of LSN-stamped records with each transaction's prevLSN chain threaded back through it, and overlays the two tables as they evolve: pages entering the dirty-page table with their recLSN, transactions entering and leaving the active table. A checkpoint marker drops a snapshot of both tables into the log, and a clearly drawn line shows where redo will begin — the minimum recLSN — sitting well to the right of the log's start. You can see, concretely, the work the checkpoint saves: everything to the left of that line is replay the database gets to skip.
+
+<PythonSandbox client:only="react" initialCode={CHECKPOINT_SANDBOX} />
+
+The sandbox builds the dirty-page and transaction tables on the canonical `DB`, runs some updates and a flush, and prints both — the DPT mapping pages to their recLSN, the ATT mapping transactions to status and lastLSN — then takes a `checkpoint()` and shows the snapshot embedded in the log. Watch a page's recLSN get *cleared* when it's flushed (its changes are on disk now, so redo needn't revisit it) and note where the minimum recLSN sits: that's the redoLSN, the line recovery will start from. The point to carry forward is that the checkpoint plus the DPT is what keeps restart time bounded — recovery reads the recent past, not the whole past. With the log built and bounded, we can finally recover.
+
+</Section>
+
+<Section
+  id="analysis"
+  title="Analysis"
+  quiz={{
+    question: "The Analysis pass scans the log forward from the last checkpoint. By the time it reaches the end (the crash point), what has it produced, and how does it classify a transaction as a 'loser'?",
+    options: [
+      { text: "It has rebuilt the dirty-page table (so it knows redoLSN = min recLSN, where Redo starts) and the transaction table as of the crash. A transaction is a loser if it appears active with no commit record — it was in flight when the crash hit, so Undo must roll it back; transactions with a commit (and end) record are winners.", correct: true },
+      { text: "It has replayed every change to disk and rolled back the losers; Analysis is the only pass that touches pages, and a loser is any transaction that wrote to more than one page.", },
+      { text: "It produces nothing reusable — Analysis only validates checksums, and 'loser' means a transaction whose log records failed a checksum and must be ignored.", },
+    ],
+  }}
+>
+
+Recovery is three passes over the log, and ARIES runs them in a fixed order: **Analysis**, then **Redo**, then **Undo**. The hero figure animates all three; this section builds the first, whose job is purely to *figure out what the crash left* — to reconstruct, from the durable log, the in-memory bookkeeping that died with the crash. Analysis touches no data pages; it only reads the log and rebuilds two tables and two numbers.
+
+It starts at the last checkpoint (found by scanning to the most recent checkpoint record) and adopts that checkpoint's ATT and DPT as a starting estimate. Then it scans **forward** from there to the end of the log, updating the tables as if re-watching the recent history in fast-forward. Each kind of record moves the bookkeeping: an **update** record means a transaction is active (add or refresh it in the ATT, set its lastLSN to this record) and a page got dirty (if the page isn't already in the DPT, add it with this record's LSN as its recLSN — the oldest unflushed change to it). A **commit** record flips a transaction's status to committed in the ATT. An **end** record means a transaction is fully finished, so remove it from the ATT entirely. By the time the scan reaches the crash point, the two tables describe the database's exact in-flight state at the instant of the crash — reconstructed from nothing but the log.
+
+Out of that reconstruction fall the two things the other passes need. From the DPT comes the **redoLSN** — the minimum recLSN — the line where Redo will begin. From the ATT comes the **loser set** — every transaction still present and *not* committed. These are the transactions that were in flight when the crash hit: no commit record ever reached the log for them, so by the durability contract they must be erased, and Undo will roll them back. Everything else — every transaction with a commit record — is a **winner** whose effects must survive. Analysis is the pass that draws this line between winners and losers, and it draws it using the one source of truth a crash can't corrupt: the log says exactly who reached "commit" and who didn't, and that, not the torn disk, is the arbiter of who lives.
+
+<ThreePassesScene client:visible />
+
+Figure 11.3 is the chapter's centerpiece — the whole of ARIES in one animation. A crash falls across a running log; then the three passes sweep in turn. **Analysis** runs left-to-right from the checkpoint, the transaction and dirty-page tables filling in as records stream past, ending with the loser set marked and the redoLSN line drawn. **Redo** (the next section) sweeps **forward** from that line, data pages lighting up as changes are reapplied — and skipping, visibly, the ones whose pageLSN shows they're already done. **Undo** (§7) sweeps **backward** over the losers, pages reverting and compensation records appended. Watch the directions: Analysis and Redo go *forward* through history, Undo goes *backward* against it — repeat history, then roll back. The end state is the payoff in one frame: committed work present on every page, uncommitted work gone, the disk finally telling the truth.
+
+<PythonSandbox client:only="react" initialCode={ANALYSIS_SANDBOX} />
+
+The sandbox runs a workload, checkpoints, does more work, crashes, then runs `_analysis()` alone and prints what it reconstructed: the rebuilt ATT and DPT, the computed redoLSN, and the loser set — all derived purely from the log, the in-memory originals having been wiped by the crash. Compare the reconstructed tables to what was live before the crash and see that the log carried enough to rebuild them exactly. Analysis has now told us *where* to redo from and *who* to undo; the next two sections do the work.
+
+</Section>
+
+<Section
+  id="redo"
+  title="Redo"
+  quiz={{
+    question: "ARIES's Redo pass 'repeats history' — it replays changes from even the uncommitted loser transactions, not just the winners. Why deliberately redo work that Undo is about to reverse?",
+    options: [
+      { text: "So recovery never has to figure out which changes reached disk. Redo blindly makes the disk match the exact pre-crash state (all changes, winners and losers), using the pageLSN check to skip what's already there. Then Undo rolls back the losers from that known, complete state — far simpler and more robust than selectively redoing only winners.", correct: true },
+      { text: "Because the loser transactions might commit later, so their changes must be preserved on disk just in case; Undo only runs if no transaction can still commit.", },
+      { text: "It's an inefficiency in ARIES with no real purpose — replaying loser changes is a known bug, and correct implementations redo only committed transactions.", },
+    ],
+  }}
+>
+
+Here is the idea that makes ARIES both surprising and simple, the one worth the price of the whole chapter: **repeat history.**<Footnote n={4} /> The Redo pass does not cleverly replay only the committed transactions' changes. It replays *all* of them — every logged change since the redoLSN, from winners and losers alike — reconstructing the precise state the database's pages were in at the very instant of the crash, uncommitted garbage included. Only *after* the disk has been restored to that exact pre-crash state does Undo (§7) come along and roll the losers back. Redo repeats history; Undo then rewrites the ending.
+
+Why on earth redo work you're about to throw away? Because it makes recovery *not have to think*. The alternative — redo only the winners — sounds more efficient but forces recovery to reason, change by change, about which transactions committed and which pages already hold which versions, a tangle of special cases that is exactly where recovery bugs breed. "Repeat history" replaces all that cleverness with a blind, uniform rule: **make the disk match the log, completely, then unwind the losers.** Redo doesn't care whether a change belongs to a winner or a loser; it just reapplies it. This is the robustness that made ARIES the design everyone copied — it reconstructs a *known* state (the crash state) and proceeds from there, rather than trying to construct a clever shortcut to the final state directly.
+
+The pass is a forward scan from the redoLSN, and for each update (and, later, each compensation record) it applies the change's after-image to the page — *unless the page already has it.* That exception is the pageLSN from §3 doing its job: if the page's pageLSN is greater than or equal to the record's LSN, the change is already on disk (this is one of the changes that *did* make it out before the crash), so redo skips it. That single comparison is what makes redo **idempotent** and therefore safe to restart: replay the region twice and every already-applied change is silently skipped the second time. So redo touches the disk only where the crash left a gap — reapplying the committed-but-unflushed changes (§1's lost page A) and, yes, the uncommitted-and-unflushed ones too — until every dirty page holds exactly what it held the moment before the lights went out. The disk is now consistent with the log's full history. It is also, briefly, *wrong* — it contains the losers' uncommitted changes — but it is wrong in a known, uniform way that the final pass is built to fix.
+
+<PythonSandbox client:only="react" initialCode={REDO_SANDBOX} />
+
+The sandbox runs Analysis then Redo on the canonical `DB`, and prints which records it *applied* versus *skipped as already-present* — the pageLSN check visible in action. After it finishes, the disk matches the pre-crash buffer exactly: the committed change that §1 lost is back, and the loser's uncommitted change is (for now) faithfully reconstructed too. Inspect the pages and you'll see history has been repeated in full. The disk is consistent with everything that happened — including the parts that shouldn't have. Undo deals with those next.
+
+</Section>
+
+<Section
+  id="undo-and-clrs"
+  title="Undo & CLRs"
+  quiz={{
+    question: "During Undo, ARIES writes a Compensation Log Record (CLR) for each change it reverses, and a CLR carries an undoNextLSN pointing at the next change still to undo. If the machine crashes again mid-Undo, how do CLRs make the re-run correct?",
+    options: [
+      { text: "CLRs are redo-only — they are never undone. On restart, Redo replays the CLRs already written (reapplying the rollback work done before the second crash), and Undo resumes from each transaction's undoNextLSN rather than starting over — so no change is ever undone twice. Recovery is idempotent and restartable.", correct: true },
+      { text: "CLRs trigger a full database reload from a backup, discarding the log; undoNextLSN is the byte offset into the backup file where restore begins.", },
+      { text: "CLRs are undone on the next pass just like update records, so a second crash simply restarts Undo from the beginning, undoing every loser change a second time to be safe.", },
+    ],
+  }}
+>
+
+After Redo, the disk faithfully holds the crash-time state — committed work restored, and the losers' uncommitted work sitting there illegitimately. The **Undo** pass removes the losers, and the way it removes them is what lets recovery survive being interrupted by *another* crash, which on a flaky machine is a real risk, not a thought experiment.<Footnote n={5} />
+
+Undo rolls back each loser transaction by walking its prevLSN chain *backward* — newest change to oldest — and reversing each update by writing its before-image back to the page. (Recovery undoes all losers together, repeatedly reversing whichever pending change has the highest LSN across all of them, so it makes a single backward sweep through the log rather than one pass per transaction.) Reversing an update is mechanical: the log record carried both images precisely so undo could reach for the *before* one. If that were all, though, undo would have a fatal fragility: suppose recovery reverses half of a loser's ten changes and then the machine crashes again. On the next restart, the prevLSN chain still points at all ten — recovery has no way to know it already undid five — so it would undo them again, and a *re-*undo of an already-undone change can corrupt the page (undo the before-image of a change that was already reverted and you've written stale data). Recovery that can't survive a crash is barely recovery at all.
+
+The fix is the **compensation log record**, the CLR, and it is a small idea with a large payoff. *Every time undo reverses a change, it logs that reversal* as a CLR — a record saying "I undid the change at LSN X by restoring this before-image." Two properties make the CLR magic. First, **a CLR is redo-only: it is never itself undone.** It records work that *must stand* (a rollback step that already happened), so if recovery restarts, the Redo pass simply *replays* the CLRs — reapplying the rollback steps already performed — exactly as it replays any other change, via the same idempotent pageLSN check. The undo work done before the second crash is preserved by redo, for free, because a CLR looks to redo like any other logged change. Second, **a CLR carries an undoNextLSN** — a pointer to the *next* change that still needs undoing for that transaction (the prevLSN of the change just reversed). So after a second crash, undo doesn't restart the chain from the top; it reads the last CLR and resumes from its undoNextLSN, picking up exactly where it left off. Together these make recovery **idempotent and restartable**: crash during recovery as many times as you like, and each restart redoes the rollback already done (never re-undoing it) and continues from the right spot. The CLR is how ARIES closes the last loophole — the crash that interrupts the cleanup — and it's the detail that separates a recovery algorithm that works in a paper from one that works on real, failing hardware.
+
+<CLRScene client:visible />
+
+Figure 11.4 isolates this payoff. Watch Undo reverse a loser's changes one by one, appending a CLR for each, the undoNextLSN pointer marching back along the chain. Then a *second* crash strikes mid-rollback. On restart, see the CLRs get *redone* (not undone) — the rollback steps already taken are replayed and the pages skip-when-already-applied — and Undo resume from the last undoNextLSN rather than from the top. No change is reversed twice; the rollback finishes cleanly across the second crash. Recovery surviving its own interruption is the quietly remarkable thing this figure shows.
+
+<PythonSandbox client:only="react" initialCode={UNDO_SANDBOX} />
+
+The sandbox runs the complete `recover()` — Analysis, Redo, Undo — and prints the CLRs undo writes (each with its undoNextLSN) and the final disk: committed work present, uncommitted work reversed, the §1 disaster fully repaired. Then it does the thing that matters most: it **crashes again and recovers a second time**, and asserts the disk is *identical* — the CLRs are redone rather than re-undone, so the second recovery is a no-op on the data, exactly as it must be. That assertion passing is the whole chapter in one line: a database that can crash, recover, crash *during* recovery, and still wake up correct. Durability, finally, all the way down.
+
+</Section>
+
+<Section id="whats-next" title="What's next">
+
+Stop and notice what's finished. With recovery built, the **D** in ACID is paid in full — not as a slogan but as a mechanism that survives the worst case, the crash that interrupts the cleanup. And it's not only the D. Look back across the arc: atomicity (Chapter 02's all-or-nothing transaction, now enforced through a crash by undo), consistency, isolation (Chapters 03, 08, 09's locking and MVCC), and durability (Chapters 02, 10, and this one) — the whole of ACID has now been built, by hand, from the page up. A single database engine, correct under concurrency and survivable under failure, is complete. That's a real summit; it's worth pausing on.
+
+But every word of it assumed **one machine.** One buffer pool, one log, one disk, one crash to recover from. The log was durable because *the* disk held it; recovery worked because there was a single authoritative state to reconstruct. Pull the camera back and that assumption looks fragile in a new way. What if the machine doesn't just crash and restart — what if it's *destroyed*, disk and all? What if one machine can't hold the data, or can't serve the traffic, and you need several working together? The moment there is more than one machine, two hard problems appear that nothing in this book has touched.<Footnote n={6} /> First, **atomic commit across machines**: if a transaction spans two databases, how do they agree to *both* commit or *both* abort, when either might crash — or the network between them might vanish — at the worst instant? (The classic answer, two-phase commit, is itself a small recovery protocol, built on exactly this chapter's logging.) Second, **replication**: how do you keep a *second copy* of the database on another machine continuously in sync with the first, so that if one dies the other carries on? Here the log returns one last time in a new role — Chapter 02 hinted at it — because the stream of log records that recovers a database is also, shipped to another machine and replayed there, precisely what keeps a replica current.
+
+> One machine can crash and recover. But what if it's gone for good? How do two machines agree to commit together when either can fail mid-handshake — and how does a second copy stay in step with the first?
+
+That's where the book goes next: out of the single engine and into the cluster. **Chapter 13 — replication** takes the log you just learned to recover from and ships it across the network to keep copies alive, with all the new trouble that distance and partial failure bring. The ACID machine is built. Now we make more than one of them, and make them agree.
+
+</Section>
+
+<Section id="sources" title="Sources & further reading">
+
+Six places to go deeper, each with a line on why it earns the detour. The first frames the buffer-policy taxonomy; the second is the algorithm itself; the rest carry you through checkpoints, the repeat-history principle, where recovery sits in a real engine, and the bridge to distribution.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Härder &amp; Reuter, 1983 — "Principles of Transaction-Oriented Database Recovery" (ACM Computing Surveys).</strong> The paper that gave us the word <em>ACID</em> and the §2 taxonomy this chapter turns on: the steal/no-steal and force/no-force buffer policies, and which recovery actions each implies. Read it to see the whole design space of recovery laid out as a grid, with steal+no-force — the corner ARIES lives in — identified as the high-performance, full-machinery case.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Mohan, Haderle, Lindsay, Pirahesh &amp; Schwarz, 1992 — "ARIES: A Transaction Recovery Method Supporting Fine-Granularity Locking and Partial Rollbacks Using Write-Ahead Logging" (ACM TODS).</strong> The algorithm, in full. Everything in §3–§7 is here: LSNs and the pageLSN, the per-transaction log chain, fuzzy checkpoints and the dirty-page table, the three passes, repeat-history, and the compensation log records that make recovery restartable. Dense but foundational — the single most-implemented recovery design in the industry.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Gray &amp; Reuter, 1992 — "Transaction Processing: Concepts and Techniques," chapters on logging and recovery.</strong> The encyclopedic treatment behind §4: checkpoints, the log manager, the interplay of the buffer pool and the log, and the recovery manager's place among them. When this chapter compressed a detail — what exactly a fuzzy checkpoint writes, how recLSN is maintained — this is where the unabridged version lives.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Petrov, 2019 — "Database Internals," Part I (Storage Engines), the WAL and recovery chapters.</strong> A modern, implementation-minded walk through §6's repeat-history idea and the surrounding machinery, with an eye to how today's engines actually structure their logs and recovery. The clearest bridge from this chapter's toy to the code in a real storage engine, and an excellent companion to Chapters 04, 05, 10, and 11 together.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Hellerstein, Stonebraker &amp; Hamilton, 2007 — "Architecture of a Database System," §5 (Recovery) and the surrounding sections.</strong> Where the recovery manager sits in a complete engine and how it couples to the buffer manager and the log — the §7 picture of CLRs and restartable recovery placed inside the whole system this book has been building chapter by chapter. The map that shows recovery is not a bolt-on but a thread running through every component.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, ch. 7 (Transactions) &amp; ch. 8–9 (Distributed Trouble &amp; Consistency).</strong> The bridge §8 promises: durability and crash recovery on a single node, and then the new problems that appear the moment there are two — atomic commit across machines, replication, and the failure modes distance introduces. Read it to see why "recover one machine" (this chapter) and "keep many machines in agreement" (the chapters ahead) are different orders of difficulty.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
