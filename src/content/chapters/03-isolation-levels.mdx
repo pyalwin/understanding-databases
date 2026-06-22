@@ -291,9 +291,9 @@ COMMIT;
 -- read_1 = 100, read_2 = 150. Same row, same transaction,
 -- two different answers.`} />
 
-The rule that prevents this is `REPEATABLE READ`. The name describes what it promises: any row a transaction reads can be read again — same answer, every time, for the duration of that transaction. Two implementations dominate. The traditional one is *read locks*: take a shared lock on every row you read and hold it until commit; concurrent writers block on those locks; readers and writers serialize. The modern one is *snapshot isolation* via MVCC, which we will meet properly in chapter 08: at `BEGIN`, the transaction captures a snapshot id; every read consults that snapshot, ignoring any committed write whose commit timestamp is later than the snapshot. T2's commit at $150 happens *after* T1's snapshot, so T1 never sees it. Both reads return $100. The first read is repeatable.
+The rule that prevents this is `REPEATABLE READ`. The name describes what it promises: any row a transaction reads can be read again — same answer, every time, for the duration of that transaction. Two implementations dominate. The traditional one is *read locks*: take a shared lock on every row you read and hold it until commit; concurrent writers block on those locks; readers and writers serialize. The modern one is *snapshot isolation* via MVCC, which we will meet properly in chapter 09: at `BEGIN`, the transaction captures a snapshot id; every read consults that snapshot, ignoring any committed write whose commit timestamp is later than the snapshot. T2's commit at $150 happens *after* T1's snapshot, so T1 never sees it. Both reads return $100. The first read is repeatable.
 
-The trade-off between the two implementations is real and worth stating. Read locks pay their cost at *read* time: every `SELECT` takes locks, every concurrent writer waits on them, and a long-running read can stall the rest of the system. Snapshot isolation pays its cost in *storage*: every write keeps the prior version of the row around for as long as some live transaction's snapshot might want to see it, which is what chapter 08's vacuum subsystem exists to manage. The snapshot model trades disk space and bookkeeping for non-blocking reads; the lock model trades waiting for storage simplicity. Modern engines almost universally chose the snapshot model — Postgres, Oracle, SQL Server, MySQL all keep multiple row versions internally — because non-blocking reads turn out to matter more, in practice, than the disk overhead costs.
+The trade-off between the two implementations is real and worth stating. Read locks pay their cost at *read* time: every `SELECT` takes locks, every concurrent writer waits on them, and a long-running read can stall the rest of the system. Snapshot isolation pays its cost in *storage*: every write keeps the prior version of the row around for as long as some live transaction's snapshot might want to see it, which is what chapter 09's vacuum subsystem exists to manage. The snapshot model trades disk space and bookkeeping for non-blocking reads; the lock model trades waiting for storage simplicity. Modern engines almost universally chose the snapshot model — Postgres, Oracle, SQL Server, MySQL all keep multiple row versions internally — because non-blocking reads turn out to matter more, in practice, than the disk overhead costs.
 
 Postgres's `REPEATABLE READ` is the snapshot flavour — a fact the Postgres documentation states bluntly, with a small footnote that this is stricter than the SQL standard requires.<Footnote n={4} /> A snapshot prevents the non-repeatable read *and*, by accident, prevents almost every other read-side anomaly the SQL standard names — for free, with no extra locks, just by virtue of every read inside the transaction consulting the same frozen view. Almost every. There is one anomaly snapshot isolation does not catch, and one anomaly it catches accidentally, and the next section is the harder of the two.
 
@@ -615,7 +615,7 @@ def write_balance(bal):
     os.rename(tmp, 'account.json')
 
 # A tiny in-memory lock manager. Real databases have much fancier
-# versions of this (chapter 07 builds one); the shape is the same.
+# versions of this (chapter 08 builds one); the shape is the same.
 _locks = {}
 def acquire(row, txn):
     if row in _locks and _locks[row] != txn:
@@ -848,7 +848,7 @@ Two notes on what the script is and isn't.
 
 It is a faithful reproduction of the lost update, the one anomaly the chapter built up to in §5 and demonstrated in the §8 sandbox. The unsafe path will lose updates on most runs — exactly how many depends on your kernel scheduler and the `delay` knob. The safe path uses `fcntl.flock` for the read-modify-write, which is the same advisory-locking pattern chapter 01 ended its disclosure with; it is `SELECT … FOR UPDATE` translated into the language of the filesystem. Zero lost updates.
 
-It is not a model of the other anomalies. Write skew, in particular, needs a *multi-row* invariant the lock manager has no way to know about, which is exactly the place a single-file flock breaks down. That's why a real database has a lock manager (chapter 07) and an MVCC subsystem (chapter 08) and an SSI dependency tracker. The hand-built WAL is the bedrock; everything in the next several chapters builds upward from it.
+It is not a model of the other anomalies. Write skew, in particular, needs a *multi-row* invariant the lock manager has no way to know about, which is exactly the place a single-file flock breaks down. That's why a real database has a lock manager (chapter 08) and an MVCC subsystem (chapter 09) and an SSI dependency tracker. The hand-built WAL is the bedrock; everything in the next several chapters builds upward from it.
 
 </div>
 </details>

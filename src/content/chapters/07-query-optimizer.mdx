@@ -1,0 +1,288 @@
+---
+title: The Query Optimizer
+chapterNumber: 7
+summary: "The executor will run any plan you hand it — including a catastrophically bad one. The same SQL query maps to hundreds of equivalent plans whose runtimes differ by orders of magnitude, and something has to pick a good one in milliseconds, before a single row is read. Build that something by hand in Python: a cost model to score a plan, the cardinality estimator that feeds it (and where every optimizer lives or dies), the index-versus-scan crossover that finally explains Chapter 04's EXPLAIN, and the join-order search at the combinatorial heart — then watch one wrong estimate wreck all of it."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import PlanSpaceScene from '@/components/chapter-07/PlanSpaceScene';
+import CostScene from '@/components/chapter-07/CostScene';
+import CardinalityScene from '@/components/chapter-07/CardinalityScene';
+import JoinOrderScene from '@/components/chapter-07/JoinOrderScene';
+import { PLANSPACE_SANDBOX, COSTMODEL_SANDBOX, ACCESSPATH_SANDBOX } from '@/components/chapter-07/cost-sandboxes';
+import { CARDINALITY_SANDBOX } from '@/components/chapter-07/estimation-sandboxes';
+import { JOINORDER_SANDBOX, WRONGSTATS_SANDBOX } from '@/components/chapter-07/joinorder-sandboxes';
+
+<ChapterReader chapterId="07-query-optimizer">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 06's executor will run any plan tree you hand it. For `SELECT … FROM a JOIN b JOIN c WHERE …` there are hundreds of equivalent plans, and the slowest is thousands of times slower than the fastest — yet the engine must commit to one in milliseconds, before reading a single row. What does that force the optimizer to be?",
+    options: [
+      { text: "A search over the space of equivalent plans, guided by the *estimated* cost of plans it never runs — it has to judge each candidate from predicted page reads and row counts, because it must choose before execution, not after. Prediction is the whole game.", correct: true },
+      { text: "A profiler: it runs each candidate plan briefly, measures the real time taken, and keeps the fastest — choosing by direct measurement rather than estimation.", },
+      { text: "A rule table: it looks up the SQL syntax (number of joins, presence of a WHERE) and emits the one canonical plan that syntax always maps to, so there is no search and nothing to estimate.", },
+    ],
+  }}
+>
+
+Chapter 06 ended on a confession. We had built an executor that could run *any* plan — scan or index at the leaves, nested-loop or hash or sort-merge at the joins, group and sort on top — every operator composing through one tiny `open`/`next`/`close` interface. We could hand it a tree and it would faithfully produce the answer. And that was exactly the problem: it would faithfully produce the answer for *any* tree we handed it, including a catastrophically bad one. We picked every operator ourselves, by hand, and every time we did it we deferred the real question with the same promise — *something else decides this.* Now collect the debt.
+
+So take an ordinary query, the kind that turns up a thousand times a day:
+
+```sql
+SELECT c.name, o.total
+FROM orders o JOIN customers c ON o.cust_id = c.id
+WHERE o.total > 500 AND c.country = 'JP'
+```
+
+One query. Now count the plans. The `orders` filter can run as a sequential scan or, if there's an index on `total`, an index scan. The `customers` filter, likewise, scan or index on `country`. The join can be nested-loop, hash, or sort-merge. And the two tables can be joined in either order — `orders` on the outside or `customers` on the outside. Multiply it out and this trivial two-table query already has *dozens* of distinct physical plans. Add a third table and the join orderings alone explode combinatorially; a six-way join has hundreds of valid shapes. Every one of those plans returns the **identical answer** — they are all correct. And their costs differ not by ten percent but by **orders of magnitude**: the difference between a query that returns in a millisecond and the very same query, same rows, grinding for an hour.
+
+Nobody writes the plan by hand. The part of the engine that does — the **optimizer** — takes the declarative SQL, considers the space of equivalent plans, and picks one. But look at the brutal constraint it works under: it has to choose *fast*, in a millisecond or two, and it has to choose *before the query runs*. It cannot try all the plans and keep the fastest — there are far too many, and running even one of them is the whole expense we're trying to avoid. So it must judge plans it will never execute. It has to look at a tree and *predict* what that tree would cost — guess how many rows the `total > 500` filter will pass, guess how big the join's output will be, guess whether the index is worth its random fetches — and stake the entire query's performance on those guesses.
+
+That is the shape of the whole chapter, and it's worth committing to up front. We will build a tiny cost-based optimizer by hand, the same way we built the executor: in Python, in your browser, one piece at a time. A **cost model** that scores a plan from estimated page reads and CPU work (§2). A **cardinality estimator** that predicts how many rows each operator emits — the hard, central problem, the one every real optimizer lives or dies on (§3). The **access-path decision**, index versus scan, which is finally where Chapter 04's `EXPLAIN QUERY PLAN` gets explained (§4). The **join-order search** at the combinatorial heart (§5). And then an honest look at what happens when the estimates lie (§6) — because they do, and when they do, the plan is wrong.
+
+The reveal that organizes everything: the optimizer is a search over plans guided by *predicted* cost, and prediction is the whole game. Build the predictor well and the engine flies. Build it badly and the executor you wrote in Chapter 06 will faithfully, obediently, run something a thousand times too slow.
+
+</Section>
+
+<Section
+  id="the-plan-space"
+  title="The plan space"
+  quiz={{
+    question: "An optimizer enumerates three physical plans for one query: Plan A (seq scan + filter, then hash join) costs an estimated 1,200; Plan B (index scan, then index-nested-loop join) costs 40; Plan C (seq scan, then sort-merge join) costs 1,500. All three return the exact same rows. What is true, and what should the optimizer do?",
+    options: [
+      { text: "All three are correct — correctness is shared across the whole plan space — but cost is not: B is ~30× cheaper than A and ~37× cheaper than C. The optimizer should choose B. The entire job is choosing within a set of plans that already agree on the answer.", correct: true },
+      { text: "Plan B must be returning fewer or different rows, since it's so much cheaper — a 30× cost gap means it's cutting a corner on correctness, so the safe choice is the middle plan, A.", },
+      { text: "The costs are estimates, so they're meaningless for choosing; the optimizer should pick whichever plan the SQL syntax lists first and ignore the numbers.", },
+    ],
+  }}
+>
+
+Start where the optimizer starts: with the fact that one query is *many* programs. We spent all of Chapter 06 insisting that a query compiles to a tree of operators. The thing we glossed is that it compiles to a tree *non-uniquely* — there is a whole **space** of trees, every one of them a faithful translation of the same SQL, every one producing the same rows.
+
+Take the join query from §0 and write out just three of its plans. **Plan A**: sequentially scan `orders`, filter for `total > 500`, sequentially scan `customers`, filter for `country = 'JP'`, then hash-join the two filtered streams. **Plan B**: use an index on `customers.country` to fetch only the Japanese customers, then for each one do an index-nested-loop into an index on `orders.cust_id` to find their big orders. **Plan C**: scan both tables, sort each on the join key, sort-merge them. Three trees. Three completely different shapes — different leaf operators, different join algorithms, different orders. And here is the property that makes the optimizer's job *possible*: all three are **correct**. They return byte-for-byte the same result set. Correctness is shared across the entire plan space — it's invariant, a thing you get for free no matter which plan you pick.
+
+What is *not* shared is cost. If most customers are Japanese and most orders are large, Plan A's scans-and-hash might be the cheapest. If only a handful of customers are in Japan and each has few orders, Plan B's index-nested-loop touches almost nothing and wins by a factor of thirty. Plan C's double sort might be pure waste — unless the output needs to be sorted anyway, in which case it's suddenly competitive. The point is the *gap*: across plans that all agree on the answer, the cost can swing by orders of magnitude. So the optimizer's whole job reduces to a single sentence: **choose well within a set of plans that already agree on the answer.** It never has to worry about getting the right rows — every candidate does that. It only has to worry about getting them cheaply.
+
+<PlanSpaceScene client:visible />
+
+Figure 7.1 lays out alternative plan trees for one query side by side, each annotated with an estimated cost, and lets you toggle which one is "chosen." Flip between them and watch the trees rebuild — the same query becoming a seq-scan-and-hash shape, then an index-nested-loop shape, then a sort-merge shape — while the cost number above each one tells a wildly different story. The rows they'd return are identical (the scene says so); the costs are not, and the gap is loud on purpose. That gap *is* the chapter. Everything from here is the machinery for putting a trustworthy number above each tree so the optimizer can pick the small one.
+
+<PythonSandbox client:only="react" initialCode={PLANSPACE_SANDBOX} />
+
+The sandbox builds two or three equivalent plans for a query as operator trees — reusing the exact `SeqScan` / `IndexScan` / `Join` vocabulary from Chapter 06 — and prints each one with a placeholder cost stapled on. There's no real cost model yet; the numbers are stand-ins. The point of the scene is only to make the *space* concrete in your hands: a query is not one tree, it's a set of trees you can enumerate, hold in a list, and compare. We have the candidates. Now we need to score them — and that means replacing those placeholder numbers with a cost we can actually compute. That's §2.
+
+</Section>
+
+<Section
+  id="the-cost-model"
+  title="The cost model"
+  quiz={{
+    question: "A cost model scores a plan as `cost ≈ pages_read + cpu_per_row × rows_processed`. A seq scan of a 10,000-page table reads all 10,000 pages and processes 1,000,000 rows; an index scan for a selective predicate reads ~50 pages and processes ~500 rows. Using `cpu_per_row = 0.01`, which plan does the model prefer, and what single quantity dominates the comparison?",
+    options: [
+      { text: "Seq scan ≈ 10,000 + 0.01×1,000,000 = 20,000; index scan ≈ 50 + 0.01×500 = 55. The model strongly prefers the index scan, and the comparison is dominated by *how many rows each path touches* — i.e., the row-count estimates, not the cost formula's constants.", correct: true },
+      { text: "Seq scan ≈ 10,000 and index scan ≈ 50, so the index wins — but only because of the page counts; the rows-processed term is negligible and the row-count estimates don't really matter to the decision.", },
+      { text: "The two are about equal once you include CPU cost, so the model can't distinguish them and falls back to picking the seq scan as the safe default.", },
+    ],
+  }}
+>
+
+To choose the cheap plan you need a number for "cheap," and you need it for a plan you are *not going to run*. So the cost model is a function that reads an operator tree and returns an estimated cost — a prediction of how much work executing that tree would take — computed purely from the tree's shape and some statistics about the tables. It never touches the data. It does arithmetic.
+
+The arithmetic is built on the two costs we've spent two chapters learning to respect. The first is **page reads** — disk I/O, the dominant expense, the thing Chapter 04 taught us to count. A sequential scan reads *every* page of a table; an index scan reads a few pages to walk the B-tree plus a few more to fetch the matching rows. The second is **CPU work** — the per-row cost of evaluating a predicate, hashing a key, comparing for a sort, copying a column. Per row it's tiny, far cheaper than a page read, but multiplied across millions of rows it stops being negligible. So a serviceable cost model is just the sum of the two, rolled up over the whole tree:
+
+> **cost ≈ (pages read) + cpu_per_row × (rows processed)**, summed over every operator in the plan.
+
+Each operator contributes its own page reads and its own per-row CPU, and the costs roll up from the leaves to the root the same way the rows do. The `cpu_per_row` constant is small — something like 0.01 in "page-read units" — encoding the fact that processing a row in memory is far cheaper than fetching a page from disk. That single number is the model's exchange rate between CPU and I/O, and it's roughly the kind of constant Selinger's original System R optimizer tuned by hand.<Footnote n={1} />
+
+Now watch what the formula does to the §1 plans. A seq scan of a ten-thousand-page table reads all ten thousand pages and grinds through, say, a million rows: cost ≈ 10,000 + 0.01 × 1,000,000 = 20,000. An index scan for a selective predicate reads maybe fifty pages and processes five hundred rows: cost ≈ 50 + 0.01 × 500 = 55. The model prefers the index scan by a factor of several hundred — and exactly mirrors what you watched happen in Chapter 06 when you swapped a `SeqScan` leaf for an `IndexScan` and the rows-scanned counter collapsed. The cost model is that collapse, written as a number you can compute *before* running anything.
+
+One honest complication, because we earned it in Chapter 05. The model counts **logical** I/O — pages the plan *asks for*. But the buffer pool sits underneath, and a page that's already resident is a cheap memory hit, not a disk read. So the true cost depends on what's hot, which the optimizer can't fully know at planning time. Real optimizers paper over this with an estimate (Postgres has separate `seq_page_cost` and `random_page_cost` knobs, and a guess at cache hit rates), but the gap is real: the cost model estimates logical I/O and the buffer pool quietly muddies it. We'll keep counting logical pages and stay honest that it's an approximation.
+
+<CostScene client:visible />
+
+Figure 7.2 makes the roll-up visible. It draws an operator tree where every node shows its estimated rows and its own cost contribution, and those contributions sum up the tree to a total at the root. Then turn a knob — table size, or the selectivity of a predicate — and watch the per-node costs and the total move. Crank the selectivity down and an index path's cost barely twitches while a seq scan's stays pinned at "read everything"; crank it up and the index path's fetches pile on until it loses. The scene is the cost formula come to life: cost is mechanical *given the row counts*.
+
+<PythonSandbox client:only="react" initialCode={COSTMODEL_SANDBOX} />
+
+The sandbox writes `cost(plan, stats)` as a recursive walk over the Chapter 06 operator objects: each operator returns its own (pages, rows, cpu) contribution and adds its children's, and the root hands back a single number. Point it at the §1 plans and the cheap one wins on the arithmetic — no placeholder numbers anymore, a real computed cost. But notice what every line of that function leans on. The seq scan's cost needs the table's page count (fine, we know that). Every other cost — the index scan's fetches, the filter's CPU, the join's comparisons — needs to know **how many rows flow through that operator.** And those row counts are not facts; they're *predictions* about data the optimizer hasn't read. The cost model is only as good as those predictions. Which throws the entire weight of the optimizer onto one question we've been quietly assuming away: how many rows does each operator emit? That's §3, and it's the hardest thing in the chapter.
+
+</Section>
+
+<Section
+  id="cardinality-estimation"
+  title="Cardinality estimation"
+  quiz={{
+    question: "Figure 7.3's `age` histogram bins ~10,000 users into bands of 10. The buckets at and above 40 hold [40–50): 1,743, [50–60): 1,082, [60–70): 770, [70–80): 196. You read `age > 40` off the histogram, then chain 4 joins where each carries a 2× cardinality error (correlation breaking the independence assumption). What's the selectivity estimate, and how far off is the chain by the end?",
+    options: [
+      { text: "`age > 40` sums the four buckets above 40: 1,743 + 1,082 + 770 + 196 = 3,791 of ~10,000 → selectivity ≈ 0.38. And a 2× error per join compounds *multiplicatively*: 2⁴ = 16× off by the end of a four-join chain. Small per-join errors explode through the chain.", correct: true },
+      { text: "Selectivity ≈ 0.38 (3,791/10,000), and a 2× error per join *adds up*: 2 + 2 + 2 + 2 = 8× off after four joins — errors accumulate linearly, so a long chain is only mildly worse than a single join.", },
+      { text: "Selectivity ≈ 0.02 (just the [70–80) bucket, since `> 40` means the top of the range), and the join errors cancel out because over- and under-estimates average away across four joins.", },
+    ],
+  }}
+>
+
+Here is the hero and the heartbreak. Every cost in §2 depends on a row count, and every one of those row counts has to be *estimated* — predicted before the query runs, from statistics, about data the optimizer has not looked at. This is **cardinality estimation**, and it is, by a wide margin, the hardest and most consequential thing the optimizer does. Cost models are roughly mechanical. Estimation is where real optimizers succeed or fail.
+
+Start with one predicate. The key quantity is **selectivity**: the fraction of rows a predicate passes. `WHERE active = true` might pass 0.9 of the rows; `WHERE age > 30` maybe 0.4; `WHERE id = 12345` essentially 1/N, almost nothing. Multiply selectivity by the table's row count and you have the estimate the cost model wanted. But where does the selectivity number itself come from? The optimizer can't run the predicate — that's the whole point. So it keeps **statistics**: gathered ahead of time (Postgres's `ANALYZE` does this), they record each table's row count, each column's number of distinct values, the min and max, and — the workhorse — a **histogram** of how the column's values are distributed.
+
+A histogram chops a column's range into buckets and records how many rows fall in each. Picture the `age` histogram you'll meet in Figure 7.3: ten thousand users sorted into eight equi-width bands ten years wide, the counts piling up in the middle of the range — [20–30) and [30–40) are fattest, with a couple thousand rows each — and thinning toward the young and old ends. To estimate `age > 40`, you just add the buckets above forty: 1,743 + 1,082 + 770 + 196 = 3,791 rows out of about 10,000, a selectivity of roughly **0.38**. No data read — the answer came straight off the summary, and it's exact at a bucket boundary like forty (the approximation error only creeps in *inside* a bucket, where the histogram has to assume values spread evenly). (Equi-width buckets are the simple version; production systems use **equi-depth** buckets, each holding roughly the same *number* of rows so that dense regions get finer resolution. Either way the idea is the same: summarize the distribution once, read estimates off it forever.<Footnote n={3} />)
+
+So far so good — a single predicate's selectivity is a reasonable estimate. The trouble starts when predicates and tables combine, because the optimizer has to *guess how they interact*, and its standard guess is the **independence assumption**: it assumes two conditions are unrelated, so their combined selectivity is the product of the two. `country = 'JP' AND language = 'ja'` gets estimated as sel(country) × sel(language) — which is badly wrong, because those columns are *correlated*: nearly everyone in Japan speaks Japanese, so the true combined selectivity is far higher than the product. Independence is the assumption that quietly breaks on real data.
+
+And joins are where the breakage becomes catastrophic, because **errors compound multiplicatively through a chain of joins.** Estimating a join's output cardinality means estimating how many pairs of rows match, which again leans on independence and on the distinct-value counts — and the estimate for join number two takes the (already wrong) estimate from join number one as its *input*. So the errors don't add; they multiply. A modest 2× error per join — easy to incur — becomes 2 × 2 × 2 × 2 = **16×** off after a four-join chain. The estimate and the reality start together at the leaves and walk exponentially apart as you climb. And since the cost model (§2) feeds entirely on these counts, an estimate that's 16× wrong can hand the join-order search (§5) a cost that's 16× wrong, and the optimizer will confidently choose a plan built on a fantasy.
+
+<CardinalityScene client:visible />
+
+Figure 7.3 is the chapter's hero, and it's built to make the compounding *visceral*. Set a predicate on the histogram — drag the threshold — and watch the estimated selectivity read straight off the buckets, side by side with the true count, so you can see the histogram's approximation error directly. Then chain joins and watch the two numbers, estimate and actual, march apart: a small gap at one join, a yawning one at four, the error factor ticking up multiplicatively as the assumptions stack — a 2×-per-join error blowing out to 16× across four joins. That growing gap is the single most important picture in the chapter, and it's the chapter's whole danger in one line: **the plan is chosen from the estimate, but it pays the actual bill.** It is, quite literally, the reason production databases pour so much engineering into statistics.
+
+<PythonSandbox client:only="react" initialCode={CARDINALITY_SANDBOX} />
+
+The sandbox builds the estimator by hand: construct a histogram over a column, estimate a predicate's selectivity off the buckets, estimate a join's cardinality under independence, and then print *estimate versus actual* and the error factor across a two- or three-join chain. Run it and the divergence is right there in the numbers — the estimate that looked fine for one predicate, drifting into nonsense by the third join. Carry the one sentence that the rest of the chapter depends on: **the optimizer's quality is capped by its cardinality estimates.** Everything downstream — the access-path crossover, the join-order DP — is arithmetic on these numbers, and arithmetic on wrong numbers gives wrong plans. This is where optimizers live or die.
+
+</Section>
+
+<Section
+  id="access-path-selection"
+  title="Access-path selection"
+  quiz={{
+    question: "For `WHERE status = ?` on a 10,000-page table, the planner compares a seq scan (cost ≈ 10,000, fixed) against an index scan (cost ≈ selectivity × rows × random-fetch-cost, which grows with selectivity). At selectivity 0.001 the index costs ~30; at 0.5 it costs ~25,000. Which path does each selectivity get, and what is this decision called in Chapter 04's terms?",
+    options: [
+      { text: "Selectivity 0.001 → index scan (30 ≪ 10,000); selectivity 0.5 → seq scan (the index's 25,000 in random fetches beats one sequential sweep of 10,000). This is exactly Chapter 04's `SEARCH USING INDEX` vs `SCAN` — the optimizer picking the access path at the selectivity crossover.", correct: true },
+      { text: "Both selectivities use the index, because an index is always faster than reading every page; Chapter 04 called this `SEARCH USING INDEX` and there's no crossover — the index just wins.", },
+      { text: "Both use the seq scan, because random index fetches are always more expensive than sequential reads; the selectivity doesn't change the decision, only the row count returned.", },
+    ],
+  }}
+>
+
+Now we cash the promissory note from Chapter 04. Back then you ran `EXPLAIN QUERY PLAN` and watched SQLite print `SCAN users` for one query and `SEARCH users USING INDEX` for another — the same table, a different access path — and we said, flatly, that *who chooses* between them, and *why*, was the optimizer's job, deferred to a later chapter. This is the later chapter. The choice between a sequential scan and an index scan is a cost comparison, and now you can do the arithmetic yourself.
+
+Set it up. For a predicate like `WHERE col = ?` or `col > ?`, the planner has (at least) two ways to find the matching rows. The **sequential scan** reads every page of the table and filters — its cost is fixed, roughly the table's page count, *regardless of how many rows match*. Read all ten thousand pages whether one row qualifies or nine thousand do. The **index scan** walks the B-tree to the matching keys and then fetches the corresponding rows — and its cost *scales with the number of matches*, because each match is (in the worst case) a random page fetch into the heap, and random fetches are the expensive kind. Few matches, few fetches, cheap. Many matches, many fetches — and a pile of random I/O can cost more than one orderly sequential sweep.
+
+So the two cost curves cross. Plot cost against selectivity and the seq scan is a flat horizontal line — fixed at "read the whole table." The index scan starts near zero (a selective predicate fetches almost nothing) and rises with selectivity as the matches and their random fetches accumulate. They intersect at the **selectivity crossover**: below it the index wins, above it the seq scan wins. With a ten-thousand-page table, a selectivity of 0.001 makes the index cost ~30 against the scan's 10,000 — the index in a landslide. A selectivity of 0.5 makes the index cost something like 25,000 in scattered fetches against the scan's flat 10,000 — and now the "dumb" full scan is *the smart choice*. Same table, same index, opposite verdicts, and the only thing that changed was the estimated selectivity from §3. That is the whole story behind Chapter 04's `SCAN`-versus-`SEARCH` line: not a rule, not a syntax lookup, but the optimizer comparing two cost curves and reading off which is lower at the selectivity it estimated.<Footnote n={6} />
+
+There's a wrinkle that shifts the crossover, and it's worth naming because Chapter 04 set it up too: the **covering index**. The index scan's expense is the *heap fetch* — after finding a key in the index, hop to the table to get the other columns. But if the index already contains every column the query needs (a covering index, Chapter 04 §6), there's no heap hop at all; you answer the query from the index alone. That knocks the random-fetch term out of the index's cost, so the index stays cheap to much higher selectivities and the crossover slides way over. This is why the same predicate can favor an index for one query (it's covered) and a seq scan for another (it isn't) — the columns the query asks for change the arithmetic.
+
+<PythonSandbox client:only="react" initialCode={ACCESSPATH_SANDBOX} />
+
+The sandbox is `choose_access_path(selectivity, table_pages, …)`: it computes the seq-scan cost and the index-scan cost from the same §2 model, returns the winner, and — the satisfying part — sweeps selectivity from 0 to 1 and prints the exact crossover point where the verdict flips. Run it and you watch `SEARCH` turn into `SCAN` at a specific selectivity, the same flip Chapter 04 showed you with no explanation. Then flip the covering-index flag and watch the crossover jump. The reveal is small and complete: the index-versus-scan choice you first met as a mysterious line of `EXPLAIN` output is the optimizer doing exactly this arithmetic, driven entirely by an estimated selectivity — which is why a stale statistic (§6) that misjudges that selectivity will pick the wrong path and never know it.
+
+</Section>
+
+<Section
+  id="join-ordering"
+  title="Join ordering"
+  quiz={{
+    question: "You join A (10,000 rows), B (10,000 rows), and C (10 rows), where A⋈B is huge but A⋈C and B⋈C are tiny (C is very selective). Two left-deep orders: (A⋈B)⋈C builds a 1,000,000-row intermediate first; (A⋈C)⋈B builds a ~10-row intermediate first. Why does the second order cost so much less, and what makes finding it tractable for many tables?",
+    options: [
+      { text: "Joining the selective C early keeps the *intermediate result* tiny, so the next join works over ~10 rows instead of 1,000,000 — and the cost of each join is driven by the size of its inputs. Dynamic programming over subsets (System R) finds the cheap order without enumerating all N! of them.", correct: true },
+      { text: "The second order is cheaper only because C is listed last in the query; join order follows the FROM clause, so rewriting the SQL is what makes it tractable — no search is needed.", },
+      { text: "Both orders cost the same total work since they produce the same final rows; the second just looks cheaper because intermediate size doesn't affect cost, only the final result size does.", },
+    ],
+  }}
+>
+
+Access-path selection chooses *how* to read one table. Join ordering chooses *in what sequence* to combine many — and it is the combinatorial heart of the optimizer, the part that makes the search genuinely hard. Because the number of orders explodes: joining N tables, there are N! ways to sequence them (more, once you allow bushy trees), and order matters enormously for one specific reason — **the size of each intermediate result feeds the cost of the next join.**
+
+Make that concrete. Join A (10,000 rows), B (10,000 rows), and C (10 rows), where C joins very selectively to either of the others but A and B join to each other promiscuously. Consider the order (A⋈B)⋈C: the first join produces a *million-row* intermediate (A and B match almost everything), and then you join that monster against C. Now consider (A⋈C)⋈B: the first join is A against the tiny, selective C, producing maybe *ten* rows, and then you join those ten rows against B. Same three tables, same final answer — but the first order built a million-row intermediate and the second built a ten-row one, and since the cost of a join is driven by the size of its inputs, the second order is *thousands of times cheaper*. The whole art of join ordering is this: **join the selective things early, keep the intermediates small,** and never build a giant intermediate you're only going to filter down later. (And notice this all rests on §3 — "C is selective" is a cardinality estimate. Get that estimate wrong and you'll cheerfully pick the million-row order.)
+
+So the optimizer must search the orderings for a cheap one — but N! is hopeless to enumerate directly; a ten-way join has over three million orderings, and that's before counting algorithm and access-path choices at each step. The breakthrough is **System R's**, from Selinger's 1979 paper, and it's two ideas.<Footnote n={1} /> First, restrict the search to **left-deep** plans — trees where each join's right input is always a base table, so you're always joining an accumulated intermediate against one more table. That throws away the bushy shapes and shrinks the space enormously while keeping the orders that matter in practice. Second, search what's left with **dynamic programming.** The insight: the cheapest way to join a *set* of tables doesn't depend on how you got there, only on which tables are in the set. So build up by subset size — find the best plan for every pair of tables, then use those to find the best plan for every triple, then every quadruple — reusing the smaller solutions instead of recomputing them. DP turns the factorial search into something exponential-but-manageable (2^N subsets), and for the table counts most queries have, it's fast.
+
+When N gets genuinely large — a twenty-way join, where even 2^N is too much — the DP itself becomes too expensive, and optimizers fall back to **heuristics**: greedy algorithms that just keep joining the cheapest-looking next table, or randomized/genetic search (Postgres switches to its "genetic query optimizer" past a threshold). These don't guarantee the optimal order; they settle for a good-enough one found in reasonable time. The modern extensible optimizers — the **Cascades** framework and its descendants — generalize the whole search into a rule-driven exploration of the plan space, but the core bet is unchanged: explore enough of the space to find a cheap plan, cleverly enough to avoid exploring all of it.<Footnote n={4} />
+
+<JoinOrderScene client:visible />
+
+Figure 7.4 puts a few candidate join orders for three or four tables side by side, drawn as trees, each annotated with its **intermediate cardinalities** and total cost. The good order and the bad order are right there to compare, and the difference is visible in the size of the boxes: the cheap order's intermediates stay small all the way up; the expensive order bulges with a giant intermediate near the bottom that everything above has to grind through. Watch how moving the selective table earlier shrinks every box above it. That shrinking is the entire game, and the cost number at the root tracks it.
+
+<PythonSandbox client:only="react" initialCode={JOINORDER_SANDBOX} />
+
+The sandbox builds a small **dynamic-programming join-order optimizer** over estimated cardinalities for a four-table chain — `region`, `customer`, `orders`, `lineitem` — exactly the System R approach in miniature. Follow the naive FROM-clause order and it joins `region` against `lineitem` with no predicate between them, a cartesian blowup into the hundreds of millions of rows that everything above has to grind through. The DP fills in the best plan for each subset of tables, building up by size, keeps every intermediate small, and prints its chosen order and cost next to the naive one's — over 1,600× cheaper on the same tables. That's the DP earning its keep. The reveal is the chapter's structure in one object: the optimizer is, more than anything, a search for a good join order, and dynamic programming makes that search tractable — *but it is only as good as the §3 estimates feeding it.* Hand the DP good cardinalities and it finds the cheap order. Hand it the wrong ones and it will find the cheapest plan in a fantasy world, which is the subject of §6.
+
+</Section>
+
+<Section
+  id="when-it-goes-wrong"
+  title="When it goes wrong"
+  quiz={{
+    question: "An optimizer estimates a join's output at 100 rows (assuming two filters are independent), but the columns are correlated and the true output is 100,000 rows. It picks an index-nested-loop join — great for 100 rows, ruinous for 100,000. Then someone runs `ANALYZE` and the stats improve. What does this illustrate about where optimizers fail and how they recover?",
+    options: [
+      { text: "The plan failed at the *estimate*, not the cost model or the search — a correlated-column underestimate (the independence assumption breaking) made a good-for-100-rows plan catastrophic at 100,000. Better statistics (ANALYZE, multi-column stats) fix the input, so the same optimizer then picks a sane plan. Estimation is the dominant error source.", correct: true },
+      { text: "The plan failed because the cost model's constants were miscalibrated; ANALYZE recalibrates `cpu_per_row`, which is what fixes it. The cardinality estimate was fine — the issue was purely the cost arithmetic.", },
+      { text: "The plan failed because index-nested-loop is simply the wrong algorithm and should never be chosen; ANALYZE helps by disabling it. The row-count estimate was irrelevant to the bad choice.", },
+    ],
+  }}
+>
+
+We've built the whole machine — cost model, estimator, access-path chooser, join-order search — so now be honest about how it breaks, because in production it breaks all the time, and always in the same place. The cost model is roughly fine. The search is roughly fine. **The estimates are where it dies**, and §3 already told you why: cardinality errors compound, and they feed everything downstream.
+
+Trace one failure end to end. Suppose a query filters on two correlated columns — `country = 'JP' AND language = 'ja'` — and the optimizer, assuming independence, multiplies the two selectivities and estimates the join's output at 100 rows. The truth, because the columns are correlated, is 100,000 rows. Now the join-order search (§5) and the access-path chooser (§4) make their decisions on the *100-row* fantasy: an index-nested-loop join looks perfect, because doing 100 index seeks is cheap. The plan ships. At runtime it does not 100 seeks but 100,000 — a random-I/O bloodbath — and the query that should have taken a hundred milliseconds takes ten minutes. Nobody changed the data or the SQL. One bad estimate near the leaves chose a plan a thousand times too slow. This is the optimizer's characteristic failure: not a crash, not a wrong answer, but a **right answer produced catastrophically slowly**, and it traces back to a number the optimizer guessed before it read a row.
+
+The causes are a catalog of ways the estimate drifts from reality. **Stale or missing statistics**: the table grew or its distribution shifted since the last `ANALYZE`, so the histograms describe a database that no longer exists. **Correlated columns**: the independence assumption, the single most common culprit, turning a product of selectivities into a number off by orders of magnitude. **Parameter sniffing**: the optimizer plans for one parameter value (`country = 'JP'`, common) and caches that plan, then reuses it for a wildly different value (`country = 'VA'`, vanishingly rare) where a totally different plan was wanted. And underneath all of it, the **long tail**: most queries get a fine plan, but the small fraction that get a disastrous one dominate the pain, and they're exactly the queries with the gnarliest estimation problems.
+
+The honest assessment is Leis et al.'s, in their 2015 paper bluntly titled *"How Good Are Query Optimizers, Really?"*<Footnote n={2} /> Their finding, after measuring real systems hard: **cardinality estimation is the dominant source of error** — the cost model's details matter far less than getting the row counts right, and a good cost model fed bad cardinalities still picks bad plans. It is the empirical backbone of everything this chapter has claimed about §3 being the heart.
+
+So what do real systems *do* about it? **Better statistics**: run `ANALYZE` regularly (or let auto-analyze do it), and gather **multi-column / extended statistics** that capture correlation directly instead of assuming independence away. **Hints**: when the optimizer is incorrigibly wrong, tools like `pg_hint_plan` let a human override its choices — an admission of defeat, but a useful one. And **adaptive execution**: re-plan or correct course at *runtime* when the actual row counts come in wildly different from the estimates, closing the loop the static optimizer couldn't.
+
+<Callout type="note" title="In production: feed the optimizer, or it starves">
+The single most common cause of a sudden, mysterious slow query in a healthy database is **stale statistics**. A nightly batch loads ten million rows, but `ANALYZE` hasn't run since the table had ten thousand — so the planner still thinks the table is tiny, picks a nested-loop that was perfect at 10K and ruinous at 10M, and the query that ran in 50ms yesterday runs for twenty minutes today. The fix is almost never to rewrite the query; it's to update the statistics (`ANALYZE table;`) so the optimizer is reasoning about the database that actually exists. The optimizer is a model of your data — keep the model current or it will confidently plan for a database you no longer have.
+</Callout>
+
+<PythonSandbox client:only="react" initialCode={WRONGSTATS_SANDBOX} />
+
+The sandbox takes the §5 join-order optimizer and feeds it a deliberately **wrong** cardinality — simulating the correlated-column underestimate above. Believing a correlated join will yield a single row when it really yields a hundred thousand, the optimizer schedules that join first and pays a true cost around 100,000, choosing the wrong order because it thinks an intermediate will be tiny when it's actually enormous. Then "fix the stats": replace the bad estimate with the true cardinality and rerun, and the *same optimizer, same code,* flips to the genuinely selective join first for a cost of about a dozen — a roughly nine-thousand-fold swing from one corrected number. Nothing about the algorithm changed — only the numbers it was fed. That's the whole lesson in one before-and-after: the optimizer is a model of reality, and when the model is wrong the plan is wrong, which is precisely why production databases spend so much effort keeping the model — the statistics — honest.
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+Stand back and look at the engine now. It can find rows on a page (Chapter 04). It can keep the hot pages in memory and turn cold reads into cheap hits (Chapter 05). It can compile a declarative query into a tree of operators and run that tree, joining tables three different ways (Chapter 06). And now it can *choose* — survey the space of equivalent plans, score each one with a cost model fed by cardinality estimates, pick the index or the scan at the selectivity crossover, order the joins to keep intermediates small, and commit to a good plan in milliseconds before reading a single row. Everything you need to answer *one* query, and answer it well.
+
+One query. That's the catch, and it's the one the rest of the book is about. A real database doesn't serve one query — it serves thousands, all at once, from clients who have never heard of each other, and a frightening number of them want to touch the *same rows at the same time.* Two transactions read the same balance, both add to it, both write back — and one of the updates silently vanishes. This is exactly the race that opened the whole book in Chapter 01, the lost update, the reason transactions exist at all. We've spent six chapters building an engine that can answer a single question beautifully. Now we have to make it survive a crowd.
+
+> We can answer one query well. Now run a thousand at once, on the same rows, without them clobbering each other.
+
+That's **Chapter 8 — locking and concurrency.** The engine knows *what* to do. Next it learns to do many things at once without letting them corrupt each other.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Six places to go deeper, each with a line on why it's worth the detour. The first two are the load-bearing references for this chapter — the foundation and the honest modern reckoning; the rest fill in the histograms, the framework, and the production view.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Selinger, Astrahan, Chamberlin, Lorie &amp; Price, 1979 — "Access Path Selection in a Relational Database Management System" (ACM SIGMOD).</strong> The System R optimizer, and the founding document of this entire chapter: cost-based optimization, the selectivity estimates of §3–§4, the access-path crossover of §4, and the left-deep dynamic-programming join-order search of §5. Nearly every cost-based optimizer alive is a descendant of this paper.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Leis, Gubichev, Mirchev, Boncz, Kemper &amp; Neumann, 2015 — "How Good Are Query Optimizers, Really?" (VLDB).</strong> The honest modern assessment and the backbone of §6: measured across real systems, <em>cardinality estimation is the dominant source of error</em> — get the row counts wrong and a perfect cost model still picks bad plans. Read it to understand why §3 is the heart of the chapter and not a footnote to it.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Yannis Ioannidis, 2003 — "The History of Histograms (abridged)" (VLDB).</strong> Where the §3 histograms come from and the estimation techniques built on them: equi-width vs equi-depth, the assumptions each makes, and how selectivity gets read off a summary of a distribution. The reference for the single most important statistic an optimizer keeps.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Goetz Graefe, 1995 — "The Cascades Framework for Query Optimization" (IEEE Data Eng. Bulletin).</strong> The architecture behind modern extensible optimizers (SQL Server, and the lineage many others follow) — and the optimizer-side companion to the Volcano executor of Chapter 06. Where the §5 search grows up into a rule-driven exploration of the whole plan space.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Hellerstein, Stonebraker &amp; Hamilton, 2007 — "Architecture of a Database System," §4 (Query Optimizer).</strong> Where the optimizer sits relative to the executor (Chapter 06) and the catalog/statistics it depends on — the same engine-wide map this book has drawn chapter by chapter, here with the optimizer placed in the whole.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>PostgreSQL documentation — "Planner/Optimizer" and the <code>EXPLAIN</code> reference.</strong> The §1–§5 ideas as a production system exposes them: how Postgres estimates selectivity, costs paths (<code>seq_page_cost</code> vs <code>random_page_cost</code>), and orders joins (and when it switches to the genetic optimizer). Read it with Chapter 04's <code>EXPLAIN QUERY PLAN</code> in hand and the §4 crossover becomes something you can watch a real planner make.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
