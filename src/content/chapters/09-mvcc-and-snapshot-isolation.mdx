@@ -1,0 +1,307 @@
+---
+title: MVCC & Snapshot Isolation
+chapterNumber: 9
+summary: "Chapter 08 bought correctness with waiting — a reader blocks a writer and a writer blocks a reader, because there is only one copy of each row to fight over. This chapter refuses that trade. A write never overwrites; it appends a new version of the row beside the old one, each version tagged with the transaction that created it (xmin) and the one that deleted it (xmax). A reader takes a snapshot of which transactions had committed when it began and sees exactly the versions that were live at that instant — so readers never wait for writers and never take a lock to read. Build the whole machine by hand in Python: the versioned store, the visibility rule, snapshot isolation and first-committer-wins, the one anomaly snapshots get wrong (write skew), and the bill that comes due for never overwriting — the dead versions that vacuum must reclaim."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import VersionChainScene from '@/components/chapter-09/VersionChainScene';
+import SnapshotScene from '@/components/chapter-09/SnapshotScene';
+import WriteSkewScene from '@/components/chapter-09/WriteSkewScene';
+import VacuumScene from '@/components/chapter-09/VacuumScene';
+import { COST_SANDBOX, VERSIONS_SANDBOX, VISIBILITY_SANDBOX } from '@/components/chapter-09/version-sandboxes';
+import { SNAPSHOT_SANDBOX, WRITESKEW_SANDBOX } from '@/components/chapter-09/snapshot-sandboxes';
+import { VACUUM_SANDBOX } from '@/components/chapter-09/vacuum-sandboxes';
+
+<ChapterReader chapterId="09-mvcc-and-snapshot-isolation">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 08 built a correct concurrency-control mechanism out of locks, but every guarantee it gave was purchased with the same currency. What was that currency, and what is this chapter's alternative proposal?",
+    options: [
+      { text: "The currency was *waiting*: a lock makes one transaction stop until another finishes, and under the §2 matrix a reader and a writer on the same row block each other in both directions. This chapter's alternative keeps *multiple versions* of every row so a reader can see the old value while a writer installs a new one — eliminating the read-write conflict instead of scheduling it.", correct: true },
+      { text: "The currency was disk space, and the alternative is to compress rows so locks become unnecessary; with small enough rows there is no contention to manage.", },
+      { text: "The currency was CPU time spent on the compatibility matrix, and the alternative is to precompute every possible lock grant at startup so no transaction ever has to wait.", },
+    ],
+  }}
+>
+
+Chapter 08 ended on an indictment of its own mechanism, and this chapter is the appeal.
+
+We built a lock manager by hand — shared and exclusive modes, the compatibility matrix, two-phase locking, the wait-for graph that catches a deadlock — and we proved it correct. Strict 2PL gives serializability, the gold standard. But we were honest about the price in the same breath we named the prize: **a lock is a mechanism for making one transaction wait.** Correctness was purchased with waiting, and waiting has a property that turns ugly under load. Look back at the compatibility matrix from §2 of the last chapter and read the off-diagonal cells: shared conflicts with exclusive, in *both* directions. A reader blocks a writer. A writer blocks a reader. There is exactly one copy of each row, and any transaction that wants to change it has to evict every transaction that's reading it, and vice versa. Under light contention you never notice. Under a crowd — a long analytics query sweeping the same rows a busy write path is updating — the wait queues fill, throughput collapses, and the database spends its time not computing but *blocking*.
+
+The whole of the last chapter was the engineering of who waits for whom. This chapter asks a more dangerous question: *what if, for reads, nobody had to wait at all?*
+
+The reason a reader and a writer fight is that they're fighting over a single object. The reader wants the row to hold still so it can observe a consistent value; the writer wants to change it. They can't both have the row in the state they want at the same time, so one of them waits. But that conflict is manufactured entirely by the decision to keep **one** copy. Suppose, instead, that a write never overwrote anything. Suppose every update *appended* a new version of the row, leaving the old version sitting right where it was. Now the reader and the writer want different things and can both have them: the writer installs version two while the reader goes on reading version one, each oblivious to the other, neither waiting a single microsecond. The read takes no lock because there is nothing to lock against — the value the reader wants is immutable, frozen the instant it was written, and the writer's new value lives somewhere else.
+
+That is the entire idea of **multiversion concurrency control** (MVCC), and it is the mechanism behind the snapshot isolation that Chapter 03 kept gesturing at without building. Chapter 03 catalogued the anomalies and named *two* families of fix: locking, which Chapter 08 built, and multiversion concurrency control, which it deferred to "later." This is later. Where locking makes conflicting transactions take turns, MVCC keeps the past around so that reads never conflict with writes in the first place.
+
+Nothing is free, and the bargain inside MVCC is as worth stating up front as the bargain inside locking was. Locking trades throughput for simplicity of storage: one copy, but everyone waits. MVCC trades storage and bookkeeping for the disappearance of read-write contention: nobody waits to read, but now there are *many* copies of every row, and someone has to decide which copy each transaction may see, and someone has to clean up the copies no one will ever look at again. This chapter builds both halves of that trade. First the mechanism — versions, and the visibility rule that picks the right one — then the isolation level it naturally produces (snapshot isolation), then the one anomaly that level gets *wrong* (write skew, which Chapter 03 named), and finally the bill: the dead versions piling up in the heap pages from Chapter 04, and the **vacuum** process that reclaims them.
+
+Here is the path. Re-stage the cost of locking concretely, so the motivation is in front of us as a stalled reader (§1). Then the core move: a write appends a version, and a version carries the marks `xmin` and `xmax` that say who created and who deleted it (§2). Then the heart of the chapter — the **visibility rule**, the few lines of logic that, given a transaction's snapshot, decide which version of a row that transaction sees (§3). Then **snapshot isolation** itself: what you get when every transaction reads from a snapshot taken at its start, and the **first-committer-wins** rule that keeps two writers from clobbering each other (§4). Then the sharp edge — **write skew**, the anomaly snapshot isolation permits, and a look at the serializable version that closes it (§5). Then **vacuum**, the garbage collector that pays for the whole scheme (§6). Then an honest accounting of MVCC against locking (§7), and the thread forward (§8).
+
+By the end you'll have built, by hand, the concurrency-control mechanism that most modern databases actually run — Postgres, Oracle, SQL Server's snapshot mode, MySQL's InnoDB — and you'll understand why, when given the choice between making readers wait and keeping the past around, the industry overwhelmingly chose the past.
+
+</Section>
+
+<Section
+  id="the-cost-of-waiting"
+  title="The cost of waiting"
+  quiz={{
+    question: "A reporting transaction holds a shared lock on a row for the seconds it takes to compute, and a writer wants to update that row. Under the strict-2PL locking of Chapter 08, what happens — and what is the single structural fact that forces it?",
+    options: [
+      { text: "The writer's exclusive-lock request conflicts with the held shared lock (S/X conflict), so the writer blocks until the report releases. The structural fact forcing this is that there is only *one copy* of the row, so a consistent read and a concurrent write cannot both be satisfied at once — one must wait.", correct: true },
+      { text: "The writer proceeds immediately because shared locks never block writers; only two exclusive locks conflict, so a reader and a writer always run concurrently under 2PL.", },
+      { text: "Both transactions abort and restart, because any time a reader and writer touch the same row the lock manager declares a deadlock and aborts both as victims.", },
+    ],
+  }}
+>
+
+Make the cost concrete the way we make everything concrete — as code you can run, not a warning you take on faith.
+
+Picture the workload that breaks locking: a long *read* overlapping short *writes*. A reporting transaction begins a sweep — sum every account balance, say, for a consistency check — and it needs the balances to hold still while it adds them up, or its total will be the sum of some rows at their old value and others at their new value, an amount that was never actually true at any single instant. Under the locking of Chapter 08, "hold still" means one thing: take a shared lock on each row you read and hold it (this is Chapter 08's `REPEATABLE READ` — strict 2PL on reads). So the report acquires shared locks and holds them for the seconds its computation takes. Meanwhile an ordinary writer — a customer depositing money — wants an exclusive lock on one of those rows. The matrix says S conflicts with X. The writer blocks. It will sit in the wait queue until the report commits and releases, however long that takes. A *single reader* has stalled the write path, not because the machine is busy, but because there is one copy of the row and the reader has claimed the right to see it unchanged.
+
+<PythonSandbox client:only="react" initialCode={COST_SANDBOX} />
+
+The sandbox stages exactly that standoff with a single-copy cell and the shared/exclusive lock from last chapter: a reader takes `S` and holds it, a writer requests `X` and is forced to wait, and you can watch the writer parked behind a read that contributes nothing but a delay. This is not a bug in the lock manager — the lock manager is working perfectly, enforcing the isolation the report asked for. It is a bug in the *premise*. The premise is that the row has one value, and a value can be either observed-stably or changed, but not both at once.
+
+So pull on the premise. The report doesn't actually need the row to *not change*; it needs to not *see* the change. Those are different requirements, and the gap between them is the whole opportunity. If the writer's change went somewhere else — a new version, leaving the value the report is reading untouched — the report could finish its sum against a frozen picture of the database while the writer commits its deposit immediately, and neither would ever know the other was there. The report sees a consistent state (the one that existed when it began); the writer makes progress (its new version is live for whoever comes next); nobody waits. The cost of waiting was never fundamental. It was the cost of insisting on a single copy. Stop insisting, and it evaporates — which is precisely what the rest of the chapter does, version by version.
+
+</Section>
+
+<Section
+  id="versions"
+  title="Versions"
+  quiz={{
+    question: "In the xmin/xmax model, a transaction updates row `k` from 100 to 150. What does the store actually do to the underlying tuples?",
+    options: [
+      { text: "It marks the existing version (value 100) as deleted by stamping its `xmax` with the updating transaction's id, and *appends a new tuple* (value 150) whose `xmin` is that same id and whose `xmax` is empty. The old version is not overwritten — both tuples now coexist in the version list.", correct: true },
+      { text: "It overwrites the bytes of the existing tuple in place, changing 100 to 150, and records the old value 100 in a separate undo log that is discarded at commit.", },
+      { text: "It deletes the old tuple entirely and inserts a fresh one, so that at every instant exactly one tuple exists for key `k` and no old versions are ever retained.", },
+    ],
+  }}
+>
+
+If a write must not destroy the value a concurrent reader is using, then a write cannot overwrite. That single negative requirement dictates the data structure. We need a store where an update *adds* rather than *replaces*, and where each stored value carries enough information to say *when it was true* — for which span of the database's history it was the live value of its row. The classic encoding, the one Postgres uses and the one we'll build, attaches two transaction ids to every stored value.
+
+Call each stored value a **tuple** (the physical thing on disk, as opposed to the logical *row* it's a version of). A tuple carries:
+
+- **`xmin`** — the id of the transaction that **created** this version (the insert or update that produced it), and
+- **`xmax`** — the id of the transaction that **deleted** this version (the update or delete that superseded it), or empty if this version is still live.
+
+A logical row is therefore not a single thing but a *chain* of tuples, each valid for the interval between the commit of its `xmin` and the commit of its `xmax`. To insert a row, append a tuple with `xmin` set to you and `xmax` empty. To update a row, do two things in one motion: find the version you can currently see, stamp its `xmax` with your id (marking "I deleted this"), and append a brand-new tuple with `xmin` set to you and the new value. To delete, just the first half — stamp the visible version's `xmax` and append nothing. Notice that an update is a delete-plus-insert: the old version isn't touched except for the `xmax` stamp, so any transaction still reading it is undisturbed.<Footnote n={1} />
+
+<PythonSandbox client:only="react" initialCode={VERSIONS_SANDBOX} />
+
+The sandbox builds the `MVCCStore` we'll carry through the whole chapter: a `tuples` list that only ever grows, transaction ids handed out by `begin`, and `write` doing the stamp-old-then-append-new dance. Run it and read the printed version list after an update: two tuples for the same key, the first with its `xmax` now pointing at the updating transaction, the second live with an empty `xmax`. The old value did not move and did not vanish. This is the structural change that makes everything else possible, and it's almost anticlimactically simple — a list you append to, with two extra columns. The entire apparatus of snapshots and visibility that follows is just a question we ask *of* this list: given who I am and when I started, which of these coexisting tuples is the one I'm allowed to see?
+
+There is an obvious cost staring up from that list, and we will not pretend it isn't there: the tuples accumulate. Every update leaves a corpse — the superseded version, still sitting in the store, marked deleted but not removed. A row updated a thousand times has a thousand dead tuples trailing behind its one live one. Holding onto the past is the source of MVCC's power and the source of its central problem, and §6 is where we deal with the corpses. For now, let the list grow; the point is that nothing is ever destroyed, so nothing a reader is using can be pulled out from under it.
+
+</Section>
+
+<Section
+  id="visibility"
+  title="Visibility"
+  quiz={{
+    question: "Transaction T3 began when T1 had already committed but T2 was still in progress (so T3's snapshot records T2 as in-flight). T3 reads key `k`, which has a version created by T1 and a newer version created by T2. Under the visibility rule, which does T3 see, and why?",
+    options: [
+      { text: "T3 sees T1's version. T1 committed before T3's snapshot, so its effect is visible; T2 was in-progress in T3's snapshot, so T2's version is invisible *even if T2 later commits*. The snapshot freezes T3's view at its start instant, so a transaction that wasn't committed then never becomes visible to T3.", correct: true },
+      { text: "T3 sees T2's version, because it is the newest tuple in the chain and readers always see the most recent value regardless of commit status.", },
+      { text: "T3 sees neither version and reads NULL, because the presence of any in-progress writer on a key makes that key unreadable until every writer commits.", },
+    ],
+  }}
+>
+
+We have versions; now we need the rule that picks one. The whole of MVCC reads — the reason a reader never waits — comes down to a small predicate evaluated against the version list: *is this tuple visible to me?* Get that predicate right and reading is just "scan the chain, return the first visible version." No locks, no waiting, no coordination with writers at all — visibility is a function of facts already recorded in the tuples and a snapshot the reader took for free at its start.
+
+The key object is the **snapshot**. When a transaction begins, it records which *other* transactions are still in progress at that instant — the set of ids that have started but not yet committed. That set, frozen at start, is the transaction's snapshot, and it defines the transaction's entire view of the database for its whole life. The rule for whether one transaction's effects are visible to me has two clean parts. A transaction `x`'s work is visible to me if **either** `x` is *me* (I always see my own writes), **or** `x` had already **committed** at the moment I took my snapshot — which means `x` is committed *and* `x` was not in my in-progress set. The second clause is the subtle one and the important one: a transaction that was running when I started is invisible to me **forever**, even if it commits a microsecond later. My snapshot froze the world; latecomers stay frozen out. That's what makes my reads *repeatable* — the set of committed work I can see never grows during my transaction, so a value I read once reads the same every time.
+
+Now lift that from transactions to tuples. A tuple is visible to me when its **creator is visible and its deleter is not**:
+
+- its `xmin` (creator) passes the visible-transaction test above — the version was made by work I can see, and
+- its `xmax` (deleter) is empty *or* fails the test — the version has not been deleted by any work I can see.
+
+Read it as a span: I see a version if it was created by a committed-as-of-my-snapshot transaction and not yet deleted by one. Scan a row's chain with this predicate and exactly one tuple passes (the live one as of my snapshot), and that's what `read` returns. Two transactions that started at different moments, scanning the very same chain, can pass *different* tuples — and that is not a bug, it's the entire feature. Each sees the database as it was when that transaction began.
+
+<VersionChainScene client:visible />
+
+Figure 9.1 makes this literal: a single row's version chain laid out as a line of tuples, each labeled with its `xmin`/`xmax`, and a reader's snapshot you can slide along the timeline. As you move the snapshot earlier or later — as you place it before or after various transactions committed — watch which tuple lights up as *the one this reader sees*. Slide it back and the reader sees an old value; slide it forward past a commit and a newer version becomes the visible one. The old versions never leave; the snapshot just points at a different one. This is the chapter's defining image: the past is all still there, lying in the chain, and your snapshot is a finger pointing at the version that was current when you began.
+
+<PythonSandbox client:only="react" initialCode={VISIBILITY_SANDBOX} />
+
+The sandbox proves the surprising part — that two readers of the same key get different answers, lawfully. It takes two snapshots at two different times around a write, reads the same key through each, and prints not just the two different values but *why*: for the relevant version it shows whether the creator is visible and whether the deleter is, the two-part test resolving to a yes or a no for each reader.<Footnote n={2} /> Nothing in `read` ever blocks, ever consults a lock, ever waits for the writer. It walks the chain and applies the predicate. The reader's freedom from waiting, the thing this whole chapter is chasing, is bought entirely by that little function — visibility is the mechanism, and it costs a reader nothing but a scan.
+
+</Section>
+
+<Section
+  id="snapshot-isolation"
+  title="Snapshot isolation"
+  quiz={{
+    question: "Two transactions begin from the same snapshot, both read `balance = 100`, and both try to write a new value to that row. Under snapshot isolation's first-committer-wins rule, what happens?",
+    options: [
+      { text: "Whichever commits first installs its version; the second, on trying to commit a write to a row that was modified by a transaction not in its snapshot, detects a write-write conflict and *aborts* (and typically retries). This is exactly what prevents Chapter 01's lost update — the two writes cannot both silently succeed.", correct: true },
+      { text: "Both commit successfully and the second value wins, overwriting the first — snapshot isolation resolves write conflicts by last-writer-wins, identical to having no concurrency control at all.", },
+      { text: "Both block until the other commits, deadlock, and one is chosen as a victim by the wait-for graph — snapshot isolation falls back to the lock manager for all writes.", },
+    ],
+  }}
+>
+
+Assemble the pieces from §2 and §3 and you get a complete isolation level, the one most databases run by default: **snapshot isolation** (SI). The definition is exactly what we've built. Every transaction, at its start, takes a snapshot. Every read is served from that snapshot via the visibility rule — so a transaction sees a single, consistent, frozen image of the database as of the instant it began, no matter how many other transactions commit while it runs. Reads take no locks and never block. A transaction's own writes are visible to itself (the `x == me` clause) but to no one else until it commits, at which point its versions become visible to transactions that start *afterward*.
+
+Trace what SI gives you against Chapter 03's catalogue of anomalies. **Dirty reads**: impossible — you only see versions whose creator committed before your snapshot, so you can never read another transaction's uncommitted write. **Non-repeatable reads**: impossible — your snapshot is frozen, so re-reading a row returns the same version every time, because the set of commits you can see never grows. **Phantoms**: also handled — a row inserted by a transaction outside your snapshot is invisible to you, so a range scan returns the same rows on every pass; no new row materializes mid-transaction. With reads alone, snapshot isolation cleanly defeats the three anomalies that cost Chapter 08's locking the most — the very ones that forced `REPEATABLE READ` to hold shared locks to commit and `SERIALIZABLE` to take range locks. SI gets them for free, with no read locks at all, because a frozen snapshot is *automatically* repeatable.
+
+Reads are the easy half. Writes are where SI has to do real work, because two transactions writing the *same* row reintroduce exactly Chapter 01's lost update. Suppose T1 and T2 both snapshot the world, both read `balance = 100`, both compute `+50`, both append a new version with value 150. If both commit, one of the two 150-writes is pointless — the account took two deposits and gained one. MVCC's reads don't prevent this, because reading never conflicts. So SI adds a write-side rule: **first-committer-wins**. When a transaction goes to commit a write to a row, the system checks whether that row was modified by some *other* transaction that committed after this transaction's snapshot was taken. If so, the two writes conflict, and the later committer is **aborted** (and usually retried from the top, where its fresh snapshot now sees the winner's value). The first writer to commit wins the row; the second discovers it lost and rolls back. The lost update is prevented not by making the second writer *wait* (as a lock would) but by letting it run optimistically and *aborting* it if it turns out to have collided — concurrency control after the fact rather than before.<Footnote n={3} />
+
+<SnapshotScene client:visible />
+
+Figure 9.2 runs two transactions side by side on a shared timeline. Watch a reader take an early snapshot and keep reading the old value while a writer commits a new version right next to it — the reader unblocked, the writer unblocked, the two passing in the night. Then watch the write-write case: two transactions both targeting the same row, the first to commit installing its version, the second flashing a conflict and aborting. The two behaviors are the two faces of SI — reads are free and never conflict, writes are optimistic and conflict only at commit.
+
+<PythonSandbox client:only="react" initialCode={SNAPSHOT_SANDBOX} />
+
+The sandbox extends the `MVCCStore` with the commit-time conflict check and runs both scenarios end to end: a long reader seeing a stable value across a concurrent commit, and a pair of racing writers where the second is forced to abort. Trip the conflict yourself and watch the abort fire. The reveal is that snapshot isolation is two rules, not one: a *read* rule (the visibility predicate, which prevents the read anomalies by construction) and a *write* rule (first-committer-wins, which prevents the lost update). Hold onto that division, because the next section is about the gap *between* the two rules — the anomaly that slips through when transactions conflict in a way that is neither a dirty read nor a write-write collision.
+
+</Section>
+
+<Section
+  id="write-skew"
+  title="Write skew"
+  quiz={{
+    question: "Two doctors are on call. Two transactions run concurrently under snapshot isolation; each checks 'at least one other doctor is on call' (both see 2, both pass) and each takes a *different* doctor off call. First-committer-wins does not fire. Why does the invariant break, and what would catch it?",
+    options: [
+      { text: "First-committer-wins only triggers on writes to the *same row*, but the two transactions wrote *different* rows (different doctors), so neither conflicts. Each read a value the other was about to invalidate — a read-write dependency SI doesn't track. A serializable level (SSI), which watches read-write dependencies, would detect the dangerous structure and abort one.", correct: true },
+      { text: "The invariant breaks because snapshot isolation allows dirty reads, so each transaction saw the other's uncommitted change; stricter read locks on the snapshot would fix it.", },
+      { text: "It breaks because the two transactions deadlocked and both were aborted, leaving the table in an inconsistent state; a longer lock timeout would let one finish and preserve the invariant.", },
+    ],
+  }}
+>
+
+Snapshot isolation is not serializable, and the gap has a name Chapter 03 already taught you: **write skew**. It is the one anomaly SI permits, and understanding exactly *why* it slips through is understanding the precise boundary of what multiversion reads can and can't guarantee.
+
+Here is the canonical case, the one from Chapter 03. A hospital requires that **at least one doctor be on call** at all times. Two doctors, Alice and Bob, are both on call, and both want to go off-shift. Each runs the same transaction: *check whether at least one other doctor is on call; if so, take myself off.* Run serially, the second one to try is refused — by the time Bob checks, Alice is already off, so Bob sees zero others on call and stays. The invariant holds. Now run them under SI, concurrently. Alice's transaction snapshots the world and sees two doctors on call (herself and Bob) — at least one other, so it's safe to go off, and she writes her own row to off-call. Bob's transaction, from its own snapshot taken at the same time, *also* sees two on call (it can't see Alice's not-yet-committed change, and even after she commits, Bob's frozen snapshot still shows her on call) — so Bob also concludes it's safe and writes *his* row to off-call. Both commit. First-committer-wins does not fire, because **they wrote different rows**: Alice wrote Alice's row, Bob wrote Bob's. No write-write conflict exists. Both commit cleanly, and the hospital now has zero doctors on call. The invariant is broken by two transactions that were each, individually, correct.
+
+Look at why every defense we built fails to catch this. The reads weren't dirty — each saw only committed data. The reads were repeatable — each snapshot was internally consistent. There was no lost update — no row was written by two transactions. Every rule SI enforces was satisfied. The anomaly lives in a place SI doesn't look: a **read-write dependency** between the transactions. Alice *read* Bob's on-call status and *wrote* in a way that depended on it; Bob did the symmetric thing. Each transaction's write was justified by a value the other transaction was simultaneously invalidating. SI's first-committer-wins watches for two transactions writing the same item, but write skew is two transactions where each *reads* what the other *writes* — a conflict on different items that no write-write check can see. The snapshot gave each transaction a consistent view of the *past*, but neither's view accounted for the other's concurrent *change to a different row*, and the invariant spanned both rows.
+
+<WriteSkewScene client:visible />
+
+Figure 9.3 stages the doctors directly. Two transactions, two snapshots, both reading "two on call — safe," both removing a different doctor, both committing — and the on-call count dropping to zero with no conflict raised anywhere. Step it and watch the precise moment the guarantee fails: it's not at any write, but in the *gap* between each transaction's read and the other's write, a gap snapshot isolation leaves wide open.
+
+<PythonSandbox client:only="react" initialCode={WRITESKEW_SANDBOX} />
+
+The sandbox runs the anomaly to its bad end on the `MVCCStore`, then says what it would take to stop it. The fix is **serializable snapshot isolation** (SSI): keep MVCC's cheap, non-blocking reads, but additionally *track the read-write dependencies between concurrent transactions*, and when they form the dangerous pattern that can produce a non-serializable outcome — a cycle of "T1 read something T2 wrote, T2 read something T1 wrote" — abort one of them.<Footnote n={4} /> SSI is how Postgres implements true `SERIALIZABLE`: snapshot isolation plus a dependency monitor that fires only on the genuinely dangerous structures, so most workloads pay almost nothing and only actual write-skew risks get aborted. It is the resolution of the tension this chapter and the last one have been circling — serializability *without* the read locks that made Chapter 08's `SERIALIZABLE` so expensive. You get the gold standard by watching for trouble and aborting it after the fact, rather than by making every reader wait in advance.
+
+Until you ask for serializable explicitly, though, you are on snapshot isolation, and write skew is real. The practical defense application developers reach for is to *materialize the conflict* — make the two transactions touch a common row so first-committer-wins can fire (a `SELECT ... FOR UPDATE` on a shared counter, or an explicit lock on the invariant's guard row). It's a manual patch over exactly the gap we just traced: if SI won't see the conflict because the writes are on different rows, force a shared row into the write set so it will.
+
+</Section>
+
+<Section
+  id="vacuum"
+  title="Vacuum"
+  quiz={{
+    question: "A row has been updated thousands of times, leaving thousands of dead tuples (each with a committed `xmax`). One long-running reporting transaction is still open, with an old snapshot. Which dead tuples can vacuum safely reclaim?",
+    options: [
+      { text: "Only the tuples whose deletion is already visible to *every* still-live snapshot — i.e. tuples deleted before the oldest active snapshot was taken. The long-running report pins the horizon: any version it might still need to see cannot be reclaimed until that transaction ends, which is why one long transaction can bloat a table.", correct: true },
+      { text: "All of them — once a tuple's `xmax` is committed it is dead and can be removed immediately, regardless of which transactions are still running.", },
+      { text: "None of them — vacuum only runs when the database is shut down, so while any transaction is open no reclamation can occur at all.", },
+    ],
+  }}
+>
+
+Every update in this chapter has left a corpse. That is the bargain we signed in §2: nothing is overwritten, so nothing a reader is using gets pulled away — but the superseded versions don't disappear, they pile up. A row updated a thousand times carries a thousand dead tuples behind its one live version, and those tuples sit in the **heap pages** of Chapter 04, taking up slots, bloating the file, slowing every scan that has to skip past them. MVCC's superpower and MVCC's tax are the same fact: the past is kept. Sooner or later, something has to throw away the parts of the past that no one will ever look at again. That something is **vacuum**.
+
+The question vacuum answers is precise: *which dead tuples are safe to remove?* A tuple is dead when its `xmax` has committed — some transaction deleted it and that deletion is final. But "dead" is not the same as "reclaimable," and conflating them is how you corrupt a running transaction's view. A tuple deleted by a committed transaction is still *needed* by any in-progress transaction whose snapshot predates that deletion — that old transaction is entitled to see the version as live, because from its frozen vantage point the deleter hasn't happened. So the rule for reclamation is stricter than the rule for death: a dead tuple can be removed only when its deletion is visible to **every** still-active snapshot — equivalently, when its `xmax` committed *before the oldest currently-running transaction took its snapshot*. That threshold — the snapshot of the oldest live transaction — is the **horizon** (Postgres calls the boundary `xmin` in this context, the oldest xid any snapshot still cares about). Below the horizon, a dead tuple can never again be seen by anyone, and vacuum is free to reclaim it. Above it, the tuple might still be someone's live version, and it must stay.<Footnote n={5} />
+
+This is where the cost of MVCC turns concrete and occasionally vicious. A single **long-running transaction holds the horizon back.** That reporting query from §1, the one that no longer *blocks* writers under MVCC — it doesn't make anyone wait anymore, but as long as it stays open, its old snapshot is the horizon, and *no* dead tuple newer than its start can be reclaimed, across the entire database. Writers race ahead creating new versions; vacuum follows behind trying to clean up; and the open report pins a line in the past that vacuum cannot cross. The dead tuples accumulate, the tables bloat, scans slow down — all because one transaction stayed open too long. MVCC didn't eliminate the cost of a long reader; it *transformed* it, from blocking other transactions (the locking world's symptom) into preventing reclamation (the MVCC world's symptom). The long report that would have stalled the write path under Chapter 08's locks instead, here, quietly inflates the storage. Every engineer who has hunted down "why is this table 40 GB when it has 10,000 rows" has met this transformation in person.
+
+<VacuumScene client:visible />
+
+Figure 9.4 shows a heap page — a grid of slots, in Chapter 04's terms — filling with row versions as transactions commit, the superseded ones marked dead. Press *vacuum* and watch the reclaimable dead tuples get swept, their slots freed for reuse. Then open a long-running snapshot and watch the **horizon** hold: the dead tuples newer than that snapshot refuse to be reclaimed, staying stubbornly in their slots no matter how many times you vacuum, until the long transaction finally ends and the horizon advances past them. The page bloating behind a pinned horizon is the cost of MVCC made visible.
+
+<PythonSandbox client:only="react" initialCode={VACUUM_SANDBOX} />
+
+The sandbox builds `vacuum()` on the `MVCCStore`: it computes the horizon from the oldest active snapshot, scans the version list, removes every dead tuple below the horizon, and reports how many it freed and how many it had to leave. Open a long transaction first and watch the reclaimable count collapse — the same dead tuples, now un-reclaimable, because one old snapshot still might want them. This is the garbage collector that pays for the whole scheme, and real engines run it constantly (Postgres calls it *autovacuum*) precisely because if they didn't, the corpses from §2 would bury the database. Keeping the past is what lets readers never wait; vacuum is the price of admission, charged continuously, forever.
+
+</Section>
+
+<Section
+  id="mvcc-vs-locking"
+  title="MVCC vs locking"
+  quiz={{
+    question: "Having built both mechanisms, how should you characterize the relationship between Chapter 08's locking and this chapter's MVCC?",
+    options: [
+      { text: "They are two different trades against the same problem: locking keeps one copy and schedules conflicts by making transactions wait; MVCC keeps many copies and avoids read-write conflicts entirely, paying instead in storage, garbage collection, and a residual anomaly (write skew) under plain snapshot isolation. Real engines mix them — MVCC for reads, locks (or first-committer-wins) for write conflicts.", correct: true },
+      { text: "MVCC strictly dominates locking with no downside, which is why correct databases use MVCC for everything and never take a lock of any kind.", },
+      { text: "They are the same mechanism described in two vocabularies; xmin/xmax are just shared and exclusive locks renamed, and a version chain is identical to a wait queue.", },
+    ],
+  }}
+>
+
+Two chapters, two answers to the one question Chapter 03 posed — how to let transactions run concurrently without letting them corrupt each other's view. It's worth setting them side by side now that you've built both, because the contrast is the real lesson, and neither is simply *better*.
+
+Locking keeps **one copy** of each row and resolves conflict by **scheduling**: when two transactions want the same row incompatibly, one waits. The machinery is the lock manager, the compatibility matrix, two-phase locking, deadlock detection. Its costs are paid in *waiting* — readers block writers, writers block readers, wait queues form, deadlocks happen, and throughput degrades under contention. Its virtue is conceptual economy and exact serializability: strict 2PL is provably serializable, full stop.
+
+MVCC keeps **many copies** and resolves read-write conflict by **avoiding it**: the reader and the writer want different versions and can both have them, so reads never wait and never lock. The machinery is the version chain, the snapshot, the visibility rule, first-committer-wins, and vacuum. Its costs are paid in *space and bookkeeping* — every update leaves a dead tuple, the store bloats, and a garbage collector has to run forever to reclaim what no snapshot can see, with a long transaction able to pin the horizon and balloon the storage. And under plain snapshot isolation it leaves one anomaly on the table — write skew — that locking's `SERIALIZABLE` would have caught, recoverable only by stepping up to serializable snapshot isolation or by manually materializing the conflict.
+
+The honest summary is that they trade the same dilemma in opposite directions. Locking pays in time; MVCC pays in space. Locking serializes pessimistically, before the conflict; MVCC (for writes) detects optimistically, at commit. And the reason most modern engines lean on MVCC is empirical, not theoretical: read-heavy workloads — which is to say most workloads — get enormous benefit from reads that never wait, and storage is cheap while latency is not. But "lean on" is not "use exclusively," and the most important thing to carry out of these two chapters is that **real databases mix both.**<Footnote n={6} />
+
+<Callout type="note" title="What Postgres actually does, in one breath">
+Postgres is the canonical MVCC engine, and its behavior is exactly the machine you just built. Every row version carries `xmin`/`xmax` (you can `SELECT xmin, xmax FROM t` and see them). `READ COMMITTED`, the default, takes a *fresh* snapshot for each statement; `REPEATABLE READ` takes one snapshot for the whole transaction (this chapter's snapshot isolation, exactly); `SERIALIZABLE` adds the SSI dependency monitor from §5. Reads take no row locks. Write-write conflicts are caught by first-committer-wins. Dead tuples are reclaimed by *autovacuum*, and a long-open transaction holds the `xmin` horizon and bloats tables — the §6 lesson, in production, every day. And when an application needs a write conflict that SI won't see (the write-skew defense), it reaches for `SELECT ... FOR UPDATE` — which takes an honest Chapter 08 *lock*. MVCC for the reads, a lock for the conflict that versions can't catch: both mechanisms, in one engine, exactly where each is strongest.
+</Callout>
+
+The reveal that closes the pair: concurrency control is not a single invention but a *spectrum of trades*, and you have now built the two endpoints by hand. Everything real systems do — `READ COMMITTED` versus `REPEATABLE READ` versus `SERIALIZABLE`, optimistic versus pessimistic, the choice of when to lock and when to version — is a point chosen on the line between "make them wait" and "keep the past around." You understand the line because you've built both ends of it.
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+Step back and notice a debt this chapter quietly ran up. We've talked the whole way through about transactions that *commit* — first-committer-wins turns on commit order, a snapshot freezes which commits you can see, vacuum reclaims what committed transactions left dead. Commit has been the pivot of every rule. But we've treated it as an instant, a clean line a transaction crosses, and said nothing about what *makes* a commit real. What does it mean, physically, for a transaction to have committed? When the power fails one microsecond after first-committer-wins declared T1 the winner, how does the database know, on restart, that T1's version is durable and T2's abort is final?
+
+That's the **D** in ACID — durability — and the last few chapters have leaned on it without paying for it. Chapter 02 built a write-ahead log and promised that commit means "the log record is on disk." But a real engine commits *thousands* of transactions a second, and forcing the disk on every single commit — an `fsync` per transaction — is far too slow. So commit itself becomes an engineering problem: how do you make many transactions durable without paying a separate disk flush for each? The answer is to batch them — let commits pile up for a few milliseconds and flush them together, amortizing one expensive disk sync across a whole **group** of transactions.
+
+> If every transaction that commits leaves a new version behind, and committing means writing to a log, then a busy MVCC database is a firehose of small log writes. How do you make that firehose durable without an `fsync` per drop?
+
+That's **group commit**, and it opens onto a larger idea: a database whose very storage is organized as an append-only log — **log-structured storage** — where writes are always sequential, the disk's favorite access pattern, and the same "never overwrite, append a new version" instinct you built into the heap this chapter gets built into the *storage engine itself*. The versions we appended to a list, generalized to an entire on-disk structure.
+
+That's **Chapter 10 — group commit and log-structured storage.** This chapter kept the past in the heap so readers wouldn't wait. The next one makes writing that past to disk fast enough to keep up — and then asks what happens if you let the log *become* the database. (And when a crash interrupts all of this mid-flight, recovering a consistent state is **Chapter 11**'s job — ARIES, checkpoints, and the dirty-page table — the final piece of the durability story.)
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Six places to go deeper, each with a line on why it earns the detour. The first two are the foundation — the thesis that invented multiversion concurrency and the paper that gave it a theory; the rest define snapshot isolation, make it serializable, ground it in a real engine's vacuum, and bridge back to locking.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Reed, 1978 — "Naming and Synchronization in a Decentralized Computer System" (MIT Ph.D. thesis).</strong> The origin of multiversion concurrency control: the idea that you keep multiple timestamped versions of an object and let each transaction read the version appropriate to its time. Everything in §2 and §3 — versions that carry a creation and a deletion stamp, reads served from a consistent point in the past — descends from here. Read it to see the idea in its first, most general form, before it was specialized into xmin/xmax.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Bernstein &amp; Goodman, 1983 — "Multiversion Concurrency Control — Theory and Algorithms" (ACM TODS).</strong> The formal treatment behind §3's visibility rule: what it means for a multiversion schedule to be correct, and the algorithms that produce one. The rigorous version of the predicate you built — given a transaction and a set of versions, which version is the right one to read — and the proof that serving reads from a consistent snapshot is sound.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Berenson, Bernstein, Gray, Melton, O'Neil &amp; O'Neil, 1995 — "A Critique of ANSI SQL Isolation Levels" (SIGMOD).</strong> The paper that defined <em>snapshot isolation</em> precisely (§4), showed that the ANSI SQL isolation levels were under-specified, and named <em>write skew</em> (§5) as the anomaly SI permits that the ANSI hierarchy didn't anticipate — SI is strong on the three classic read anomalies yet not serializable. This is the source for first-committer-wins and for the exact boundary of what snapshot isolation guarantees.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Cahill, Röhm &amp; Fekete, 2008 — "Serializable Isolation for Snapshot Databases" (SIGMOD).</strong> The backbone of §5's resolution: how to keep MVCC's non-blocking reads and still get true serializability by tracking read-write dependencies among concurrent transactions and aborting the ones that form a dangerous cycle. This is the SSI that Postgres ships as <code>SERIALIZABLE</code> — serializability without the range locks that made Chapter 08's version of it so expensive.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>The PostgreSQL documentation — "Concurrency Control" and "Routine Vacuuming," plus the MVCC chapters of <em>The Internals of PostgreSQL</em> (Suzuki).</strong> Where this chapter's model meets a production system: real <code>xmin</code>/<code>xmax</code> on every tuple, the visibility rules, the transaction-status (commit log) machinery, and — for §6 — how autovacuum computes the horizon and reclaims dead tuples, and exactly how a long-running transaction holds that horizon back and bloats a table. The cleanest path from "I built a toy" to "I understand the engine on my laptop."
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, ch. 7 ("Transactions").</strong> The synthesis of these two chapters in one place: two-phase locking, snapshot isolation, and serializable snapshot isolation set against each other as the three great answers to concurrent transactions, with their costs laid out plainly. Read it to see why "make everyone take turns" (Chapter 08) and "keep the past around" (this chapter) are endpoints of a single spectrum, and how real systems pick a point on it.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
