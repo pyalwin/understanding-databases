@@ -1,0 +1,307 @@
+---
+title: Query Execution
+chapterNumber: 6
+summary: "You can fetch any page fast now — but a SELECT names a result, not a procedure. Build the executor by hand in Python: compile a query into a tree of operators, drive it with the Volcano iterator model, stack scan/filter/project, then join two tables three different ways — nested-loop, hash, sort-merge — and finish on the blocking operators that stall a pipeline. Who picks the plan is the next chapter."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import PlanTreeScene from '@/components/chapter-06/PlanTreeScene';
+import VolcanoScene from '@/components/chapter-06/VolcanoScene';
+import AggSortScene from '@/components/chapter-06/AggSortScene';
+import JoinScene from '@/components/chapter-06/JoinScene';
+import { PLANTREE_SANDBOX, ITERATOR_SANDBOX, SCANFILTERPROJECT_SANDBOX, AGGSORT_SANDBOX } from '@/components/chapter-06/exec-sandboxes';
+import { NESTEDLOOP_SANDBOX, HASHJOIN_SANDBOX, SORTMERGE_SANDBOX } from '@/components/chapter-06/join-sandboxes';
+
+<ChapterReader chapterId="06-query-execution">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "A user types `SELECT name FROM users WHERE age > 30`. The engine could answer it a dozen different ways, but every one of them comes down to the same kind of thing. What does the engine actually run?",
+    options: [
+      { text: "A tree of operators — small machines that each do one job (scan a table, drop rows that fail a predicate, keep some columns) — wired so that data flows up from the leaves to the root. The SQL is the request; the tree is the program that satisfies it.", correct: true },
+      { text: "The SQL text itself, interpreted token by token left to right — `SELECT` reads the columns, `FROM` opens the table, `WHERE` filters — exactly in the order the keywords appear." },
+      { text: "A single compiled machine-code routine generated fresh for that one query string, with no reusable parts and no intermediate structure the engine can reason about.", },
+    ],
+  }}
+>
+
+Chapter 05 ended with the engine able to fetch any page fast — hot pages resident, cold pages pulled in once and kept for as long as they're useful — and one admission hanging in the air: *we can fetch any page fast now; we still have no idea which pages a query should touch.* That's this chapter. We pointed across the room at the part of the engine that decides *which pages*; now we build it.
+
+So let a user type the most ordinary thing in the world:
+
+```sql
+SELECT name FROM users WHERE age > 30
+```
+
+Read that sentence as the engine has to read it, and notice what it does *not* say. It names a result — the names of users older than thirty — but it says nothing about *how* to produce that result. It doesn't say "open the `users` table." It doesn't say "read the rows in this order," or "check the age first and the name second," or "use the index if there is one." It is pure *what*, zero *how*. SQL is **declarative**: you describe the answer you want and leave the procedure entirely unspecified. That's the feature that makes SQL pleasant to write and it's exactly the problem this chapter exists to solve, because a computer cannot run a *what*. It can only run a *how*.
+
+Between the SQL and the answer, then, sits the part of the engine whose whole job is to invent the *how*. It takes your declarative request and compiles it into a **plan**: a concrete, runnable procedure. And the shape that procedure takes — this is the one idea the whole chapter rests on — is a **tree of operators**. Each operator is a small machine that does exactly one job and knows nothing about the others: one scans a table and emits its rows; one drops the rows that fail a predicate; one keeps only certain columns; one joins two inputs; one sorts; one groups. Wire them into a tree, point the engine at the root, and rows flow up from the leaves through each transforming operator until the final answer falls out the top. The SQL was the wish. The tree is the program. And the executor — the thing this chapter builds — is the interpreter that runs the program.
+
+Here is the plan, and it is the by-now-familiar plan: you build the thing yourself, in Python, in your browser, one operator at a time, until you've assembled an engine that can run a real query end to end. First the **plan tree** itself — what the operators are and how a query becomes a tree of them. Then the **iterator model**, the deceptively simple protocol that drives the whole tree from the root by *pulling* one row at a time. Then the three simplest operators — **scan, filter, project** — built and composed into a runnable query. Then the heart of the chapter: **joining two tables**, the single hardest thing an executor does, built three different ways — nested-loop, hash, and sort-merge — each a different bet about the data. And finally **aggregation and sort** — `GROUP BY` and `ORDER BY` — which forces us to confront the operators that *can't* stream, the ones that have to swallow all their input before they can emit a single row.
+
+One deliberate omission, named up front so you don't go looking for it. This chapter teaches the engine to *run* a plan. It does not teach the engine to *choose* one. The same query can compile to many different trees — scan or index, this join algorithm or that, this table first or that one — with costs that differ by orders of magnitude, and picking the cheap one is a whole engine of its own.<Footnote n={4} /> We'll build every operator the chooser gets to choose among, and we'll keep noticing, scene by scene, that a choice is being made — but *who* chooses, and *how*, is Chapter 07. Here, we learn to run.
+
+By the end you won't have read about a query engine. You'll have written one.
+
+</Section>
+
+<Section
+  id="the-plan-tree"
+  title="The plan tree"
+  quiz={{
+    question: "Here is a plan tree for `SELECT name FROM users WHERE age > 30`, drawn root-at-top: `Project[name]` sits above `Filter[age>30]`, which sits above `SeqScan[users]`. A row produced by `SeqScan` — say `{id: 7, name: 'Mona', age: 41}` — travels through the tree to become part of the answer. In what order do the operators touch it, and what is left of it at the top?",
+    options: [
+      { text: "SeqScan emits the whole row, Filter sees age 41 > 30 and passes it up unchanged, Project drops every column but `name` — so `{name: 'Mona'}` reaches the root. Data flows up the tree, leaf to root; each operator transforms the row on its way past.", correct: true },
+      { text: "Project runs first because it's written first in the SQL, narrowing to `name`; then Filter can't check `age > 30` because the column is gone, so the row is dropped as malformed." },
+      { text: "All three operators run simultaneously on the row and vote; since two of three keep it, the full row `{id: 7, name: 'Mona', age: 41}` reaches the root with all columns intact.", },
+    ],
+  }}
+>
+
+Start with the shape, because once you see the shape everything else is detail. A plan is a **tree**, and the tree has a strict anatomy.
+
+At the bottom, the **leaves**, sit the data sources — the operators that don't transform anything but *produce* rows from storage. A `SeqScan` reads every row of a table, page by page, exactly the heap scan you built in Chapter 04. An `IndexScan` descends a B-tree and produces only the rows matching a key, the other access path from Chapter 04. Leaves are where rows enter the tree; everything above them only ever reshapes rows that a leaf first produced.
+
+Above the leaves, the **interior nodes** transform. A `Filter` takes a stream of rows and emits only the ones passing a predicate. A `Project` takes a stream and reshapes each row, keeping some columns and dropping others. A `Join` takes *two* input streams and emits combined rows. A `Sort` reorders; an `Aggregate` groups and summarizes. Each interior operator has one job, takes rows from its child or children, and hands transformed rows to its parent.
+
+At the very top sits the **root** — the operator whose output *is* the query's answer. Ask the root for rows and you get the final result set, nothing above it.
+
+Now the part that trips everyone up the first time, so look at it directly: **data and control flow in opposite directions.** *Data* flows **up** — a row is born at a leaf, climbs through each operator getting filtered and reshaped, and emerges transformed at the root. But *control* — the act of asking "give me the next row" — flows **down**: you ask the root, the root asks its child, the child asks *its* child, down to a leaf that finally reads something real. The tree is pulled from the top and fed from the bottom. Hold that image; the next section is nothing but the mechanics of it.
+
+<PlanTreeScene client:visible />
+
+Figure 6.1 draws the tree for `SELECT name FROM users WHERE age > 30`. The root is `Project[name]`; below it `Filter[age>30]`; below that the leaf `SeqScan[users]`. Each node is annotated with the one job it does. Toggle between the presets and watch the tree rebuild: add a `JOIN` and a `Join` node appears with *two* children, each its own subtree; swap the predicate onto an indexed column and the `SeqScan` leaf becomes an `IndexScan`, the same `SCAN → SEARCH` flip you watched SQLite make in Chapter 04. The text beside the tree is the `EXPLAIN`-style rendering — the engine's own description of the plan, indentation standing in for tree depth — so you can read the tree two ways at once: as a picture and as the line-by-line plan a real database prints. (That an `age` filter *could* become an index scan instead of a heap scan is a choice the engine makes; *which* it picks, and why, is Chapter 07's whole problem. Here we just note the tree can take either shape.)
+
+The sandbox builds the tree as data — because that's exactly what it is. An operator is a little object with a type, some parameters, and a list of children; a plan is just those objects nested inside each other. We construct the `Project → Filter → SeqScan` tree by hand, then walk it to print itself. No rows move yet; there's no execution at all. The point of this scene is only to make the structure concrete in your hands: a query is a tree, the tree is built out of plain objects, and you can hold the whole thing in a variable and look at it before a single row has been read.
+
+<PythonSandbox client:only="react" initialCode={PLANTREE_SANDBOX} />
+
+That's the whole reveal of this section, and it's worth saying plainly because the rest of the chapter is variations on it: **the tree is the unit of execution.** Not the SQL — the SQL is gone, compiled away, the moment the tree is built. The engine never re-reads your query string; it runs the tree. So everything from here on is about two questions. How do you *run* a tree of operators — what's the protocol that drives it? And what does each *individual* operator do when the protocol asks it for a row? The first question is the next section. The second is the rest of the chapter.
+
+</Section>
+
+<Section
+  id="the-iterator-model"
+  title="The iterator model"
+  quiz={{
+    question: "In the iterator model, you call `next()` on the root `Project`, which calls `next()` on `Filter`, which calls `next()` on `SeqScan`. `SeqScan` returns a row with age 24 — which fails the filter. What does `Filter` do, and how many rows has the root received so far?",
+    options: [
+      { text: "Filter discards the age-24 row and immediately calls `next()` on SeqScan again, looping internally until a row passes the predicate (or the scan is exhausted) before it returns anything. The root still has zero rows — one `next()` at the top can drive several pulls at the bottom.", correct: true },
+      { text: "Filter returns the age-24 row to Project anyway, and Project is responsible for noticing it should have been filtered and dropping it; the root receives one row, then deletes it." },
+      { text: "Filter returns a special 'rejected' sentinel up to the root, which counts as one row received; the next call to `next()` will retry from the top of the tree.", },
+    ],
+  }}
+>
+
+We have a tree. How does running it actually work? The answer is a protocol so simple it's almost anticlimactic, and so general that essentially every database built since 1990 uses some version of it. It's called the **Volcano model**, or just the **iterator model**, from Goetz Graefe's system of that name.<Footnote n={1} />
+
+Every operator — scan, filter, project, join, sort, all of them — implements exactly three methods. `open()`: get ready to produce rows (allocate state, position a cursor, whatever this operator needs). `next()`: produce and return the **next single row**, or signal "I'm done" when there are no more. `close()`: clean up. That's the entire interface. Every operator looks identical from the outside — a thing you can `open`, pull rows from one at a time with `next`, and `close` — regardless of whether inside it's reading a heap, hashing a join, or sorting a million rows. That uniformity is the whole trick: because every operator presents the same three-method face, an operator can have *another operator* as its child and drive it through that same tiny interface, knowing nothing about what it actually is.
+
+So here is how a tree runs. You `open()` the root, which opens its children, which open *their* children, down to the leaves — the whole tree gets ready top-down. Then you call `next()` on the root, and the magic happens: the root needs a row, so it calls `next()` on its child; that child needs a row, so it calls `next()` on *its* child; the call descends all the way to a leaf, which reads one actual row from storage and returns it. The row then travels *back up*: each operator on the way receives the row from its child, does its one job — Filter checks the predicate, Project drops columns — and returns the result to *its* parent. One call to the root's `next()`, one row out the top. Call it again for the next row. Call until it says "done." This is **demand-driven** execution, or **pull-based**: nothing happens until someone at the top pulls, and each pull draws exactly one row up through the entire tree.
+
+<VolcanoScene client:visible />
+
+Figure 6.2 animates a single pull. Press "pull next row" and watch the `next()` call travel *down* the tree to the leaf — control flowing down — then watch a row bubble back *up* through Filter and Project to the root — data flowing up. Crucially, watch what happens when Filter meets a row that fails its predicate: it doesn't return anything yet. It calls `next()` on its child *again*, internally, looping until a row passes — so one pull at the top can trigger several reads at the bottom, the rejected rows never surfacing past the Filter that ate them. The scene makes the demand-driven rhythm visceral: one row in flight at a time, pulled on demand, transformed at each level on its way up.
+
+That "one row in flight at a time" is the property that makes this model worth its fame, and it has a name: **pipelining**. Because each operator handles one row and immediately passes it up, rows stream through the tree without ever piling up. The Filter doesn't build a list of all passing rows and hand it to Project; it hands Project *one* row, Project reshapes it and hands it to the root, the root emits it — and only *then* does anyone pull the next one. At no point does an intermediate result get **materialized** — fully computed and stored — anywhere. A scan over a billion-row table, filtered and projected, uses a tiny, *bounded* amount of memory, because there's only ever one row moving through the pipe, no matter how many rows the scan will ultimately touch. (And remember where that leaf row comes from: each `SeqScan` `next()` ultimately pulls a page through the buffer pool from Chapter 05 — hot pages cheap, cold pages a real disk read. The iterator model is what *those* page reads are in service of.)
+
+<PythonSandbox client:only="react" initialCode={ITERATOR_SANDBOX} />
+
+The sandbox lays down the foundation everything else builds on: an operator base class with `open`/`next`/`close`, a `SeqScan` leaf that walks a list of rows and returns them one at a time (raising `StopIteration`, Python's natural "done" signal, when exhausted), and a driver loop that just calls `next()` over and over until done. It's barely twenty lines and it does nothing visible yet — but it *is* the engine's skeleton. Every operator in the rest of this chapter slots into this exact protocol. Build a new operator, give it `open`/`next`/`close`, and it composes with all the others for free.
+
+One honest caveat, because we'll cash it in two sections from now. Pipelining is the *default*, and it's beautiful, but it isn't *always* possible. Some operators genuinely cannot emit their first row until they've consumed their *last* input row — a `Sort` can't know which row comes first until it's seen them all; a hash join can't probe until it's finished building. Those are **blocking** operators, and they're where the bounded-memory dream breaks. We'll meet them properly in §7. For now, hold the clean version: execution is a recursive pull from the root, one row at a time, streaming.
+
+</Section>
+
+<Section
+  id="scan-filter-project"
+  title="Scan, filter, project"
+  quiz={{
+    question: "You run `Project[name](Filter[age>30](SeqScan[users]))` over a 1,000-row table where 200 rows have age > 30, and count rows touched. Then you swap the `SeqScan` leaf for an `IndexScan` on an `age` index that returns only the matching rows. Roughly how does the count of rows *read from storage* change, and what stays the same?",
+    options: [
+      { text: "The SeqScan version reads all 1,000 rows (the Filter discards 800 above it); the IndexScan version reads only the ~200 matching rows from storage, so the Filter has nothing left to drop. The final answer is identical — the leaf choice changes cost, not correctness.", correct: true },
+      { text: "Both read exactly 1,000 rows from storage, because an index still has to scan the whole table underneath; the IndexScan only saves time by checking the predicate faster.", },
+      { text: "The IndexScan reads 200 rows but returns a different, smaller answer than the SeqScan, because indexes can only see the columns they were built on.", },
+    ],
+  }}
+>
+
+Now make the operators real. We have the protocol; this section fills in the three simplest operators — and that's already enough to run an actual query.
+
+`SeqScan` is the leaf you just sketched: it holds a table, and each `next()` returns the next row until the rows run out. It does no thinking — it's the unconditional "give me everything" source, the Chapter 04 heap scan wearing the iterator interface. `Filter(predicate)` is the first transformer: it holds a child operator and a predicate function, and each `next()` pulls rows from the child and *throws away* the ones that fail the predicate, returning only the first one that passes — looping internally over rejects, exactly the behavior you watched in Figure 6.2. `Project(columns)` is the second transformer: it pulls one row from its child and reshapes it, keeping only the named columns and dropping the rest. Filter changes *which rows* survive; Project changes *which columns* survive. Between them they cover the two axes a `SELECT … WHERE` cares about.
+
+Compose them and you've rebuilt the §1 tree — except now it *runs*. `Project[name](Filter[age>30](SeqScan[users]))` is three operators nested by constructor, each holding the next as its child. Drive the root with the §2 loop and rows stream out: the scan emits every user, the filter keeps the over-thirties, the project narrows each to just the name, and `{name: ...}` rows fall out the top. The same declarative query from §0, now a running procedure you assembled from three small parts.
+
+<PythonSandbox client:only="react" initialCode={SCANFILTERPROJECT_SANDBOX} />
+
+The sandbox builds all three operators on the §2 base and runs that exact composition over a seeded table, printing both the results and a **rows-scanned counter**. Read that counter, because it's where this chapter starts touching cost. With a `SeqScan` leaf, the counter reads the full table size — the filter sits *above* the scan, so every row gets read from storage and *then* most get discarded. The work of reading them already happened.
+
+Then swap the leaf. Re-meet Chapter 04's `IndexScan` — the B-tree seek — as an alternative leaf that returns *only* the rows matching the predicate, straight from the index, without reading the rest of the table at all. Drop it in where `SeqScan` was and run the same query: the answer is byte-for-byte identical, but the rows-scanned counter collapses, because now the predicate is satisfied *at the leaf* instead of by a filter sitting above a full scan. The Filter above it has nothing left to do — every row reaching it already passes.
+
+And there's the thing worth carrying out of this section. You just saw the *same query* produce the *same answer* two ways, one reading a thousand rows and one reading two hundred. Same correctness, wildly different cost — and the only difference was the leaf operator the planner picked. Real queries are exactly this: small operators stacked into a tree, where the *choice* of which operators (seq scan or index scan, filter here or push it down to the leaf) decides whether the query is fast or slow. We keep bumping into that choice. We keep deferring it. Hold the thought one more time — the joins are next, and that's where the choice gets expensive.
+
+</Section>
+
+<Section
+  id="nested-loop-join"
+  title="Nested-loop join"
+  quiz={{
+    question: "A nested-loop join runs over an outer table of 10,000 rows and an inner table of 10,000 rows, scanning the entire inner once per outer row. Roughly how many row-comparisons does it perform — and which single change to the *inner* side collapses that cost the most?",
+    options: [
+      { text: "About 100 million (10,000 × 10,000) — it's O(n·m). Putting an index on the inner's join key turns each inner scan into a cheap B-tree seek (index-nested-loop), so each outer row does ~one lookup instead of 10,000 comparisons.", correct: true },
+      { text: "About 20,000 (10,000 + 10,000) — it compares each row to its counterpart once; sorting the outer side first would make it even faster.", },
+      { text: "About 10,000 — it scans the outer once and the inner is consulted for free via the buffer pool, so only the outer rows count.", },
+    ],
+  }}
+>
+
+Here is the hardest thing an executor does, and the reason this chapter has a hero scene. Everything so far has touched *one* table — scan it, filter it, reshape it. But the relational model's whole point is *relating* tables: `SELECT … FROM orders JOIN customers ON orders.cust_id = customers.id`. A **join** takes two inputs and produces every combined row where the join condition holds — each order stitched to its customer. There are several fundamentally different algorithms for doing it, they have wildly different costs, and choosing among them is one of the most consequential decisions in the engine. We'll build all three. Start with the obvious one.
+
+The obvious one is the **nested-loop join**, and it's obvious because it's exactly how you'd do it by hand. For each row of the **outer** input, scan the *entire* **inner** input looking for matches; emit a combined row for each match; move to the next outer row; repeat. Two loops, one nested in the other — hence the name. It is dead simple, it works for *any* join condition (not just equality — any predicate you can evaluate), and it needs almost no memory. It is also, in its naive form, **O(n·m)**: n outer rows times m inner rows, every pair considered. Ten thousand rows joined to ten thousand rows is a hundred million comparisons. A million by a million is a trillion. For two large tables, naive nested-loop is a catastrophe — the join equivalent of the full scan you suffered through in Chapter 04, and quadratic instead of merely linear.
+
+But — and this is why it survives in every real engine despite the scary exponent — it's the *right* choice in two cases. First, when the inner is **tiny**: if the inner table is ten rows, then "scan the whole inner per outer row" is scanning ten rows, and n·m is just 10n, basically linear. Second, and far more important: when the inner has an **index on the join key.** Then you don't scan the inner at all — for each outer row, you do a single cheap B-tree seek into the inner's index to find the matches directly. This is the **index-nested-loop join**, and it turns the inner loop from an O(m) scan into an O(log m) lookup, collapsing the whole thing to roughly O(n log m). An outer row, one index seek, the matches; next outer row, one seek; and so on. With an index on the inner's join column, the quadratic monster becomes perfectly reasonable. *Without* one, on two big tables, it's ruinous — and that gap is precisely why the next two algorithms exist.
+
+<JoinScene client:visible />
+
+Figure 6.3 is the hero of the chapter, and it's reused across this section and the next two — one visualizer, three algorithms, a mode switch to flip between them on the *same two tables* so you can watch the cost change. In nested-loop mode: two row lists, outer and inner. The outer cursor steps to its first row; the inner cursor sweeps the *entire* inner looking for matches, each match flashing as a combined row is emitted; then the outer cursor advances and the inner sweeps *again from the top*. A **comparisons counter** climbs as you watch, and it climbs like n·m — every outer step costs a full inner sweep. Let it run on the sample tables and read the final count; remember it, because in §5 and §6 you'll run the *same data* through the other two modes and watch that number fall off a cliff.
+
+<PythonSandbox client:only="react" initialCode={NESTEDLOOP_SANDBOX} />
+
+The sandbox builds `NestedLoopJoin(outer, inner, predicate)` as an iterator on the §2 protocol — and here you feel the model pay off. The join is just another operator with `open`/`next`/`close`; its children are two other operators (two scans), and it pulls from them through the same interface as everything else. Its `next()` holds a position in the outer and a position in the inner, advances the inner looking for the next match, and when the inner is exhausted, steps the outer and rewinds the inner. Run it on two small tables, print the combined rows and the comparison count, and the count is n·m, exactly. **The naive join is quadratic — and the cure is structure:** an index on the inner, or, when you don't have one, a smarter algorithm that stops re-scanning. That smarter algorithm is next.
+
+</Section>
+
+<Section
+  id="hash-join"
+  title="Hash join"
+  quiz={{
+    question: "A hash join builds a hash table on the smaller input (say 1,000 rows) keyed by the join column, then scans the larger input (1,000,000 rows) and probes the table once per row. Why is its build phase called *blocking*, and roughly what's the comparison cost versus nested-loop's?",
+    options: [
+      { text: "The build is blocking because the hash table must be fully populated before a single probe can happen — you can't probe a half-built table. Cost drops from O(n·m) ≈ 10^9 to O(n+m) ≈ 1,001,000: each probe is an O(1) hash lookup, not a full inner scan.", correct: true },
+      { text: "The build is blocking because it locks the smaller table against writes; the cost is the same O(n·m) as nested-loop, but it feels faster because hashing is cheap.", },
+      { text: "The build is blocking because it must sort the smaller input first; the cost becomes O(n log n), dominated by that sort.", },
+    ],
+  }}
+>
+
+When there's no index on the inner and both tables are large, nested-loop's n·m is unaffordable. The fix is the single most important operator-level trick in the whole executor, and it's the workhorse that runs the overwhelming majority of real-world joins. It's the **hash join**, and it works for one specific but enormously common case: the **equijoin**, where the condition is equality (`orders.cust_id = customers.id`). Almost every join you'll ever write is an equijoin, which is why this algorithm matters so much.
+
+The idea is to stop re-scanning the inner by building an index *on the fly*, in memory, tuned for exactly this one join. Two phases. **Build:** scan the *smaller* of the two inputs once, and for each row, insert it into a hash table keyed by the join column. (Smaller side, because the hash table lives in memory and you want it small.) **Probe:** scan the *larger* input once, and for each row, hash its join key and look it up in the hash table — an O(1) lookup that hands you all the matching rows from the build side directly, no scanning. Emit the combined rows. That's it. One pass to build, one pass to probe, and the quadratic n·m becomes a linear **O(n + m)**: you touch each row of each table exactly once, plus the constant-time hash work. Ten thousand by ten thousand drops from a hundred million comparisons to about twenty thousand. The cost you pay is **memory** — the hash table has to hold the entire build side — and that's the trade in one line: *spend memory to turn a quadratic join linear.*
+
+But notice the asymmetry between the two phases, because it's the first crack in the pipelining story and it matters for the rest of the chapter. The probe phase is beautifully pipelined — pull a probe row, hash it, look it up, emit matches, done, pull the next. But the build phase is not. You **cannot probe a hash table that isn't finished**, because a probe row might match a build row you haven't inserted yet — you'd miss real matches. So the build side must be **fully consumed**, every last row hashed in, *before* the first probe can happen. The build is a **blocking** operator: it swallows its entire input before the join can emit anything. This is the same blocking idea §2 warned about and §7 will hit head-on — an operator that has to see all of its input before it can produce any output, trading the bounded-memory streaming dream for a hash table held whole in RAM.
+
+<PythonSandbox client:only="react" initialCode={HASHJOIN_SANDBOX} />
+
+Flip Figure 6.3 to **hash mode** and the shape of the algorithm is right there: first the build side streams into a hash table, buckets filling up — and nothing is emitted yet, the join blocked on the build. Then the probe side starts, each row hashing straight to its bucket and matches flashing out. Watch the comparisons counter: it tracks n + m, climbing gently and linearly, while a side-by-side readout shows the nested-loop n·m count from §4 on the *same two tables* towering above it. That gap — linear versus quadratic, on identical data — is the entire reason hash join is the workhorse. The sandbox builds the `HashJoin` operator on the §2 protocol: `open()` runs the whole build phase (consume the inner, fill a dict keyed by join column), then `next()` runs the probe (pull outer rows, look each up, emit matches). Run it next to the §4 nested-loop on the same tables and compare both the answers (identical) and the comparison counts (linear versus quadratic). **Trading memory for time is what turns the quadratic join linear** — and it's why, when you write a join and the engine has the RAM, this is almost always what runs.
+
+</Section>
+
+<Section
+  id="sort-merge-join"
+  title="Sort-merge join"
+  quiz={{
+    question: "Sort-merge join sorts both inputs on the join key, then walks them together in one linear merge pass. Its cost is O(n log n + m log m), dominated by the two sorts — yet engines often prefer it to hash join in one situation. Which?",
+    options: [
+      { text: "When both inputs are *already sorted* on the join key — e.g. they arrive from a clustered index or an upstream sort — the two sorts are free, leaving just the linear merge, and the output comes out sorted (useful if an ORDER BY or another merge join follows).", correct: true },
+      { text: "When the inputs are tiny, because sorting two small lists is always faster than building any hash table at all.", },
+      { text: "When the join condition is inequality like `a.x <> b.y`, because merging naturally handles not-equal conditions that hashing cannot express.", },
+    ],
+  }}
+>
+
+The third way is the **sort-merge join**, and it's the one that wins on a different axis than memory: *order*. Sort both inputs on the join key, then walk them together. Once two lists are sorted on the same key, finding matches is a single linear pass — two cursors advancing in lockstep, like merging two sorted hands of cards. Advance whichever cursor points at the smaller key; when the two keys are equal, you've found a match (emit it, and handle runs of duplicates); when one list runs out, you're done. The merge itself is **O(n + m)**, linear, the same as hash join's probe. The catch is getting there: the inputs have to be sorted first, and sorting is **O(n log n + m log m)** — which dominates the cost. So in the general case, where you have to sort both sides from scratch, sort-merge is *more* expensive than hash join, and hash wins.
+
+So why does it exist, and why does every serious engine implement it? Because of the word *if*. **If the inputs are already sorted**, the sorts are free, and sort-merge collapses to just the linear merge — as cheap as hash join, with no hash table to hold in memory. And inputs are sorted more often than you'd think: a **clustered index** (Chapter 04) stores its table physically in key order, so a scan of it arrives pre-sorted; an upstream operator might have sorted the data already for some other reason. When the order is free, sort-merge is the best join there is. There's a second payoff, too: the *output* of a sort-merge join comes out **sorted** on the join key — so if the query has an `ORDER BY` on that key, or feeds into *another* merge join, you get that ordering for free instead of paying for a sort later. Hash join's output, by contrast, comes out in hash-bucket order, which is to say no useful order at all. And sort-merge handles cases hashing can't: because it works by *comparing* keys rather than hashing them, it extends naturally to range and band joins, where hash join — which can only check equality — simply doesn't apply.
+
+<PythonSandbox client:only="react" initialCode={SORTMERGE_SANDBOX} />
+
+Flip Figure 6.3 to **sort-merge mode** for the third and final view of the same two tables. First both sides visibly sort — rows rearranging into key order — then two cursors march down the sorted lists in lockstep, advancing the one pointing at the smaller key, flashing a match when they align. The comparisons counter shows the linear merge cost; the scene lets you toggle whether the inputs *start* sorted, so you can watch the cost swing from "two sorts plus a merge" down to "just a merge" when the order is already there. Set side by side, the three modes tell the chapter's central story at a glance: nested-loop's n·m, hash's n+m-plus-memory, sort-merge's n+m-if-already-sorted. The sandbox builds `SortMergeJoin` on the §2 protocol — `open()` sorts both inputs, `next()` runs the merge cursors — and runs it beside the other two on the same data.
+
+And now say the thing all three sections have been circling. There is no single best join. Nested-loop wins when the inner is tiny or indexed; hash wins for big equijoins when you have the memory; sort-merge wins when the inputs are already sorted or the output needs to be. **The best join depends entirely on the inputs** — their sizes, whether they're indexed, whether they're sorted, how much memory is free. Three algorithms, three different bets about the data, and the *same query* can use any of them and get the same answer at radically different cost. Something has to look at the actual tables and *choose*. We have now built every option that something gets to choose among. Hold that — it's the cliff §8 walks you up to.
+
+</Section>
+
+<Section
+  id="aggregation-and-sort"
+  title="Aggregation and sort"
+  quiz={{
+    question: "A query is `SELECT category, COUNT(*) FROM products GROUP BY category ORDER BY category`, run over a 10-million-row table streamed through the iterator model. Why can't the `GROUP BY` (hash aggregation) emit its first result row until it has consumed nearly all 10 million input rows?",
+    options: [
+      { text: "A group's COUNT isn't final until the last row that might belong to it has been seen — and any remaining input row could fall into any group. So the aggregate must consume its entire input before any count is trustworthy; it's a blocking operator, unlike the pipelined scan feeding it.", correct: true },
+      { text: "Because ORDER BY sits above it and forbids the aggregate from emitting rows out of order, so the aggregate waits for the sort to pull from it row by row.", },
+      { text: "Because hash aggregation must first scan the table once just to count how many distinct categories exist, then scan a second time to actually compute the counts.", },
+    ],
+  }}
+>
+
+Two operators left, and they share a property that finally forces the issue §2 kept postponing. They are `GROUP BY` and `ORDER BY` — aggregation and sort — and both are **blocking**: neither can emit its first output row until it has consumed its *last* input row.
+
+Take **aggregation** first. `SELECT category, COUNT(*) … GROUP BY category` wants one output row per category, each carrying a count. The standard way to compute it is **hash aggregation**: keep a hash table keyed by the group columns; scan the input once, and for each row, find its group's entry (creating it if new) and update the running aggregate — increment the count, add to the sum, whatever the query asks. Stream all the input through, and the hash table ends up holding the final value for every group. But notice *when* those values become final: a group's count isn't done until you've seen the **last row** that might belong to it — and since any remaining input row could fall into any group, no group's count is trustworthy until *all* the input is consumed. So the aggregate has to swallow its entire input before it can confidently emit even one row. It **blocks.** A pipelined Filter emits a passing row the instant it sees one; a hash aggregate emits *nothing* until the input is exhausted, then releases all the groups at once.
+
+**Sort** — `ORDER BY` — is blocking for an even more obvious reason. To emit rows in sorted order, you have to know which row comes *first*, and you cannot know that until you've seen *every* row — the very last row read might be the smallest, the one that has to come out first. So a sort operator must **materialize** its entire input — buffer every row in memory (or spill to disk if it doesn't fit) — sort the whole collection, and only then start emitting, smallest first. Like the aggregate, it consumes everything before it produces anything.
+
+This is the **blocking-versus-pipelined** distinction, and now it's sharp. A **pipelined** operator — scan, filter, project, the hash-join probe — emits a row as soon as it has one, holds essentially no state, and streams in bounded memory. A **blocking** operator — sort, hash aggregate, the hash-join build side — must consume *all* of its input before emitting *any* output, which means two costs the pipelined ones don't pay: it **stalls the pipeline** (every operator above it waits, idle, until the last input row finally arrives), and it **needs memory** proportional to its input (the whole sort buffer, the whole aggregation table) — and when that memory doesn't fit, it spills to disk, paying the Chapter 05 page-read penalty in bulk.
+
+<AggSortScene client:visible />
+
+Figure 6.4 puts the two behaviors side by side. On one side, a hash-aggregation table fills as rows stream in — groups appearing, counts ticking up, the table growing — with the output held back, nothing emitted, until the input runs dry and then *all* the groups release at once. On the other, a sort buffers every incoming row into a pile, the pile growing with the input, emitting nothing — then, once the last row lands, releasing the rows in order. A "blocked until last row" indicator marks both, in deliberate contrast to the pipelined operators from §2 that emit continuously. The scene makes the stall visible: watch the output stay empty while the input streams, then burst all at once.
+
+<PythonSandbox client:only="react" initialCode={AGGSORT_SANDBOX} />
+
+The sandbox builds both as iterators on the §2 protocol, and the blocking shows up in *where the work lives*. `HashAggregate(group_cols, agg)`: its `open()` consumes the **entire** child, building the group table; only then does `next()` start handing out finished groups. `Sort(keys)`: its `open()` pulls **every** row from the child and sorts them; `next()` then emits from the sorted buffer. Compare that to the §3 Filter, whose `next()` does its work one row at a time and holds nothing — the difference between blocking and pipelined is literally *whether the operator's real work happens in `open()` (all at once, up front) or in `next()` (incrementally, per row).* Run them and watch: the aggregate and sort go quiet while they consume, then produce in a rush.
+
+And that's the practical sting worth carrying out of this section. When you put an `ORDER BY` on a huge result, or `GROUP BY` over a giant table, *that operator* is often the expensive part of the whole query — not because sorting or grouping is slow per row, but because it's **blocking**: it has to materialize everything, it stalls the pipeline behind it, and if it overflows memory it spills to disk. The streaming scan underneath it might be cheap; the blocking operator on top is what makes you wait.
+
+</Section>
+
+<Section
+  id="whats-next"
+  title="What's next"
+>
+
+Look at what the engine can do now. It takes a declarative SQL query, compiles it to a tree of operators, and runs that tree by pulling rows up from the leaves through the iterator protocol — scanning tables, filtering and projecting, joining two inputs three different ways, grouping and sorting. Every operator you'd need to answer a real `SELECT … FROM … WHERE … JOIN … GROUP BY … ORDER BY`, built by hand, composing through one tiny interface. The engine can *run any plan you hand it.*
+
+But sit with the phrase *any plan you hand it*, because that's the whole catch. We hand-built every tree in this chapter. We picked the operators ourselves — chose the seq scan or the index scan, chose nested-loop or hash or sort-merge, chose which table to put on the build side. And every one of those choices, we deferred, with the same promise each time: *something else decides this.* Now collect the debt. A single query — say two tables joined and grouped — has *many* valid plans. Seq scan versus index scan on each table. Three join algorithms. With more than two tables, many possible *orders* to join them in (and the number of orders explodes combinatorially). Each combination is a different tree, every one produces the **identical answer**, and their costs differ not by percentages but by **orders of magnitude** — the difference between a query that returns in a millisecond and the very same query, same result, grinding for an hour. Running the wrong plan can be thousands of times slower than running the right one.
+
+So something has to choose — and choose *fast*, before the query runs, without actually trying them all (there are far too many). It has to *estimate* what each plan would cost without executing it: guess how many rows that filter will pass, how big that join's output will be, whether that index is worth using. That estimating, choosing machine is the **query optimizer**, and it is every bit as deep as the executor you just built.
+
+> We can run any plan now. We have no idea which one to run. That's the optimizer.
+
+That's **Chapter 07**. It's where the `EXPLAIN QUERY PLAN` you met in Chapter 04 — the `SCAN`-versus-`SEARCH` choice we kept pointing at and refusing to explain — finally gets explained: it's the optimizer's verdict, printed. And once a query can be planned *and* run, the last question is what happens when two of them run at once and touch the same rows — concurrency and locking, further on. But first: who chooses the plan, and how. That's next.
+
+</Section>
+
+<Section
+  id="sources"
+  title="Sources & further reading"
+>
+
+Five places to go deeper, each with a line on why it earns the detour. The first three are the load-bearing references for the operators and joins in this chapter; the last two are the wider map.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Goetz Graefe, 1994 — "Volcano — An Extensible and Parallel Query Evaluation System" (IEEE TKDE).</strong> The iterator model of §2 from the source: the <code>open</code>/<code>next</code>/<code>close</code> protocol, demand-driven pulling, and the uniform operator interface that lets any operator drive any other. The paper that named the pattern essentially every executor still uses.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Goetz Graefe, 1993 — "Query Evaluation Techniques for Large Databases" (ACM Computing Surveys).</strong> The encyclopedic survey behind this entire chapter: scans, the three join algorithms, aggregation, sorting, and the blocking-versus-pipelined distinction, all laid out and compared. If you read one thing after this chapter, read this — it's the map.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Leonard Shapiro, 1986 — "Join Processing in Database Systems with Large Main Memories" (ACM TODS).</strong> The classic on the §5/§6 trade: hash join versus sort-merge, when each wins, and how main-memory size tips the balance — the original case for spending memory to turn the quadratic join linear.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Hellerstein, Stonebraker &amp; Hamilton, 2007 — "Architecture of a Database System," §4 (Query Processor).</strong> Where the executor of this chapter sits relative to the optimizer above it (Chapter 07) and the storage engine below it (Chapters 04–05) — the same engine-wide map this book has been drawing chapter by chapter, in one authoritative survey.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Martin Kleppmann, <em>Designing Data-Intensive Applications</em>, Chapter 3.</strong> The same execution material — operators, joins (including the nested-loop/hash/merge trio), and the declarative-query-to-procedure compilation — set one notch up, with an eye to how it plays out across distributed systems. The natural companion read.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
