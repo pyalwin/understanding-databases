@@ -189,7 +189,12 @@ so we don't duplicate work.
 
 ## License
 
-[MIT](./LICENSE) — free to read, run, fork, remix, and republish.
+This project is dual-licensed, because it's two kinds of work in one repo:
+
+- **Code** — the Astro/React/TypeScript app, components, and build config — is licensed under the [MIT License](./LICENSE).
+- **Content** — the book itself: the MDX chapters, prose, and figures — is licensed under [Creative Commons Attribution 4.0 International (CC-BY-4.0)](./LICENSE-CONTENT).
+
+In short: fork the code freely, and read, remix, or republish the writing — just credit *Understanding Databases* and link back.
 
 <div align="center">
 <sub>Built with care. Read at your own pace.</sub>
