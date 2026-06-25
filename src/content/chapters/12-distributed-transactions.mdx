@@ -1,0 +1,282 @@
+---
+title: Distributed Transactions & Two-Phase Commit
+chapterNumber: 12
+summary: "Chapter 11 finished a complete ACID engine — atomic, consistent, isolated, durable, survivable through any single-machine crash. But every word of it assumed one machine: one buffer pool, one log, one disk, one authoritative state to recover. The moment a transaction spans two machines, a new and harder problem appears: how do they agree to both commit or both abort, when either can crash — or the network between them can vanish — at the worst possible instant? This chapter builds the classic answer, two-phase commit, by hand in Python: a coordinator collects votes in a prepare phase, then broadcasts one durable decision in a commit phase, and the whole thing turns out to be a small recovery protocol built directly on Chapter 11's write-ahead log — each node logs prepare and commit and replays on restart, with the coordinator's decision record as the single source of truth. Then meet the flaw that defines the chapter: if the coordinator dies after the participants have prepared but before they hear the verdict, they block — stuck in-doubt, holding locks, unable to commit or abort alone. See why three-phase commit trades that blocking for split-brain under a network partition rather than truly fixing it, and why the real answer is consensus — Paxos and Raft — handed forward to the chapters ahead."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import TwoPhaseCommitScene from '@/components/chapter-12/TwoPhaseCommitScene';
+import BlockingScene from '@/components/chapter-12/BlockingScene';
+import RecoveryScene from '@/components/chapter-12/RecoveryScene';
+import ThreePhaseScene from '@/components/chapter-12/ThreePhaseScene';
+import { NAIVE_SANDBOX, PREPARE_SANDBOX } from '@/components/chapter-12/commit-setup-sandboxes';
+import { LOGGING_SANDBOX, BLOCKING_SANDBOX } from '@/components/chapter-12/commit-logging-sandboxes';
+import { RECOVERY_SANDBOX, THREEPHASE_SANDBOX } from '@/components/chapter-12/commit-recovery-sandboxes';
+
+<ChapterReader chapterId="12-distributed-transactions">
+
+<Section
+  id="premise"
+  title="The premise"
+  quiz={{
+    question: "Chapter 11 built a complete, crash-survivable ACID engine. What single assumption did it rest on that this chapter has to give up, and what new problem does giving it up create?",
+    options: [
+      { text: "It assumed one machine — one log, one disk, one authoritative state to recover. Give that up and a transaction can span several machines, which raises a problem single-node recovery never faced: how do independent nodes agree to all commit or all abort, atomically, when any of them can crash or the network can drop messages mid-decision.", correct: true },
+      { text: "It assumed transactions were short, so the new problem is simply running longer transactions across more disks on the same machine; nothing about agreement or network failure changes.", },
+      { text: "It assumed disks never fail, so the new problem is mirroring every page to a backup disk; once mirrored, multi-machine commit is automatic and needs no protocol.", },
+    ],
+  }}
+>
+
+Chapter 11 ended on a summit. We had built, by hand and from the page up, a single database engine that is atomic, consistent, isolated, and durable — and more than that, *survivable*: it can crash in the middle of anything, even in the middle of its own recovery, and wake up correct. The **D** in ACID was paid in full, not as a slogan but as a mechanism. That is a real achievement, and it is worth holding in mind as we deliberately break it.
+
+Because every line of that achievement assumed **one machine.** One buffer pool. One write-ahead log on one disk. One authoritative state that recovery could reconstruct, because there was exactly one place the truth could live. The log was durable because *the* disk held it; recovery worked because there was a single thread of history to replay. Pull the camera back one notch — put the data on *two* machines instead of one — and that assumption, so quietly load-bearing, falls away, and a problem appears that nothing in this book has yet had to face.<Footnote n={1} />
+
+Here is the problem in one sentence. A transaction now touches data on **two different machines** — move \$100 from an account on machine X to an account on machine Y — and atomicity demands that *either both halves commit or both abort.* Never one without the other. But X and Y are separate computers with separate logs, separate clocks, separate fates. X can commit its half and then, a millisecond later, Y can crash before committing its half — and now \$100 has vanished from X with nothing to show for it on Y, a torn transaction that no single-machine recovery can mend, because neither machine's log knows the other's outcome. Worse, the *network* between them can fail independently of either machine: a message saying "go ahead and commit" can be sent and never arrive, leaving the sender sure the deal is done and the receiver sure it never started.
+
+This is **atomic commit across machines**, and it is genuinely harder than anything in Chapters 1–11, for a reason worth stating plainly: there is no longer a single point that *knows* the answer. On one machine, the log *was* the truth — recovery read it and the question "did this commit?" had a definite answer sitting on disk. Across machines, the truth is *distributed*: it is spread across several logs that must somehow be brought into agreement, and the agreeing has to survive any of them dying, and the network carrying the agreement dying too, at any instant. We need a protocol — a fixed dance of messages and durable log writes — that drives a set of independent machines to a *unanimous, irreversible* decision, and that can pick up correctly from wherever a crash interrupted it.
+
+The classic protocol is **two-phase commit (2PC)**, and its shape is exactly what its name says: a *voting* phase in which one node asks all the others "can you commit?" and collects their promises, and a *decision* phase in which it tallies the votes, makes one binding call, and broadcasts it. We'll build it in Python and watch it carry a transaction across machines atomically (§2–§3). Then we'll see what makes it tick — that 2PC is not a new idea at all but a small **recovery protocol** built directly on Chapter 11's write-ahead log: every node logs its prepare and its commit, and replays on restart, with one node's decision log standing as the single source of truth (§4). Then we'll meet the flaw that defines the chapter — the **blocking problem**, where a coordinator crash at exactly the wrong moment freezes the other nodes mid-decision, holding their locks, unable to move (§5) — see how recovery rescues them when the coordinator returns (§6), why **three-phase commit** trades that blocking for a worse failure under network partitions (§7), and why the real answer is **consensus**, which we hand forward to the chapters ahead (§8). The single engine is done. Now we make several of them agree.
+
+</Section>
+
+<Section
+  id="atomic-commit"
+  title="The atomic-commit problem"
+  quiz={{
+    question: "Why isn't it enough for each machine in a distributed transaction to just commit its own half locally, using the perfectly good single-node recovery from Chapter 11?",
+    options: [
+      { text: "Because the local commits are independent events with no agreement between them: one machine can commit its half and the other can crash (or its network drop) before committing, leaving a torn transaction — half applied, half not — that neither node's recovery can detect or repair, since each log only knows its own outcome.", correct: true },
+      { text: "Because single-node recovery is too slow to run on more than one machine at a time, so the halves must be committed sequentially rather than in parallel.", },
+      { text: "Because each machine uses a different log format, so their commit records are incompatible; if they used the same format, independent local commits would be perfectly atomic.", },
+    ],
+  }}
+>
+
+Before reaching for a protocol, see exactly why the obvious non-protocol fails — because the failure is the whole specification of what a protocol must provide.
+
+The obvious thing, faced with a transaction spanning machine X and machine Y, is to just let each one do what Chapter 11 taught it: X commits its half with its own write-ahead log and its own durable commit record, Y commits its half with its own, and we call it a distributed transaction. Each local commit is individually correct — bulletproof, even, survivable through any single crash. The trouble is that they are *two separate events with nothing tying them together*, and the gap between them is where atomicity dies. X writes its commit record and reports success. Then, in the instant before Y writes its own, Y's power fails — or the network between them drops the "you can commit now" message, or Y's disk hangs. X is committed; Y is not. The transaction is **torn**: the \$100 left X and never arrived at Y, and there is no villain to blame and no log to consult, because each machine did its job perfectly. X's log says "committed" and is telling the truth about X; Y's log says "nothing happened" and is telling the truth about Y. The lie is in the *space between* them, which no single log records.
+
+And — this is the cruel part — *neither machine can even detect the tear*, let alone fix it. X's recovery, on restart, reads its log, sees a clean commit, and moves on; it has no idea Y ever existed, let alone that Y bailed. Y's recovery sees nothing to do. Chapter 11's machinery, which was complete and correct for one machine, is simply *blind* to a failure that lives in the relationship between two machines. The thing that made single-node recovery work — that the log holds the whole truth — is exactly the thing that no longer holds. There is no single log, so there is no single truth, so there is no one to notice the contradiction.
+
+<PythonSandbox client:only="react" initialCode={NAIVE_SANDBOX} />
+
+The sandbox stages this with two plain accounts on two "machines" — no protocol, just independent local commits. Machine X commits the debit; machine Y, committing the credit, hits a snag and aborts its half. Print the result and read the tear directly: the money has left X and not arrived at Y, the books don't balance, and *each machine considers itself perfectly consistent.* Sit with how undetectable it is — there is no single place where the disagreement shows up. The lesson is precise and it dictates everything that follows: independent commits give you no moment at which all parties have agreed on a single outcome. What we need is exactly that — a point in time where everyone has *promised* and then everyone *learns the same verdict.* That is a two-phase shape, and building it is the next section.
+
+</Section>
+
+<Section
+  id="two-phase-commit"
+  title="Two-phase commit"
+  quiz={{
+    question: "In two-phase commit, the coordinator commits the global transaction only if every participant votes YES in the prepare phase. Why must the decision be unanimous, and what does a participant promise when it votes YES?",
+    options: [
+      { text: "Atomicity means all-or-nothing, so a single NO (or no reply) forces a global abort — any participant that can't commit dooms the whole transaction. Voting YES is a binding promise: the participant has done the work, durably logged it, and held its locks, surrendering its right to abort unilaterally; it will commit if and only if the coordinator says to.", correct: true },
+      { text: "Unanimity is just a performance optimization; the coordinator could commit on a majority vote with identical correctness, and a YES vote is a non-binding hint that the participant would prefer to commit.", },
+      { text: "The decision is unanimous only because all participants share one disk; a YES vote means the participant has already committed locally and cannot be rolled back.", },
+    ],
+  }}
+>
+
+The fix for the torn transaction is to insert, before anyone commits anything irrevocably, a round of *promising* — and to put one node in charge of collecting the promises and announcing the verdict. That node is the **coordinator**; the others are **participants** (you'll also see "cohorts" or "resource managers"). The protocol runs in two phases, and the names are the whole idea.<Footnote n={2} />
+
+**Phase 1 — prepare and vote.** The coordinator sends every participant a `PREPARE` message: *can you commit this transaction?* A participant that receives it does the actual work locally — applies the change in its buffer, acquires the locks — but does **not** commit. Instead it force-writes a `prepared` record to its own durable log (carrying, in the Chapter 11 sense, both the redo and undo information for its half) and only then votes **YES**. If for any reason it cannot — a constraint violation, a deadlock, a disk error — it votes **NO** and aborts its half locally right away. The crucial thing a YES vote means: *I promise I can commit this, and I have made that promise durable.* Having voted YES, the participant has surrendered the right to decide its own fate. It is now **prepared** — also called **in-doubt** — and it will do whatever the coordinator tells it, holding its locks until it hears.
+
+**Phase 2 — decide and broadcast.** The coordinator collects the votes. The rule is unanimity: it commits the global transaction **if and only if every participant voted YES.** One NO — or one participant that never answered — and the whole thing aborts, because atomicity is all-or-nothing and a single node that can't commit dooms the lot. Having tallied, the coordinator does the single most important thing in the entire protocol: it **force-writes the decision to its own durable log.** *That log record is the commit point.* The instant it hits disk, the transaction's fate is sealed and irreversible — before it, the transaction could still abort; after it, the transaction *will* commit, no matter who crashes next. Only *then* does the coordinator broadcast `COMMIT` (or `ABORT`) to all the participants, each of whom applies the verdict, writes its own durable `committed` record, releases its locks, and acknowledges.
+
+Notice what the two phases buy that independent commits could not. There is now a single, well-defined **moment of agreement** — the coordinator's durable decision record — at which the outcome becomes a fact, and a single place that *knows* it. Before that moment, any participant voting NO (or vanishing) cleanly aborts everyone, and nothing irrevocable has happened anywhere. After it, the decision is fixed and merely needs *delivering*. The torn-transaction window from §1 is gone: there is no longer a gap in which X is committed and Y is free to disagree, because nobody commits irrevocably until *after* everyone has promised they can.
+
+<TwoPhaseCommitScene client:visible />
+
+Figure 12.1 animates the full protocol: a coordinator and a row of participants, the `PREPARE` messages going out, the YES/NO votes coming back, the coordinator's decision record dropping durably into its log, and the `COMMIT` broadcast landing on each participant in turn. Flip one participant's vote to **NO** and watch the global outcome flip with it — the coordinator tallies a non-unanimous vote and broadcasts `ABORT` to everyone, and crucially, *no node is left in a different state from the others.* That is atomic commit across machines, working: all commit, or all abort, decided by one node at one durable instant.
+
+<PythonSandbox client:only="react" initialCode={PREPARE_SANDBOX} />
+
+The sandbox is the canonical model the rest of the chapter builds on: a `Coordinator` and several `Participant`s, each with its own durable `log`. Run `run()` once with everyone voting YES and read the two phases in the output — the prepares, the votes, the decision record, the broadcast — ending in a clean global commit with matching `committed` records in every log. Then run it again with one participant set to vote NO, and watch unanimity do its work: the coordinator decides `aborted`, nobody commits, no tear. Trace where the *commit point* falls — the line where the coordinator appends its decision — because the entire rest of the chapter turns on what happens when a crash lands just before or just after that one line.
+
+</Section>
+
+<Section
+  id="the-logging"
+  title="2PC is a recovery protocol"
+  quiz={{
+    question: "The chapter claims 2PC is 'a small recovery protocol built on Chapter 11's write-ahead log.' What makes that literally true — what is each node actually doing with its log, and what is the distributed analogue of Chapter 02's 'commit = a durable log record'?",
+    options: [
+      { text: "Every node force-writes each irrevocable step to its durable log before acting on it (a participant logs 'prepared' before voting YES; the coordinator logs the decision before broadcasting), so on restart each node replays its log to recover its 2PC state — exactly ARIES's write-ahead discipline. The distributed commit point is the coordinator's durable decision record, the cross-machine version of ch02's local commit record.", correct: true },
+      { text: "It's a loose analogy only: 2PC sends network messages, which have nothing to do with logging; nodes keep their 2PC state purely in memory and rebuild it by re-asking each other after a crash, never touching a log.", },
+      { text: "It's true because 2PC replaces the write-ahead log entirely with network messages — the messages themselves are durable, so no node needs to write anything to disk.", },
+    ],
+  }}
+>
+
+It is tempting to file two-phase commit under "networking" — messages, votes, broadcasts — but that misses what it actually *is*. Strip away the network and 2PC is a **logging protocol**, the direct descendant of everything Chapter 11 built. Every move that matters is a durable log write, governed by the same write-ahead rule, and recovered by the same replay-on-restart discipline. Seeing this is what turns 2PC from a list of message types into something you can reason about under failure.<Footnote n={3} />
+
+Walk the protocol again, but watch only the *durable writes*, and apply Chapter 11's question to each: *if the machine died one instant after this write, what would recovery do?* When a participant prepares, it force-writes `prepared` to its log **before** voting YES — and that record carries the redo and undo information for its half of the transaction, exactly like an ARIES update record. Why before? The **write-ahead rule**, unchanged from §2 of the last chapter: the durable promise must exist before the promise is communicated, so that if the participant crashes the instant after voting YES, its restart finds the `prepared` record, knows it is in-doubt, re-acquires the locks, and waits for the verdict — instead of forgetting it ever voted. The vote is real only once it is on disk. This is ch02's "commit = the log record is on disk," moved one level up: *prepare* = the prepared record is on disk.
+
+The coordinator's decision is the same idea at the higher stakes. It force-writes `committed` (or `aborted`) to its log **before** broadcasting, and that single durable write **is the commit point of the entire distributed transaction** — the cross-machine analogue of Chapter 02's local commit record, and gated by the very same `fsync` discipline Chapter 10's group commit worked to make cheap. The reason the order is sacred is, again, recovery: if the coordinator crashes the instant after the decision hits disk but before a single broadcast goes out, its restart reads `committed`, and *re-broadcasts* — the transaction commits everywhere, because the decision was made durable before it was acted on. Had it broadcast first and logged second, a crash in between would leave participants committed to a decision the coordinator no longer remembers making: a catastrophe. Write-ahead logging forbids exactly that.
+
+So the whole protocol is a chain of durable records across several logs, each written before its action, each replayable on restart — which means a crashed node doesn't lose its place in the protocol, it *recovers* its place from its log, precisely as a crashed ARIES engine recovers its pages. 2PC inherits Chapter 11's superpower wholesale: **it survives crashes by replaying durable logs.** The new thing — the thing the rest of the chapter is about — is that there are now *several* logs that must agree, and one of them, the coordinator's decision log, is the **source of truth** that breaks every tie. Hold onto that phrase; in two sections it becomes the hero.
+
+<PythonSandbox client:only="react" initialCode={LOGGING_SANDBOX} />
+
+The sandbox runs the protocol and prints nothing but the **durable log writes**, in the order they hit disk across all the nodes: each participant's `prepared` record landing before its YES, the coordinator's decision record landing before the broadcast, each participant's `committed` record landing as it applies the verdict. One line is marked **the commit point** — the coordinator's decision write — and the exercise is to convince yourself that a crash *before* that line aborts the transaction everywhere and a crash *after* it commits the transaction everywhere, with recovery doing the delivering. The log is, once again, the whole story. Next we make a crash land exactly *on* that line — and watch the protocol's one real flaw open up.
+
+</Section>
+
+<Section
+  id="blocking"
+  title="The blocking problem"
+  quiz={{
+    question: "The coordinator crashes after every participant has voted YES (and is holding its locks) but before the coordinator has logged or broadcast any decision. Why are the prepared participants stuck — why can't a participant just decide for itself?",
+    options: [
+      { text: "Because a prepared participant cannot safely choose either outcome alone: committing is unsafe (maybe another participant voted NO and the global decision is abort), and aborting is unsafe (maybe everyone voted YES and the coordinator already decided commit before crashing). It can't tell which world it's in, so it must hold its locks and wait for the coordinator — it blocks. 2PC is not non-blocking.", correct: true },
+      { text: "They aren't stuck — a prepared participant times out and commits, since a YES vote is effectively a local commit; blocking never actually happens in 2PC.", },
+      { text: "They're stuck only because they lost their logs in the crash; if participants logged their votes durably they could each recompute the global decision independently with no coordinator.", },
+    ],
+  }}
+>
+
+Here is the flaw that has kept two-phase commit honest for forty years, and it is worth slowing down for, because it is the hero tension of the whole chapter and the reason later material exists at all.<Footnote n={4} />
+
+Return to the worst instant. Every participant has prepared: each has done its work, force-written its `prepared` record, and voted YES, and is now sitting **in-doubt**, holding its locks, waiting for the verdict. The coordinator has collected the votes and is about to make the call — and at that exact moment, *before it logs a decision and before it broadcasts anything*, the coordinator **crashes.** Now look at the world from a single participant's point of view, because that view is the entire problem. It voted YES. It is holding locks. And it does not know — *cannot* know — what the coordinator decided, because the coordinator decided nothing before it died, or perhaps decided and the decision is trapped in a dead machine's memory. What should the participant do?
+
+It cannot commit. Maybe some *other* participant voted NO, which would make the global decision **abort** — and if this one commits while that one aborts, the transaction is torn, the exact catastrophe 2PC exists to prevent. But it also cannot abort. Maybe everyone voted YES and the coordinator *did* manage to log `committed` in its final instant — and if this one aborts while the others (recovered from that log) commit, the transaction is torn the other way. The participant is trapped between two outcomes, each individually possible, each catastrophic if guessed wrong. It has surrendered the right to abort unilaterally (that was the price of voting YES) and it never had the right to commit unilaterally. So it does the only safe thing: **nothing.** It holds its locks and waits. It **blocks.**
+
+And blocking is not a mild inconvenience — it is a spreading paralysis, because of Chapters 8 and 9. The prepared participant is *holding locks*, and those locks block every other transaction that wants the same rows. Those transactions queue; transactions behind *them* queue; and the stall radiates outward from a single in-doubt node across the whole system, all because one coordinator picked the wrong microsecond to fail. The data isn't corrupted — 2PC keeps its safety promise, nothing is torn — but the system can grind to a halt, indefinitely, until the coordinator comes back. This is the defining property of two-phase commit, and it is usually stated as a flat verdict: **2PC is a blocking protocol.** A single well-timed coordinator failure can freeze participants for as long as it takes that one node to recover. There is no timeout they can safely take, no vote they can safely recount among themselves, that resolves the ambiguity — because the missing information (what did everyone vote? what did the coordinator decide?) genuinely isn't available to them. Only the coordinator knows, and the coordinator is gone.
+
+<BlockingScene client:visible />
+
+Figure 12.2 is the chapter's centerpiece. Step the protocol forward to the in-doubt moment — every participant `prepared`, locks lit, votes cast — and then crash the coordinator and watch the participants freeze: held locks glowing, an in-doubt badge spinning, other transactions piling up behind their locks with nowhere to go. Then drag the crash point along the timeline and see the protocol's character laid bare: crash the coordinator *before* the prepare phase and everyone simply aborts, no harm done; crash it *after* the decision is broadcast and everyone has the verdict, no harm done; but crash it in that one narrow window — after the votes, before the broadcast — and the participants block, the only crash point that does. That single vulnerable interval is two-phase commit's permanent liability, and seeing how *narrow* it is, yet how *total* its effect, is the whole point of the figure.
+
+<PythonSandbox client:only="react" initialCode={BLOCKING_SANDBOX} />
+
+The sandbox drives the protocol to the in-doubt state — all participants `prepared`, all holding locks — and then calls `crash()` on the coordinator *before it logs a decision.* Print each participant's status and locks and confirm the trap directly: every one is `prepared`, every one still holds its locks, and not a single one can be moved to `committed` or `aborted` from the information it has. The coordinator's log has no decision record to consult. The system is safe but stuck — exactly the blocking problem, reproduced in a dozen lines. It stays stuck, holding everything, until the coordinator returns. So the question that decides whether 2PC is usable at all is: *when the coordinator comes back, can it always finish what it started?* That is recovery, and it is the next section.
+
+</Section>
+
+<Section
+  id="recovery"
+  title="Recovering 2PC"
+  quiz={{
+    question: "After the coordinator crashes mid-protocol and restarts, how does it correctly resolve the in-doubt participants, and why is re-running the resolution safe even if it was partly done before the crash?",
+    options: [
+      { text: "It reads its durable decision log: if a 'committed' (or 'aborted') record is there, that is the verdict — re-broadcast it to the prepared participants. If no decision record exists, the coordinator never committed, so the outcome is presumed-abort. Re-broadcasting is idempotent: a participant that already applied the verdict ignores the repeat, so recovery can be re-run after further crashes with no double-apply — exactly the restartability ch11's CLRs gave.", correct: true },
+      { text: "It polls the participants and goes with the majority of their votes; since votes are durable, the majority reconstructs the decision without the coordinator needing a log of its own.", },
+      { text: "It always re-runs the protocol from scratch — re-sending PREPARE and collecting fresh votes — because the original votes are lost when the coordinator crashes.", },
+    ],
+  }}
+>
+
+The blocking problem is real, but it is a problem of *delay*, not of *correctness* — and the thing that guarantees correctness, and ends the delay, is the same thing that has carried us since Chapter 2: the durable log, replayed on restart. When the coordinator comes back, it does not guess and it does not poll. It **reads its decision log**, and the log tells it exactly what to do.<Footnote n={5} />
+
+There are only two cases, and the decision log distinguishes them cleanly. *Case one: a decision record is there.* If the coordinator, in its final instant before crashing, managed to force `committed` (or `aborted`) to its log, then the transaction's fate was sealed before the crash — recall from §4 that the durable decision record *is* the commit point. Recovery simply re-reads it and **re-broadcasts** the verdict to any participant still in-doubt. The prepared participants, who have been blocking this whole time holding their locks, finally receive the answer, apply it, write their own `committed` records, and release their locks. The blockage clears. *Case two: no decision record exists.* If the coordinator crashed *before* logging a decision, then by definition the transaction never committed — there is no commit point on disk anywhere — so recovery resolves it as **abort.** This is the **presumed-abort** convention: the absence of a decision record *means* abort, which is what lets coordinators avoid logging aborts at all (no record → presumed aborted), keeping the common case cheap. Either way, the in-doubt participants get a definitive answer the moment the coordinator returns, and the answer is always consistent with whatever was already decided.
+
+The deep reason this is safe — even if the coordinator crashes *again* during recovery, even if it had already broadcast to some participants before the first crash — is **idempotence**, and it is the same idempotence Chapter 11 built into redo and CLRs. Re-broadcasting a `COMMIT` to a participant that already committed is a harmless no-op: the participant checks its own log, sees it already applied that verdict, and ignores the repeat. So recovery can be interrupted and restarted any number of times; each run re-reads the decision log and re-delivers, and participants that already heard simply don't move. The decision log is the **single source of truth**, and delivery is idempotent, so the protocol converges on one outcome no matter how many crashes pepper the cleanup — exactly the "crash during recovery and still wake up correct" property from the last chapter, now stretched across machines. (A participant can also take the initiative: an in-doubt participant that has waited too long can *ask the coordinator* — "what was the verdict for this transaction?" — and the coordinator answers from its decision log, or presumed-abort if there's no record.)
+
+<RecoveryScene client:visible />
+
+Figure 12.3 picks up exactly where the blocking figure left off: the participants frozen in-doubt, the coordinator dead. Now the coordinator restarts and reads its decision log, and you watch the resolution flow from that one durable fact — if a `committed` record is there, the verdict re-broadcasts and the in-doubt participants light up green, commit, and drop their locks; if the log is empty of any decision, presumed-abort sweeps through instead. A participant is shown *querying* the coordinator for the outcome, and a re-delivered message arriving at an already-committed participant simply bounces off, visibly idempotent. The held locks, finally, release — the spreading paralysis from §5 undone the instant the source of truth speaks.
+
+<PythonSandbox client:only="react" initialCode={RECOVERY_SANDBOX} />
+
+The sandbox completes the story the blocking sandbox started. From the in-doubt crash state it calls `recover()` on the coordinator, in both cases: when a `committed` decision was logged before the crash (re-broadcast → everyone commits, locks release) and when it wasn't (presumed-abort → everyone aborts cleanly). Then it does the thing that proves correctness under repeated failure: it runs `recover()` **a second time** and asserts the result is identical — the participants that already applied the verdict don't budge, the re-delivery is a no-op, no value is double-applied. That assertion is the §6 payoff in one line: a distributed commit that blocks under a coordinator crash but *always finishes correctly* once the coordinator returns. Which raises the obvious question — can we keep the correctness but lose the *blocking*? That hope is the next section, and so is its disappointment.
+
+</Section>
+
+<Section
+  id="three-phase-commit"
+  title="Three-phase commit & its limits"
+  quiz={{
+    question: "Three-phase commit adds a 'pre-commit' phase so a timed-out participant can terminate on its own and avoid blocking when the coordinator crashes. Why is 3PC still not a real fix for atomic commit?",
+    options: [
+      { text: "Because it removes blocking only under crashes, not under network partitions. If the network splits the participants into groups that can't communicate, each group runs its own timeout-based termination and can reach a different verdict — one side commits, the other aborts: split-brain. 3PC trades blocking for a safety violation under partition, so it's not a true solution; consensus is.", correct: true },
+      { text: "Because the extra phase makes it too slow to be practical; it is perfectly safe under all failures, just not fast enough, so everyone uses 2PC instead purely for performance.", },
+      { text: "Because 3PC requires a shared clock across all nodes, and real machines can't synchronize clocks at all, so the pre-commit phase never completes.", },
+    ],
+  }}
+>
+
+If 2PC's flaw is that a crashed coordinator leaves participants unable to *safely* decide alone, the natural fix is to give them enough information to decide alone — and that is exactly what **three-phase commit** attempts. It is worth understanding, partly because it sometimes appears in interviews and old papers, but mostly because *why it fails* is the lesson that points at the real answer.<Footnote n={6} />
+
+3PC splits 2PC's decision phase in two, inserting a **pre-commit** phase between the vote and the commit. The flow becomes: phase 1, the coordinator collects votes as before; phase 2, if all voted YES, it broadcasts `PRE-COMMIT` — a message that means "everyone has agreed; we are *going* to commit, get ready" — and waits for acknowledgments; phase 3, only then does it broadcast the final `COMMIT`. The point of the middle phase is to plant a piece of knowledge in every participant *before* anyone commits: once a participant has received `PRE-COMMIT`, it knows the vote was unanimous, so it knows the only possible outcome is commit. Now give the participants **timeouts**: a participant left hanging by a silent coordinator can terminate *on its own*. If it had reached the pre-commit state, it knows the decision was commit, so it commits; if it timed out still merely prepared (no pre-commit), it knows the decision can't have been commit yet, so it safely aborts. Under a pure **coordinator crash**, this genuinely works: the participants can talk among themselves, agree on whether anyone reached pre-commit, and drive the transaction to a consistent finish *without* the coordinator. No blocking. It looks like a win.
+
+It is not a win, and the reason is the failure mode 2PC's designers were quietly conservative about and 3PC is not: the **network partition.** Suppose the network splits the participants into two groups that can each still function but cannot talk to each other — a switch fails, a cable is cut, a data center link drops. Group A contains participants that reached pre-commit; group B contains participants that did not. The coordinator is gone (or on the wrong side of the split). Now each group's timeout fires, and each group does the locally-correct thing: group A, seeing pre-commit, **commits**; group B, seeing no pre-commit, **aborts.** Both followed the protocol. Both were "safe" by their own lights. And the transaction is **torn** — committed on one side of the partition, aborted on the other — which is the precise catastrophe atomic commit exists to prevent. This is **split-brain**, and it is *worse* than blocking: blocking is a liveness failure (the system stalls but stays correct), while split-brain is a **safety** failure (the system stays live but goes wrong). 3PC didn't fix the problem; it moved the damage from the tolerable kind to the intolerable kind. Under the assumption that the network can partition — which, on real hardware, it absolutely can — three-phase commit is simply unsafe.
+
+<ThreePhaseScene client:visible />
+
+Figure 12.4 shows both halves of this. First the good news: the `PRE-COMMIT` phase goes out, the coordinator crashes, and the participants — each knowing the outcome from the pre-commit knowledge — terminate among themselves with no blocking, a clean commit. Then the bad news: replay it, but drop a **partition** line down the middle of the cluster. The two groups, now unable to talk, each run their timeout termination and reach *different* verdicts — one side commits green, the other aborts red, the split-brain lit up as the safety violation it is. The figure is the visual argument of the whole section: you cannot, with phases and timeouts alone, get a non-blocking *and* always-safe atomic commit when the network itself can fail.
+
+<PythonSandbox client:only="react" initialCode={THREEPHASE_SANDBOX} />
+
+The sandbox makes the failure concrete. It runs the 3PC flow and shows a timed-out participant terminating correctly when the coordinator merely crashes — no blocking, the apparent win. Then it introduces a partition: it splits the participants into two groups that can't see each other, fires each group's timeout, and prints the divergent outcomes — one group `committed`, the other `aborted`, the books torn across the split. The closing lesson is stated plainly in the output: 3PC removes blocking under crashes but is unsafe under partitions, so it is not the answer. The real answer requires nodes to *agree* even when some are unreachable and messages are lost — and that is a different and deeper problem, with a name.
+
+</Section>
+
+<Section
+  id="consensus"
+  title="Toward consensus"
+  quiz={{
+    question: "2PC blocks under coordinator failure; 3PC goes split-brain under partition. What property does a genuine solution need, and what class of algorithm provides it?",
+    options: [
+      { text: "It needs agreement that stays both safe and live despite crashes, lost messages, and partitions — typically by replacing the single coordinator (a single point of failure) with a quorum of nodes that vote, so a majority can make progress while a minority is unreachable and the two sides can never both win. That is the consensus problem, solved by algorithms like Paxos and Raft.", correct: true },
+      { text: "It needs a faster network so partitions never last long enough to matter; with low-enough latency, 2PC's blocking window closes on its own and no new algorithm is required.", },
+      { text: "It needs every node to keep a full copy of every other node's log so any single node can unilaterally decide the outcome for the whole cluster without voting.", },
+    ],
+  }}
+>
+
+Put the two failures side by side and they point, together, at exactly what was missing. Two-phase commit is **safe but can block**: a coordinator crash at the wrong moment stalls the system, but nothing is ever torn. Three-phase commit is **non-blocking but can go unsafe**: it keeps moving under a crash, but a partition splits it into contradiction. Neither gives us what we actually want, which is *both at once* — a protocol that stays correct **and** keeps making progress through crashes, lost messages, and partitions alike. The reason both fall short traces to one structural weakness: the **single coordinator.** It is a single point of failure and a single point of knowledge, and when it dies or is cut off, the rest of the system is left either blocked (2PC, waiting for the one node that knows) or guessing (3PC, deciding without it). The fix has to attack *that* — the dependence on one node to hold the truth.
+
+The idea, which we will only name here and develop properly later, is to replace the lone coordinator with a **quorum**: a group of nodes that vote on the outcome, where any decision requires a *majority.* The magic of a majority is that two different majorities of the same group must overlap in at least one node — so two conflicting decisions can never both achieve a quorum, which makes split-brain *impossible* rather than merely unlikely. And because only a majority is needed, the system can keep making progress while a *minority* of nodes is crashed or partitioned away: the reachable majority decides, the unreachable minority catches up when it returns. Safe under partition (no two majorities disagree) and live under failure (a majority can still act) — exactly the pair 2PC and 3PC could not hold together. This is the **consensus problem**, and the algorithms that solve it — **Paxos**, and its more teachable descendant **Raft** — are among the most important results in distributed systems.<Footnote n={7} />
+
+We are deliberately stopping at the threshold. Consensus is a large subject — leader election, log replication across the quorum, handling stragglers and rejoining nodes, the subtle proofs that majorities really do prevent disagreement — and it deserves its own treatment rather than a hurried paragraph here. What matters for *this* chapter is the shape of the staircase we have climbed: independent commits tear (§2); two-phase commit makes them atomic but can block on a coordinator crash (§3–§6); three-phase commit dodges the blocking but tears again under a partition (§7); and the way out of the dilemma is to stop trusting any single node and let a majority carry the truth (§8). 2PC has not been wasted effort, either — it is still everywhere, often used *underneath* a consensus layer (commit the transaction with 2PC, but make the coordinator itself a fault-tolerant replicated service so it can't be the thing that blocks). The protocols compose. But the foundational move — agreement that survives partition — belongs to consensus, and that is where the distributed half of this book is headed.
+
+</Section>
+
+<Section id="whats-next" title="What's next">
+
+Take stock of the turn this chapter made. For eleven chapters the database lived on one machine, and the hardest question was surviving a crash. This chapter put the data on *several* machines and found a harder question waiting: not "can one node recover?" but "can independent nodes *agree*?" Two-phase commit was our first real answer — and it turned out to be Chapter 11 in distributed clothing, a recovery protocol of durable logs and replay, with one node's decision log standing as the source of truth. We earned its strength (atomic commit across machines) and we earned its scar (blocking, when the coordinator dies at the worst instant), and we saw that the scar isn't a bug to be patched away with a third phase — three-phase commit only trades it for something worse — but a signpost toward consensus, where a majority replaces the fragile single coordinator.
+
+But notice what 2PC quietly assumed, and what it leaves undone. It assumed that each participant *has* the data it's committing — that the rows live *somewhere*, on some node, durably. It said nothing about keeping a **second copy** of that data on another machine, so that if a node is destroyed — not crashed-and-recoverable, but *gone*, disk and all — the data isn't lost with it. 2PC coordinates a write across nodes that each hold *different* parts of the data; it does nothing to guard against *losing* any one part. The moment you want a system that survives a machine being destroyed, or that can serve reads from more than one place, you need the *same* data living on multiple machines, kept continuously in step.
+
+> Two-phase commit makes many machines agree to commit together. But what keeps a *second copy* of the data alive and current, so that when one machine is gone for good, another can carry on without it?
+
+That is **replication**, and the log returns one last time to make it work — exactly as Chapter 2 hinted and Chapter 11 set up. The stream of write-ahead log records that recovers a database after a crash is *also*, shipped across the network to another machine and replayed there, precisely what keeps a second copy current. **Chapter 13 — replication** takes the log you have now learned to recover from, distribute, and agree on, and ships it to a replica to keep it alive: the leader's log streamed to followers, the lag and failover and split-brain that come with it, and the consensus ideas from §8 returning to decide *which* copy is allowed to lead. The cluster has learned to agree on a commit. Next it learns to keep more than one copy of the truth.
+
+</Section>
+
+<Section id="sources" title="Sources & further reading">
+
+Seven places to go deeper, each with a line on why it earns the detour. The first two are the protocol and its blocking proof; the rest carry you through where 2PC sits in a real system, why three-phase commit disappoints, and the consensus algorithms that are the genuine way out.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, ch. 9 (Consistency &amp; Consensus), with ch. 8 (Distributed Trouble).</strong> The best modern framing of exactly this chapter's arc: why atomic commit across machines is hard, how two-phase commit works and where it blocks, and the bridge from there to consensus. Chapter 8's catalogue of distributed failures — partial failures, unreliable networks, unreliable clocks — is the ground truth that makes a single-machine intuition dangerous and a protocol necessary.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>Gray &amp; Reuter, 1992 — "Transaction Processing: Concepts and Techniques," the chapters on the two-phase commit protocol and transaction managers.</strong> The encyclopedic treatment of 2PC: coordinator and participant state machines, the log records each writes, presumed-abort and presumed-commit optimizations, and the recovery procedures. When this chapter compressed a detail — what exactly is logged, how an in-doubt participant interrogates the coordinator — this is the unabridged source, by the people who built the first systems to do it.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Mohan, Lindsay &amp; Obermarck, 1986 — "Transaction Management in the R* Distributed Database Management System" (ACM TODS).</strong> The paper that made 2PC practical, from the same Mohan behind ARIES — which is why §4's claim that "2PC is a recovery protocol built on the write-ahead log" is not a metaphor but a lineage. It introduces presumed-abort and presumed-commit, the optimizations that cut the logging and message cost of the common case, and shows the protocol as an extension of single-node recovery.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Skeen &amp; Stonebraker, 1983 — "A Formal Model of Crash Recovery in a Distributed System" (IEEE TSE).</strong> The result behind §5: a formal proof that any commit protocol resilient to the failures 2PC faces is necessarily blocking, and the analysis that motivated non-blocking alternatives. Read it to understand that 2PC's blocking is not an implementation flaw but a fundamental property of the problem as 2PC poses it — which is exactly why the way out (§8) has to change the problem.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Bernstein, Hadzilacos &amp; Goodman, 1987 — "Concurrency Control and Recovery in Database Systems," ch. 7 (Distributed Recovery).</strong> The rigorous textbook account of §6: coordinator and participant recovery, the termination and cooperative-termination protocols an in-doubt participant runs, and how the decision log resolves every case. The classic that ties distributed recovery back to the concurrency-control and logging foundations this book built in Chapters 8–11.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Skeen, 1981 — "Nonblocking Commit Protocols" (ACM SIGMOD).</strong> The origin of three-phase commit and the source for §7: the extra pre-commit phase, the timeout-based termination that makes it non-blocking under crashes, and — read carefully — the synchronous-network assumptions it needs, whose failure under real partitions is exactly why 3PC is rarely deployed. The honest primary source for both the appeal and the limits of 3PC.
+  </Footnote>
+  <Footnote n={7}>
+    <strong>Lamport, 1998 — "The Part-Time Parliament" (Paxos), and Ongaro &amp; Ousterhout, 2014 — "In Search of an Understandable Consensus Algorithm" (Raft).</strong> The destination §8 points to. Paxos is the foundational consensus algorithm — majority quorums that make split-brain impossible while a minority is down — and Raft is its deliberately teachable reformulation, with leader election and log replication spelled out. Together they are how real systems get the safe-and-live agreement that 2PC and 3PC could not hold together, and the natural next read once replication (Chapter 13) raises the question of who gets to lead.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>

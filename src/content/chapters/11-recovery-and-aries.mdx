@@ -247,7 +247,7 @@ But every word of it assumed **one machine.** One buffer pool, one log, one disk
 
 > One machine can crash and recover. But what if it's gone for good? How do two machines agree to commit together when either can fail mid-handshake — and how does a second copy stay in step with the first?
 
-That's where the book goes next: out of the single engine and into the cluster. **Chapter 13 — replication** takes the log you just learned to recover from and ships it across the network to keep copies alive, with all the new trouble that distance and partial failure bring. The ACID machine is built. Now we make more than one of them, and make them agree.
+That's where the book goes next: out of the single engine and into the cluster. **Chapter 12 — distributed transactions** takes the first problem head-on — how two machines agree to *both* commit or *both* abort when either can fail mid-handshake — and builds two-phase commit, which turns out (fittingly) to be a small recovery protocol layered on exactly the write-ahead log you just learned to replay. Then **Chapter 13 — replication** takes that same log and ships it across the network to keep a second copy alive, with all the new trouble that distance and partial failure bring. The ACID machine is built. Now we make more than one of them, and make them agree.
 
 </Section>
 
