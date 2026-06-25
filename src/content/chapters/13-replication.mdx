@@ -1,0 +1,252 @@
+---
+title: Replication
+chapterNumber: 13
+summary: "Chapter 11 built a database that survives a crash; Chapter 12 made two of them commit together. This chapter answers the question that was waiting underneath both: what if a machine doesn't just crash and restart, but is gone for good? The answer is the oldest idea in this book, turned outward — the write-ahead log. Shipping a leader's log records to a second machine and replaying them there IS replication, and replaying a record on a replica is exactly Chapter 11's redo, only continuous and remote: the replica is perpetually recovering from a stream that never ends. Build a working leader/follower cluster by hand in Python and meet the chapter's hero tension — synchronous replication, where a commit waits for the replica to acknowledge and so loses nothing, against asynchronous replication, where the commit returns the instant the leader's log is durable and so risks losing the tail of the log when the leader dies. From that one dial fall replication lag and the read-your-writes anomaly, failover and the lost tail and split-brain, and finally quorum — the majority-acknowledgement idea where consensus systems live, and where this book hands you off to the next."
+status: draft
+---
+
+import ChapterReader from '@/components/scene/ChapterReader.astro';
+import Section from '@/components/scene/Section.astro';
+import { Callout, Footnote } from '@/components/scene';
+import { PythonSandbox } from '@/components/PythonSandbox';
+import LogShippingScene from '@/components/chapter-13/LogShippingScene';
+import SyncAsyncScene from '@/components/chapter-13/SyncAsyncScene';
+import LagScene from '@/components/chapter-13/LagScene';
+import FailoverScene from '@/components/chapter-13/FailoverScene';
+import { STREAM_SANDBOX, SYNC_ASYNC_SANDBOX } from '@/components/chapter-13/replication-setup-sandboxes';
+import { LAG_SANDBOX } from '@/components/chapter-13/replication-lag-sandboxes';
+import { FAILOVER_SANDBOX, QUORUM_SANDBOX } from '@/components/chapter-13/failover-sandboxes';
+
+<ChapterReader chapterId="13-replication">
+
+<Section
+  id="the-log-returns"
+  title="The log returns"
+  quiz={{
+    question: "This book has built a write-ahead log five times over — for commit, for group commit, for recovery. This chapter claims replication is the same log in a new role. What, precisely, is replication at its core?",
+    options: [
+      { text: "It is shipping the leader's stream of log records to a second machine and replaying them there. Replaying a record on the replica is exactly Chapter 11's redo — apply the change, advance a cursor — only continuous and remote: the replica is perpetually recovering from a log that never ends, and so holds a live second copy of the database.", correct: true },
+      { text: "It is copying the data files (the pages on disk) byte-for-byte to a second machine on a fixed schedule, bypassing the log entirely, because the log is a single-machine structure with no role once there is more than one node.", },
+      { text: "It is running the same SQL statements independently on two machines and trusting that identical inputs produce identical states, with the log used only to detect when the two have drifted apart.", },
+    ],
+  }}
+>
+
+Two chapters ago we finished building a database engine. With recovery in place, the **D** in ACID was paid in full — not as a slogan but as a machine that survives the worst case, the crash that interrupts its own cleanup. Atomicity, consistency, isolation, durability: all of it, built by hand from the page up, correct under concurrency and survivable under failure. Chapter 12 then taught two such engines to commit a single transaction *together*, across the network, with two-phase commit. But every line of all of it has quietly leaned on an assumption we are now going to remove, and removing it is the whole of this chapter and the doorway out of this book.
+
+The assumption is that **the machine comes back.** Recovery, for all its subtlety, recovers *the* node — it reads *the* durable log off *the* disk and reconstructs *the* one authoritative state. The entire algorithm presumes that after the lights flicker, the same machine boots, with the same disk, holding the same log. But machines do not always come back. A disk fails for good; a data centre floods; a server is decommissioned with the only copy of the log still on it. And a machine that is *fine* can still be unreachable — a network partition makes a perfectly healthy node look exactly like a dead one to everyone trying to use it. The moment you care about a database surviving the *loss* of a machine, and not merely its reboot, you need a **second copy** living on a **second machine**, kept current with the first. That is replication, and it is the last great idea this book will build.<Footnote n={1} />
+
+Here is the beautiful part, the one Chapter 02 promised in a single sentence and we are finally cashing: you already have the machine that does it. Back in Chapter 02, after building the write-ahead log, we wrote that "this shape — one durable append, then a separate apply step — is also why every modern database can be its own replication system… shipping log records to a second machine is, for free, a way to keep a second copy of the database in sync." The log is an ordered, append-only, replayable record of *every change the database has ever made.* Recovery already proved that replaying it reconstructs the state. So take that same stream of records — the very stream a crashed node replays to heal itself — and instead of (or as well as) writing it to local disk, **send it over the network to a second machine, and have that machine replay it.** The second machine, applying record after record, builds and maintains a perfect copy of the first. Replaying a log record on a replica is not *like* Chapter 11's redo; it *is* Chapter 11's redo, with one difference: it never stops. A crashed node redoes a finite log once and then opens for business. A replica redoes an infinite log forever, always a little behind the leader, **perpetually recovering** from a stream that never ends. The replica is a node frozen one instant after the crash, mid-recovery, for its entire life.
+
+That single idea — log shipping as continuous remote redo — is the spine of this chapter, and almost everything else is a consequence of *one timing question* hanging off it: when the leader writes a record, does it wait for the replica to confirm before telling the client "committed," or not? We'll build the cluster (§2), watch the stream apply idempotently on the follower (§3), and then meet the hero of the chapter — **synchronous versus asynchronous replication** (§4), the dial that trades a commit's speed against how much you can lose. From that dial fall **replication lag** and the read-your-writes anomaly (§5), **failover** and the lost tail and split-brain (§6), and finally **quorum** (§7), the majority-acknowledgement idea where the field — Raft, Paxos, the whole of consensus — actually lives, and where this book will hand you off. The log got us durability. Now watch it get us a second machine.
+
+</Section>
+
+<Section
+  id="leader-and-follower"
+  title="Leader & follower"
+  quiz={{
+    question: "In the standard leader/follower (primary/replica) design, all writes go to a single leader and followers only replay the leader's log. Why funnel every write through one node instead of letting any replica accept writes?",
+    options: [
+      { text: "Because the log is an ordered sequence, and a single leader gives every change one unambiguous position in that order — the followers just replay it and are guaranteed to reach the identical state. Allow two nodes to accept writes independently and they can order the same two changes differently, so their copies diverge with no built-in way to reconcile.", correct: true },
+      { text: "Because a follower is physically incapable of accepting a write — replicas run on read-only hardware that cannot perform disk writes, which is what makes them cheaper to operate than the leader.", },
+      { text: "Because routing all writes to one node is required to keep the followers' clocks synchronized, and without a single leader's clock the replicas could not timestamp their log records.", },
+    ],
+  }}
+>
+
+The simplest and by far the most common shape of replication is **leader-based**, also called primary/replica or (in older, blunter language) master/slave. One node is the **leader**: it alone accepts writes. Every other node is a **follower**, and a follower does exactly one thing — it receives the leader's log stream and replays it, applying each change to its own local copy of the data. Followers never accept writes from clients directly; they are read-only mirrors, always reconstructing the leader's state from the leader's log. Reads can go to any node — the leader or any follower — which is one of the two big payoffs. The other is survival: if the leader dies, a follower already holds (almost) all of its data and can be promoted to take over.
+
+Why a *single* leader? Because of the property the log has had since Chapter 02 and that Chapter 11's recovery leaned on completely: it imposes a **total order** on every change. Each record gets a position — an LSN — and "the state of the database" is precisely "the result of applying every record in LSN order." A single leader is what *manufactures* that one order. It serializes all the concurrent transactions hitting it (using the locking and MVCC machinery of Chapters 08 and 09) into one linear log, and then that log is the script every follower follows. Hand the same script to ten followers and they all reach the same state, deterministically, because redo is deterministic. The instant you let *two* nodes accept writes independently, you have two scripts — two logs — and nothing decides whose change to key `x` came "first." The copies diverge, and now you need conflict resolution, which is a genuinely hard problem we'll only gesture at. Leader-based replication sidesteps the whole mess by keeping the writer single and the order unambiguous. (Multi-leader and leaderless systems exist and are powerful, but they buy their flexibility by taking on exactly the divergence problem the single leader avoids.)
+
+So picture the topology. The leader runs a normal database engine — buffer pool, WAL, the works — and as it commits transactions it produces log records. A replication connection streams those records, in order, to each follower. Each follower has its own durable log and its own data files, and a little loop that reads the next record off the stream, appends it to its local log, and applies it. That loop is the heart of the matter and it should look deeply familiar: **append the record, then redo it.** It is the recovery loop of Chapter 11 with the "read from local disk" swapped for "read from the network," running not once at startup but continuously, for the life of the replica. The follower is a database that is *always recovering* — it has never finished, because the leader keeps writing. This is why people say a replica "follows" or "tails" the log: it is forever a few records behind, chasing a leader that is always a step ahead.
+
+<LogShippingScene client:visible />
+
+Figure 13.1 makes the stream concrete. Records march out of the leader's log, across the wire, into the follower, which replays each one into its own copy of the data — its `applied` cursor advancing record by record as its state climbs to match the leader's. Watch the follower stay a little behind and then catch up; watch it apply redo it did not generate. The leader writes history; the follower re-lives it. Nothing here is new machinery — it is Chapter 11's redo with a network in the middle — which is exactly the point. The next section pins down the one detail that makes shipping a log over an unreliable network actually safe: what happens when a record arrives that the follower has already seen.
+
+</Section>
+
+<Section
+  id="the-replication-stream"
+  title="The replication stream"
+  quiz={{
+    question: "A follower tracks `applied`, the highest LSN it has applied to its data, and applies an incoming record only if its LSN is greater than `applied`. The leader, after a dropped connection, re-sends a batch of records the follower already has. What happens, and what property does this give the stream?",
+    options: [
+      { text: "The follower skips every record whose LSN is ≤ `applied` — they're already reflected in its state — and resumes applying only the genuinely new ones. Comparing the record's LSN to `applied` makes apply idempotent (the same check the pageLSN gave redo in Chapter 11), so re-delivery is harmless: a replica can reconnect, replay from a safe earlier point, and converge without ever applying a change twice.", correct: true },
+      { text: "The follower applies the re-sent records again, doubling their effect, so the leader must guarantee exactly-once delivery over the network — which it does by having the follower acknowledge every individual record before the next is sent.", },
+      { text: "The follower detects the duplicates as corruption and tears down its copy of the database, then requests a full fresh snapshot from the leader, because any repeated LSN means the two logs have irreconcilably diverged.", },
+    ],
+  }}
+>
+
+A replication stream runs over a network, and networks are treacherous in a specific way: they drop connections, deliver late, and force retries. A follower's link to the leader will break — a transient blip, a follower restart, a leader failover — and when it reconnects it must resume the stream. The question that resume raises is the one that decides whether replication is robust or fragile: *if a record is delivered twice, what happens?* If the answer is "the change is applied twice," replication is a house of cards, because over a long-lived connection redelivery is not an edge case, it is a certainty. The answer has to be "applying a record the follower already has is a harmless no-op," and we already built exactly the mechanism that guarantees it.<Footnote n={2} />
+
+In Chapter 11, every page carried a **pageLSN** — the LSN of the most recent change applied to it — and redo skipped any logged change whose LSN the page already reflected (`pageLSN >= lsn`). That single comparison made redo **idempotent**: replay the log twice and every already-applied change is silently skipped the second time, which is precisely what let recovery survive a crash *during* recovery. Replication needs the same property for the same reason, just at a coarser grain. Each follower tracks one number, call it `applied`: the highest LSN it has applied to its data. When a record arrives, the follower compares: if the record's LSN is less than or equal to `applied`, it has already been applied — skip it. Only a record beyond `applied` actually moves the state forward, and applying it bumps `applied` to its LSN. It is the pageLSN check globalized from one page to the whole node, and it makes the stream **idempotent**: re-delivering records the follower already has changes nothing.
+
+This is what makes resumption trivial and safe. When a follower reconnects, it tells the leader the last LSN it has (`applied`), and the leader streams from there — or, just as well, streams from a little *earlier* and lets the follower's idempotent skip absorb the overlap. There is no need for the leader and follower to agree on exactly-once delivery, which over a real network is expensive and fiddly to get right; *at-least-once* delivery plus an idempotent apply gives you the same outcome for free. The follower can crash, restart, and re-request the stream; the leader can fail over to a new leader that re-sends a slightly different cut of the log; a flaky link can replay a batch three times — and the follower's copy converges to the leader's regardless, never double-applying a single change. The same idempotence trick that let one machine recover from a crash now lets a second machine track the first across an unreliable wire. One idea, paying off twice.
+
+<PythonSandbox client:only="react" initialCode={STREAM_SANDBOX} />
+
+The sandbox builds the bare `Node`: a durable log, a data dictionary, and an `applied` cursor, with `apply` doing the idempotent LSN check and `ingest` (append-then-apply) being the follower's loop. Run a few changes on a leader node, ship the *same* records into a follower with `ingest`, and print both — identical state, identical `applied`. Then re-ship a record the follower already has and watch `apply` return `False` and change nothing: the redundant delivery is absorbed. That no-op is the whole guarantee of robust streaming in one line. With a stream we can trust, the only question left is the one that defines the chapter: when does the leader wait for it?
+
+</Section>
+
+<Section
+  id="synchronous-vs-asynchronous"
+  title="Synchronous vs asynchronous"
+  quiz={{
+    question: "When the leader commits a write, it can either wait for a follower to acknowledge the record before telling the client 'committed' (synchronous) or report 'committed' as soon as the record is durable on the leader (asynchronous). What is the fundamental trade-off between the two?",
+    options: [
+      { text: "Synchronous loses no data on a leader failure — every acknowledged commit is already on a follower — but each commit's latency now includes a network round trip, and if the follower stalls the leader stalls with it. Asynchronous makes commits fast and keeps the leader independent of the follower, but a window of committed-but-unreplicated records lives only on the leader, and a crash there loses that tail.", correct: true },
+      { text: "Synchronous is always strictly better: it is both faster and safer, because waiting for the follower lets the leader batch its writes; asynchronous is a legacy mode kept only for backward compatibility with older replicas.", },
+      { text: "The two are identical in durability and differ only in CPU cost on the follower; synchronous uses more follower CPU to apply records immediately, while asynchronous lets the follower apply them lazily when idle.", },
+    ],
+  }}
+>
+
+Everything so far has been setup; here is the decision the whole chapter turns on. When the leader commits a transaction, it has made the record durable in its own log (Chapter 02's `fsync`, the **D** we worked so hard for). It is about to tell the client "committed." The question is whether, before it does, it **waits for a follower to acknowledge** that the follower has the record too. The two answers are **synchronous** and **asynchronous** replication, and they are not two features — they are the two ends of a single dial that trades durability against latency, and you cannot have both ends at once.<Footnote n={3} />
+
+**Synchronous replication.** The leader sends the record to a follower and *waits* for the follower to reply "I have it, it's durable on my disk too" before reporting the commit to the client. The win is enormous and precise: at the instant any client is told "committed," that commit exists on **at least two machines.** If the leader is struck by lightning one microsecond later, the data is safe — the follower has it, and can be promoted with zero loss. Synchronous replication is how you make the promise "we will never lose an acknowledged write" actually true in the face of a machine dying. But read what the leader had to do to make that promise: it blocked the commit on a network round trip to the follower. Every commit now costs the leader's local `fsync` *plus* the time to reach the follower, have it persist, and hear back. Worse, the leader's fate is now **coupled** to the follower's: if the follower is slow, the leader's commits are slow; if the follower is *down or unreachable*, the leader **cannot commit at all** — it sits there waiting for an acknowledgement that will never come. Naïve synchronous replication trades availability for durability so steeply that a single sick follower can freeze the entire database. (Real systems soften this with timeouts and with multiple followers, which is the road to quorum in §7 — but the raw trade is stark.)
+
+**Asynchronous replication.** The leader makes the record durable locally, *immediately* reports the commit to the client, and ships the record to followers **in the background**, whenever it can. Commits are fast — they cost only the local `fsync`, exactly as in a single-node database — and the leader is completely decoupled from its followers: a slow follower, a down follower, a follower on the far side of the planet, none of it touches commit latency. This is what most systems run by default, because it keeps the leader fast and available. But look at what it gives up. Between the moment the leader reports "committed" and the moment a follower actually receives that record, the record exists on **exactly one machine — the leader.** That window is small in good times and yawning in bad ones, and if the leader dies *while records are in that window*, those commits — already acknowledged to clients as durable — are **gone.** The followers never saw them; promoting a follower silently loses them. Asynchronous replication keeps the fast, independent commit of a single node, and pays for it with a tail of the log that a leader failure can amputate. We'll watch exactly that amputation in §6.
+
+There is the dial, in one sentence each: **synchronous** never loses an acknowledged write but makes commit wait on the network and ties the leader's availability to the follower's; **asynchronous** keeps commit fast and the leader independent, but a leader crash can lose the unreplicated tail. Notice it is the same shape of trade as Chapter 10's `force` versus `no-force`, now stretched across the network — pay at commit time for safety, or commit cheaply and risk a loss on failure. There is no setting that is fast, available, *and* lossless; you choose where on the dial to sit, often per-transaction, and you choose it knowing what each end costs.
+
+<SyncAsyncScene client:visible />
+
+Figure 13.2 is the dial made visible. Flip between synchronous and asynchronous and follow a single commit. In synchronous, the commit ack waits for the round trip — the record reaches the follower, the follower persists, the acknowledgement comes back, *then* the client hears "durable on two nodes" — and you can see the latency the safety costs. In asynchronous, the client hears "committed" the instant the leader's log is durable, while the record sits in a queue not yet on the follower — fast, but watch the un-replicated tail grow, every record in it a write that lives on only one machine. The commit clock and the size of the vulnerable tail move opposite each other: that inversion is the entire chapter.
+
+<PythonSandbox client:only="react" initialCode={SYNC_ASYNC_SANDBOX} />
+
+The sandbox runs the *same* writes through a `Cluster` twice — once `mode='sync'`, once `mode='async'` — and prints each commit's verdict. Under sync, every commit reports "durable on 2 nodes": the follower already has it. Under async, every commit reports "durable on leader only," and afterward you can print the `queue` — the records acknowledged to the client but still sitting only on the leader, waiting to ship. That queue is the lost tail in waiting. Sit with how it is the same list of writes, equally "committed" to the client, but resting on one machine instead of two. The rest of the chapter is the consequences of that queue: the lag it creates while the leader lives (§5), and the loss it causes when the leader dies (§6).
+
+</Section>
+
+<Section
+  id="replication-lag"
+  title="Replication lag"
+  quiz={{
+    question: "Under asynchronous replication a follower trails the leader by some replication lag. An application writes a value to the leader, then — to spread read load — reads it back from a follower a moment later. What can go wrong, and what is the anomaly called?",
+    options: [
+      { text: "The follower may not have applied that write yet (its `applied` cursor is behind the leader's), so the read returns a stale value or no value at all — the user fails to see their own just-made change. This is the read-your-writes anomaly, a direct consequence of lag, and it's why a session that just wrote often must read from the leader (or a sufficiently caught-up follower) for a while.", correct: true },
+      { text: "Nothing can go wrong: a follower always applies a write before acknowledging it to the leader, so by the time the write returns to the client the follower is guaranteed current. Lag affects only analytics queries, never reads of your own writes.", },
+      { text: "The read corrupts the follower, because reading a key whose latest write hasn't arrived causes the follower to fabricate a value and persist it, permanently diverging from the leader.", },
+    ],
+  }}
+>
+
+Asynchronous replication buys fast commits with a follower that is always a little behind, and "a little behind" has a precise measure: **replication lag**, the gap between what the leader has applied and what the follower has applied. In our model it is `leader.applied - follower.applied` — the number of committed records the leader holds that the follower has not yet caught up to. In a healthy async system lag is small, milliseconds, a handful of records. But it is never *zero* (that is the definition of asynchronous), and under load — a write spike, a slow follower, a congested network, a follower replaying a giant transaction — it can balloon to seconds or, in pathological cases, minutes. Lag is not a bug; it is the standing cost of decoupling the commit from the replica. The trouble is that lag is **user-visible**, and the way it shows up surprises people.<Footnote n={4} />
+
+The whole appeal of having followers is that you can send **reads** to them — scale read throughput by spreading queries across replicas, keep the leader for writes. But the moment a read can land on a follower, it can land on a follower that *hasn't caught up*, and the read sees a stale version of the database — a version from a few records, or a few seconds, ago. Usually that is fine: a slightly old view of someone else's data is harmless. It becomes a real, confusing bug in one specific case — when a user reads *their own recent write.* You post a comment; the write goes to the leader and returns success; the page reloads and the read goes to a follower that hasn't received your comment yet; your comment is *missing.* You changed your profile photo and it reverts before your eyes. You made a payment and the balance still shows the old number. The user did the thing, was told it worked, and then watched it vanish — not because anything failed, but because their write and their read hit two machines at different points in the same stream. This is the **read-your-writes anomaly** (sometimes "read-after-write consistency" when you guarantee its *absence*), and it is the most common way replication lag bites in practice.
+
+The fixes are all variations on "don't let a just-written session read from a stale follower." Route reads that *might* depend on the user's own recent writes to the **leader** (which is always current) for a window after they write. Or have the client remember the LSN of its last write and only read from a follower whose `applied` has reached or passed it — read your writes by *waiting* for the replica to catch up to you. Or track time and route to the leader for, say, a minute after any write. These are application-level and middleware-level patterns, not database internals, but they exist *because* of the mechanism this chapter built: lag is the direct, unavoidable shadow of asynchronous replication, and read-your-writes is its sharpest edge. Choose async for fast commits and you have signed up to manage lag; there is no free version.
+
+<LagScene client:visible />
+
+Figure 13.3 shows the stream with the follower trailing and a lag meter reading `leader.applied - follower.applied`. A client writes a key to the leader and immediately reads it back from the follower — and the read comes up empty or stale, the write that just "succeeded" not yet arrived. Advance the stream and watch lag fall to zero and the read snap to correct. The anomaly is not damage; it is *timing*, and the figure lets you watch the timing.
+
+<PythonSandbox client:only="react" initialCode={LAG_SANDBOX} />
+
+The sandbox runs an async `Cluster`, writes several keys, and — *before* draining the queue — prints `cluster.lag()` and the follower's data: the follower is stale, and reading a just-written key off it returns the old value or nothing, the read-your-writes anomaly reproduced in a few lines. Then it `drain()`s the queue, lag falls to zero, and the follower's reads become correct. The lesson to carry into the next section: while the leader lives, lag is merely a *consistency* nuisance the application can route around. The danger is what that same un-drained queue means when the leader does *not* live — when it dies with the tail still only on it.
+
+</Section>
+
+<Section
+  id="failover"
+  title="Failover"
+  quiz={{
+    question: "An asynchronously-replicated leader dies. A follower is promoted to be the new leader. Some transactions had been committed (and acknowledged to clients) on the old leader but not yet replicated. What is lost, and what new danger appears if the old leader later comes back?",
+    options: [
+      { text: "Those un-replicated records — the 'lost tail' — are gone: the promoted follower never received them, so writes the clients were told had succeeded silently vanish. And if the old leader revives still believing it is leader, you have split-brain: two nodes accepting writes and diverging. It's contained by fencing the old leader off (epochs/leases) and requiring a majority to elect a leader.", correct: true },
+      { text: "Nothing is lost, because promotion replays the old leader's disk into the follower before accepting writes; the only danger is a brief read-only period while the new leader warms its buffer pool.", },
+      { text: "Only uncommitted transactions are lost (which is correct behavior), and split-brain cannot occur because a promoted follower automatically powers off the old leader over the network before accepting any writes.", },
+    ],
+  }}
+>
+
+A follower exists for this moment: the leader is gone — crashed hard, disk dead, unreachable behind a partition — and the cluster must keep serving. **Failover** is the act of promoting a follower to be the new leader. Done well it is the payoff of the whole architecture: the database survives the loss of a machine, something no amount of single-node recovery could ever give you. Done badly it is the source of the most vicious bugs in distributed data, because failover is where every soft assumption about timing and reachability gets stress-tested at once. There are three hard parts, and they are hard in increasing order.<Footnote n={5} />
+
+The first is the **lost tail**, and it is the direct, inevitable consequence of asynchronous replication from §4. When the async leader died, some records were in the queue — committed, *acknowledged to clients as durable*, but not yet shipped to any follower. They lived on exactly one machine, and that machine is the one that just died. The promoted follower never saw them. So they are **gone** — not "rolled back," not "recoverable," but silently, permanently lost, even though the clients were told they succeeded. This is the bill for async's fast commits, and it comes due precisely at failover. Synchronous replication does not have a lost tail: every acknowledged commit was already on a follower before the client heard "committed," so the promoted follower has all of them, and failover loses nothing. That is the entire difference between the two modes, made concrete at the one moment it matters — sync's price was paid continuously, in commit latency; async's price is paid all at once, in the tail, here. You chose, back in §4, which bill you'd rather get.
+
+The second hard part is **split-brain**, and it is worse than loss because it is *divergence.* Suppose the old leader did not actually die — it was just unreachable for a while (a network partition, a long garbage-collection pause, an overloaded NIC). The cluster, seeing it gone, promoted a follower. Now the old leader comes back, still believing it is the leader, still accepting writes — and so does the new one. **Two leaders.** They take different writes, produce different logs, and the single authoritative order that made everything work (§2) is shattered into two contradictory histories with no way to merge them. Split-brain is the nightmare of leader-based replication, and you cannot prevent it merely by being careful, because a partition is indistinguishable from a death. You prevent it structurally: **fence** the old leader off so that even if it revives it cannot do damage — give leadership a numbered term or *epoch*, have storage and clients reject writes stamped with a stale epoch, lease leadership for a bounded time so a partitioned leader's authority simply *expires.* The old leader wakes up, discovers its epoch is stale, and steps down. Fencing is how you make "there is one leader" survive a network that lies to you.
+
+The third hard part is **deciding to fail over at all** — automatically, correctly, without a human. Is the leader really dead, or just slow? Declare it dead too eagerly and you trigger an unnecessary, possibly split-brain-inducing failover over a transient blip; wait too long and the database is down while you dither. And *who* decides, when the deciders are themselves nodes that can fail or be partitioned? This is no longer a replication question; it is a **consensus** question — getting a set of unreliable nodes to *agree* on a single fact ("the leader is dead, X is the new leader") despite some of them being down or unreachable. That question is the doorway to §7 and out of this book.
+
+<FailoverScene client:visible />
+
+Figure 13.4 stages the moment. The leader dies; a follower is promoted. Under **asynchronous** replication, watch the un-acked tail — the records still only on the old leader — simply evaporate as the follower takes over, with a flag for the split-brain risk if the old leader revives. Flip to **synchronous** and run it again: every committed record was already on the follower, so promotion loses nothing. Toggle the dial and watch the lost tail appear and disappear at the instant of promotion. The figure is §4's trade-off cashed at the worst possible moment — which is the only moment that ever really tests it.
+
+<PythonSandbox client:only="react" initialCode={FAILOVER_SANDBOX} />
+
+The sandbox makes the loss undeniable. In async mode it writes, leaves the queue un-drained (the tail still only on the leader), then calls `fail_leader()` — which returns the **lost tail**, the exact records the promoted follower is missing, writes the clients believed were safe. In sync mode it runs the same writes, but each was on the follower at commit time, so `fail_leader()` returns an empty list: nothing lost. The sandbox asserts both. One algorithm, one workload, and the durability of your acknowledged commits hinges entirely on which way the dial was set. The next section asks the obvious question: must we really choose between sync's stalls and async's lost tail? The answer is *no* — and it is where the whole field has gone.
+
+</Section>
+
+<Section
+  id="quorum-and-consensus"
+  title="Quorum & consensus"
+  quiz={{
+    question: "Quorum replication has the leader wait for a majority of nodes (not one, not all) to acknowledge a record before committing it. Why does requiring a majority give you both no lost tail and no split-brain, without waiting for the slowest node?",
+    options: [
+      { text: "Because any two majorities of the same set must overlap in at least one node. So a committed record (held by a majority) is guaranteed to be on any node that a new leader election (also requiring a majority) could choose — the new leader always has it. And two leaders can't be elected at once, since both would need a majority and the majorities would have to share a node that won't vote twice. Meanwhile the leader waits only for the fastest majority, not the slowest straggler.", correct: true },
+      { text: "Because a majority is always exactly two nodes regardless of cluster size, so the leader only ever waits for two acknowledgements, which is faster than synchronous (one) by parallelism and safer than asynchronous (zero) by redundancy.", },
+      { text: "Because requiring a majority lets the leader skip the durable log entirely — once the majority has the record in memory it is safe, so quorum systems achieve their speed by never calling fsync on any node.", },
+    ],
+  }}
+>
+
+Synchronous replication is safe but stalls on any sick follower; asynchronous is fast but can lose its tail. Stated that starkly, it sounds like an unavoidable choice — and for a single leader and a single follower, it is. The way out is to stop waiting for *one specific* follower and start waiting for *a majority of several.* This is **quorum replication**, and it is the idea underneath every modern consensus system — Raft, Paxos, the replication layers of systems like etcd, ZooKeeper, CockroachDB, and Spanner.<Footnote n={6} />
+
+The mechanism is a small change to the commit path. Instead of waiting for *the* follower (sync) or *no* follower (async), the leader sends the record to all nodes and waits for a **majority** to acknowledge — in a cluster of three, that means the leader plus one follower, two out of three; in a cluster of five, three out of five. The instant a majority has the record durably, the commit is safe and the leader acks the client. It does not wait for the last, slowest node — only for the majority to form — so one straggling or dead follower does not stall commits the way naïve sync did. And because it waited for more than one machine, there is no lost tail the way async had: every committed record is on a majority.
+
+Why a *majority* specifically, and not some other count? Because of one quietly perfect property: **any two majorities of the same set overlap in at least one node.** Two majorities cannot be disjoint — together they would be more than the whole cluster. Lean on that and both of §6's nightmares dissolve at once. **No lost tail:** a committed record sits on a majority, and electing a new leader *also* requires a majority to agree — and those two majorities must share a node, so whatever node becomes the new leader, the committed record is guaranteed to be reachable; the new leader has it. **No split-brain:** to become leader you must win a majority of votes, and two would-be leaders cannot both win a majority at the same time, because the two vote-majorities would have to share a node, and that node will not vote for both. The overlap that guarantees the committed data survives is the *same* overlap that guarantees only one leader can exist. One combinatorial fact — majorities intersect — buys durability *and* uniqueness, which is why it sits at the foundation of the field. Quorum gives you, near enough, async's speed (wait for the fast majority, not the slow straggler) with sync's safety (no acknowledged write is ever lost), and it tolerates the loss of a minority of nodes without losing data or stalling.
+
+What it does *not* do is come for free, and this is the honest edge where this book stops. Running a real quorum system means electing leaders by majority vote, detecting failures without falsely accusing slow nodes, fencing stale leaders by epoch, replicating the log so that majorities always agree on its order even as nodes come and go — in short, **consensus**, the problem of getting unreliable machines to agree on a sequence of values despite failures and partitions. Consensus is a deep, subtle, much-studied problem, and its careful solutions — Paxos, and the more teachable Raft — are entire subjects of their own. We have built the *replication* that consensus coordinates: a leader, a log shipped to followers, redo applied remotely, commits gated on acknowledgements. The step from "wait for a majority" to "a correct, live, partition-tolerant consensus protocol" is the threshold of distributed systems proper.
+
+<PythonSandbox client:only="react" initialCode={QUORUM_SANDBOX} />
+
+The sandbox runs a three-node `Cluster` in `mode='quorum'`. Each write commits as soon as a *majority* — two of the three — has acknowledged, without waiting for the third; print the commit verdicts and see "durable on 2 nodes (majority)." Then `fail_leader()`: because a majority held every committed record and the new leader is drawn from that majority, the promoted node **has the data** — no lost tail, and no waiting on the slowest node to get there. It is async's speed and sync's safety in one run, which is exactly why the field chose it. Beyond this sandbox lies the machinery — vote counting, terms, election timeouts — that makes it correct under every failure, and that machinery is where the next book begins.
+
+</Section>
+
+<Section id="whats-next" title="What's next">
+
+Stop and notice what just happened to the log. It started, in Chapter 02, as a single durable append that made one transaction survive a power cut. It became, in Chapter 10, the database itself — sequential, append-only, the fast path for every write. It became, in Chapter 11, the script that recovers a crashed machine by replaying its own history. And here, in the end, it became the thread that ties *two* machines together: ship that same stream to a second node, replay it there, and you have a living second copy of the database. The log is the one structure that has been present in every chapter since the second, and it turned out to be the answer to durability, to write performance, to crash recovery, *and* to replication. If this book has a single protagonist, it is the write-ahead log.
+
+And look at the arc it carried us along. We began with one engine and built it up from the page (Chapter 04) through the buffer pool (Chapter 05), execution and optimization (Chapters 06–07), concurrency control (Chapters 08–09), fast durable commit (Chapter 10), and crash recovery (Chapter 11) — a complete, correct, single-node ACID database, built by hand. Chapter 12 made two of them commit together. This chapter made one of them survive the death of its machine. We have walked the whole distance from "a file on a disk" to "a cluster that outlives its hardware," and at every step the new capability was an old idea — the log, redo, idempotence, the LSN — turned to face a new direction.
+
+But this last chapter has also, deliberately, walked us up to a threshold and stopped. Synchronous and asynchronous replication, lag and read-your-writes, failover and the lost tail and split-brain, quorum and majorities — these are the *replication* layer, the part that ships and applies the log. The part we kept gesturing past — *who decides the leader is dead, how do unreliable nodes agree on one history, how does a majority stay a majority as machines come and go* — is **consensus**, and it is a whole field. Raft and Paxos, leader election and log compaction in a distributed setting, the precise statements and proofs of what is and isn't possible when the network can partition — these are the next things to learn, and they build directly on everything here. So are the questions that sit alongside them: how to **shard** data across many machines (not just copy it), how to run **distributed transactions** over those shards, what the **CAP theorem** really says about the choice between consistency and availability under a partition, and how systems like Spanner, CockroachDB, and Cassandra make their particular bargains.
+
+This book set out to demystify the single database engine — to show that every word in "ACID" is a mechanism you can build, and that the hard parts are hard for reasons you can see and reproduce by hand. That engine is built, and then made plural, and then made survivable. The cluster is where the story goes next, and the log — durable, ordered, replayable, and now *shipped* — is the gift this book hands forward to it.
+
+</Section>
+
+<Section id="sources" title="Sources & further reading">
+
+Six places to go deeper, each with a line on why it earns the detour. The first is the modern map of the whole territory; the next two ground leader-based log shipping in real systems and the design space; the last three carry you across the threshold this chapter stops at — into consensus, into the failure modes that break it in practice, and into the theorem that frames the choice.
+
+<ol style={{ listStyle: 'none', padding: 0 }}>
+  <Footnote n={1}>
+    <strong>Kleppmann, <em>Designing Data-Intensive Applications</em>, ch. 5 (Replication).</strong> The clearest modern treatment of everything in this chapter: leader-based replication, synchronous vs asynchronous, replication lag and the read-your-writes / monotonic-reads anomalies, failover and its hazards, and the broader landscape of multi-leader and leaderless systems this chapter only nods at. If you read one thing after this, read this — it is the same story at more breadth, with production war stories attached.
+  </Footnote>
+  <Footnote n={2}>
+    <strong>PostgreSQL documentation — "Write-Ahead Logging (WAL)" and "High Availability, Load Balancing, and Replication."</strong> Replication as a real engine actually ships it: streaming WAL records to standbys, the LSN as the unit of progress, synchronous vs asynchronous standbys and <code>synchronous_commit</code> levels, hot standbys serving reads, and replication slots that let a follower resume the stream after a disconnect. The direct, implemented version of §2–§5 — and proof that "the replica replays the leader's WAL" is not a metaphor but literally how it works.
+  </Footnote>
+  <Footnote n={3}>
+    <strong>Gray &amp; Reuter, 1992 — "Transaction Processing: Concepts and Techniques," the chapters on replication and the standby/primary model.</strong> The encyclopedic, foundational treatment of replicated transactional state: the primary/backup architecture, the durability-vs-latency trade of acknowledging a commit before vs after the backup has it, and how all of it rests on the logging machinery of the earlier chapters. When this chapter compressed the commit-path trade-off into a dial, this is the unabridged version.
+  </Footnote>
+  <Footnote n={4}>
+    <strong>Bailis &amp; Ghodsi, 2013 — "Eventual Consistency Today: Limitations, Extensions, and Beyond" (ACM Queue); and the PBS / "Probabilistically Bounded Staleness" work.</strong> A rigorous look at exactly what §5 is about: how stale a replica read can be, how that staleness is distributed in real systems, and what consistency guarantees (read-your-writes, monotonic reads, bounded staleness) sit between "strong" and "eventual." The quantitative companion to this chapter's qualitative account of lag.
+  </Footnote>
+  <Footnote n={5}>
+    <strong>Ongaro &amp; Ousterhout, 2014 — "In Search of an Understandable Consensus Algorithm (Raft)" (USENIX ATC).</strong> The threshold §6 and §7 walk up to, crossed. Raft is consensus designed to be taught: leader election by majority vote, log replication with a majority commit rule, terms/epochs that fence stale leaders, and safety arguments you can actually follow. Read it to turn "wait for a majority, elect one leader, never split-brain" from a hand-wave into a protocol — it builds directly on the replicated log you just constructed.
+  </Footnote>
+  <Footnote n={6}>
+    <strong>Gilbert &amp; Lynch, 2002 — "Brewer's Conjecture and the Feasibility of Consistent, Available, Partition-Tolerant Web Services" (the CAP theorem); with Kyle Kingsbury's <em>Jepsen</em> analyses as the empirical counterpart.</strong> CAP states the fundamental limit this whole chapter danced around: under a network partition you cannot have both consistency and availability, so synchronous/quorum systems sacrifice availability and asynchronous ones sacrifice consistency — the dial is not an implementation detail but a law. Jepsen then shows how real databases actually behave (and misbehave) under partitions and failover, which is the unsentimental reality check on every guarantee in §6–§7.
+  </Footnote>
+</ol>
+
+</Section>
+
+</ChapterReader>
