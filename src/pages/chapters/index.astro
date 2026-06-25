@@ -7,7 +7,10 @@ const chapters = (await getCollection('chapters'))
   .sort((a, b) => a.data.chapterNumber - b.data.chapterNumber);
 ---
 
-<Layout title="Chapters">
+<Layout
+  title="Chapters"
+  description="The full table of contents for Understanding Databases — every chapter, from why databases are special through transactions, isolation, storage, query execution, MVCC, and crash recovery with ARIES."
+>
   <section class="prose-column px-6 pt-12 pb-24">
     <p class="font-sans text-xs tracking-[0.18em] uppercase text-[color:var(--color-accent)] mb-2">
       Contents

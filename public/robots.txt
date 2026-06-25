@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://db.pyalwin.workers.dev/sitemap-index.xml

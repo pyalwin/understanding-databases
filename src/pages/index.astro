@@ -7,7 +7,6 @@ const chapters = (await getCollection('chapters'))
   .map((c) => ({
     num: c.data.chapterNumber,
     title: c.data.title,
-    summary: c.data.summary,
     href: `/chapters/${c.id}`,
   }))
   .sort((a, b) => a.num - b.num);
@@ -66,7 +65,6 @@ const firstReadable = chapters[0];
                 <span class="toc-leader" aria-hidden="true"></span>
                 <span class="toc-arrow" aria-hidden="true">&rarr;</span>
               </a>
-              <p class="toc-summary">{c.summary}</p>
             </li>
           );
         })}
@@ -210,7 +208,7 @@ const firstReadable = chapters[0];
   }
 
   .toc-row {
-    padding: 1.15rem 0 1.1rem;
+    padding: 0.85rem 0;
     border-top: 1px solid var(--color-rule);
   }
   .toc-row:last-child { border-bottom: 1px solid var(--color-rule); }
@@ -260,16 +258,6 @@ const firstReadable = chapters[0];
   .toc-link:hover .toc-arrow {
     color: var(--color-accent);
     transform: translateX(3px);
-  }
-
-  .toc-summary {
-    font-family: var(--font-serif);
-    font-style: italic;
-    font-size: 0.92rem;
-    line-height: 1.5;
-    color: var(--color-ink-soft);
-    margin: 0.4rem 0 0 2.45rem;
-    max-width: 42ch;
   }
 
   .colophon {

@@ -19,9 +19,18 @@ const prev = idx > 0 ? ordered[idx - 1] : null;
 const next = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
 const label = (c: (typeof ordered)[number]) =>
   `Chapter ${String(c.data.chapterNumber).padStart(2, '0')}`;
+
+// Meta descriptions read best around ~155 chars; trim the long summary at a word boundary.
+function metaDescription(text: string, max = 155): string {
+  const clean = text.replace(/\s+/g, ' ').trim();
+  if (clean.length <= max) return clean;
+  const cut = clean.slice(0, max);
+  return cut.slice(0, cut.lastIndexOf(' ')).replace(/[.,;:—-]$/, '') + '…';
+}
+const description = metaDescription(entry.data.summary);
 ---
 
-<Layout title={entry.data.title}>
+<Layout title={entry.data.title} description={description} type="article">
   <article class="page-column px-6 pt-12 pb-24">
     <header class="prose-column mb-10 sm:mb-12 text-center">
       <p class="font-sans text-[11px] sm:text-xs tracking-[0.18em] uppercase text-[color:var(--color-accent)] mb-3">
