@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" font-family="Georgia, 'Times New Roman', serif">
+  <rect width="1200" height="630" fill="#faf7f0" />
+  <rect x="24" y="24" width="1152" height="582" rx="18" fill="none" stroke="#d6d3c4" stroke-width="2" />
+
+  <!-- database mark -->
+  <g transform="translate(96, 232) scale(1.35)" fill="none" stroke="#b45309" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <ellipse cx="64" cy="40" rx="30" ry="11" />
+    <path d="M34 40 V88" />
+    <path d="M94 40 V88" />
+    <path d="M34 88 C 38 96, 50 99, 64 99 C 78 99, 90 96, 94 88" />
+    <path d="M34 56 C 38 64, 50 67, 64 67 C 78 67, 90 64, 94 56" />
+    <path d="M34 72 C 38 80, 50 83, 64 83 C 78 83, 90 80, 94 72" />
+  </g>
+
+  <text x="320" y="200" font-size="34" letter-spacing="6" fill="#57534e">A BOOK IN PROGRESS · 2026</text>
+  <text x="318" y="320" font-size="104" font-weight="700" fill="#1c1917">Understanding</text>
+  <text x="318" y="432" font-size="104" font-weight="700" font-style="italic" fill="#b45309">Databases</text>
+  <text x="320" y="510" font-size="36" fill="#57534e">How databases actually work — read it, run it, break it.</text>
+</svg>
