@@ -2,7 +2,6 @@
 title: MVCC & Snapshot Isolation
 chapterNumber: 9
 summary: "Chapter 08 bought correctness with waiting — a reader blocks a writer and a writer blocks a reader, because there is only one copy of each row to fight over. This chapter refuses that trade. A write never overwrites; it appends a new version of the row beside the old one, each version tagged with the transaction that created it (xmin) and the one that deleted it (xmax). A reader takes a snapshot of which transactions had committed when it began and sees exactly the versions that were live at that instant — so readers never wait for writers and never take a lock to read. Build the whole machine by hand in Python: the versioned store, the visibility rule, snapshot isolation and first-committer-wins, the one anomaly snapshots get wrong (write skew), and the bill that comes due for never overwriting — the dead versions that vacuum must reclaim."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

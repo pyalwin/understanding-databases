@@ -2,7 +2,6 @@
 title: Group Commit & Log-Structured Storage
 chapterNumber: 10
 summary: "Chapter 02 said a transaction commits when its log record is on disk, and Chapter 09 turned the database into a firehose of new versions — but forcing the disk with an fsync on every single commit caps throughput at the disk's sync rate, a few hundred commits a second no matter how fast the machine. This chapter makes the log fast and then lets the log become the database. First group commit: batch many transactions into one fsync and pay the expensive disk sync once for the whole group. Then the deeper idea — sequential appends are the disk's favorite access pattern, so build the whole storage engine as an append-only log: writes land in an in-memory memtable backed by a write-ahead log, full memtables flush to immutable sorted SSTables, and compaction periodically merges the SSTables, dropping superseded values and tombstones. Build it all by hand in Python — a group-commit batcher and a working LSM-tree — and weigh the write, read, and space amplification that is the price of never updating in place."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

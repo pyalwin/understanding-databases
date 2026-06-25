@@ -2,7 +2,6 @@
 title: Replication
 chapterNumber: 13
 summary: "Chapter 11 built a database that survives a crash; Chapter 12 made two of them commit together. This chapter answers the question that was waiting underneath both: what if a machine doesn't just crash and restart, but is gone for good? The answer is the oldest idea in this book, turned outward — the write-ahead log. Shipping a leader's log records to a second machine and replaying them there IS replication, and replaying a record on a replica is exactly Chapter 11's redo, only continuous and remote: the replica is perpetually recovering from a stream that never ends. Build a working leader/follower cluster by hand in Python and meet the chapter's hero tension — synchronous replication, where a commit waits for the replica to acknowledge and so loses nothing, against asynchronous replication, where the commit returns the instant the leader's log is durable and so risks losing the tail of the log when the leader dies. From that one dial fall replication lag and the read-your-writes anomaly, failover and the lost tail and split-brain, and finally quorum — the majority-acknowledgement idea where consensus systems live, and where this book hands you off to the next."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

@@ -8,7 +8,6 @@ const chapters = defineCollection({
     chapterNumber: z.number().int().positive(),
     summary: z.string(),
     readingTime: z.string().optional(),
-    status: z.enum(['draft', 'published']).default('draft'),
   }),
 });
 

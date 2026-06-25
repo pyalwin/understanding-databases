@@ -2,7 +2,6 @@
 title: Distributed Transactions & Two-Phase Commit
 chapterNumber: 12
 summary: "Chapter 11 finished a complete ACID engine — atomic, consistent, isolated, durable, survivable through any single-machine crash. But every word of it assumed one machine: one buffer pool, one log, one disk, one authoritative state to recover. The moment a transaction spans two machines, a new and harder problem appears: how do they agree to both commit or both abort, when either can crash — or the network between them can vanish — at the worst possible instant? This chapter builds the classic answer, two-phase commit, by hand in Python: a coordinator collects votes in a prepare phase, then broadcasts one durable decision in a commit phase, and the whole thing turns out to be a small recovery protocol built directly on Chapter 11's write-ahead log — each node logs prepare and commit and replays on restart, with the coordinator's decision record as the single source of truth. Then meet the flaw that defines the chapter: if the coordinator dies after the participants have prepared but before they hear the verdict, they block — stuck in-doubt, holding locks, unable to commit or abort alone. See why three-phase commit trades that blocking for split-brain under a network partition rather than truly fixing it, and why the real answer is consensus — Paxos and Raft — handed forward to the chapters ahead."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

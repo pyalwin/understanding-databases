@@ -2,7 +2,6 @@
 title: The Query Optimizer
 chapterNumber: 7
 summary: "The executor will run any plan you hand it — including a catastrophically bad one. The same SQL query maps to hundreds of equivalent plans whose runtimes differ by orders of magnitude, and something has to pick a good one in milliseconds, before a single row is read. Build that something by hand in Python: a cost model to score a plan, the cardinality estimator that feeds it (and where every optimizer lives or dies), the index-versus-scan crossover that finally explains Chapter 04's EXPLAIN, and the join-order search at the combinatorial heart — then watch one wrong estimate wreck all of it."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

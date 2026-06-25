@@ -2,7 +2,6 @@
 title: Recovery & ARIES
 chapterNumber: 11
 summary: "Every durability promise this book has made — Chapter 02's commit, Chapter 09's first-committer-wins, Chapter 10's group commit and replay — has rested on a sentence we never cashed: 'if the machine crashes, replay the log and recover.' This chapter cashes it. A crash strikes mid-flight and leaves the disk inconsistent both ways: committed changes that never reached it (no-force) and uncommitted changes that did (steal), exactly the buffer-pool policy from Chapter 05 that bought performance. ARIES is the algorithm that cleans up the mess. Build a working one by hand in Python: a write-ahead log of LSN-stamped records with a per-transaction chain, fuzzy checkpoints and a dirty-page table that bound how far back you replay, and the three recovery passes — Analysis to rebuild the crash-time tables, Redo to repeat history forward, and Undo to roll back the losers backward — with compensation log records that make recovery itself survive a second crash."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

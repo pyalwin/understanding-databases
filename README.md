@@ -7,7 +7,6 @@ O'Reilly-deep. Narrated like a story. Illustrated with 3Blue1Brown-style
 animations and live in-browser code sandboxes.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-2f6b3a.svg?style=flat-square)](./LICENSE)
-[![Status](https://img.shields.io/badge/chapters-01%E2%80%9313%20drafted%20%C2%B7%2001%E2%80%9303%20published-1e4fa5.svg?style=flat-square)](#chapters)
 [![Made with Astro](https://img.shields.io/badge/Astro-6-BC52EE.svg?style=flat-square&logo=astro&logoColor=white)](https://astro.build)
 [![React 19](https://img.shields.io/badge/React-19-149ECA.svg?style=flat-square&logo=react&logoColor=white)](https://react.dev)
 [![Tailwind v4](https://img.shields.io/badge/Tailwind-v4-38BDF8.svg?style=flat-square&logo=tailwindcss&logoColor=white)](https://tailwindcss.com)
@@ -65,21 +64,21 @@ Open <http://localhost:4321> and start with Chapter 01.
 
 ## Chapters
 
-| # | Title | Status | Highlights |
-|---|-------|--------|------------|
-| 01 | **Why Databases Are Special** | ![Published](https://img.shields.io/badge/published-2f6b3a.svg?style=flat-square) | Races, torn writes, broken invariants, lying disks — by abusing a JSON file until it breaks. Five scenes + Python sandboxes. |
-| 02 | **The Transaction** | ![Published](https://img.shields.io/badge/published-2f6b3a.svg?style=flat-square) | Build a write-ahead log, the commit record, and crash recovery by hand in Python. |
-| 03 | **Isolation Levels** | ![Published](https://img.shields.io/badge/published-2f6b3a.svg?style=flat-square) | The ANSI anomalies + write skew, each staged in real SQLite. Ends on SSI. |
-| 04 | **Where Data Actually Lives** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Pages, heaps, and B-trees from first principles — then the same machinery inside SQLite. |
-| 05 | **The Buffer Pool** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Frames, the page table, pinning, the dirty bit, and eviction — LRU, the scan that wrecks it, clock, LRU-K. |
-| 06 | **Query Execution** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Compile SQL into an operator tree; the Volcano model; nested-loop, hash, and sort-merge joins. |
-| 07 | **The Query Optimizer** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Cost model, cardinality estimation, index-vs-scan crossover, and the join-order search. |
-| 08 | **Locking & Concurrency** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Shared/exclusive locks, two-phase locking, the lock manager, and deadlock via wait-for graphs. |
-| 09 | **MVCC & Snapshot Isolation** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Row versions (xmin/xmax), snapshots, first-committer-wins, write skew, and vacuum. |
-| 10 | **Group Commit & Log-Structured Storage** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Group commit, then a working LSM-tree — memtable, SSTables, compaction, and amplification. |
-| 11 | **Recovery & ARIES** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | WAL with LSN chains, fuzzy checkpoints, the three passes (Analysis/Redo/Undo), and CLRs. |
-| 12 | **Distributed Transactions & Two-Phase Commit** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | 2PC as a recovery protocol, the blocking problem, 3PC, and the road to consensus. |
-| 13 | **Replication** | ![Draft](https://img.shields.io/badge/draft-a16207.svg?style=flat-square) | Log shipping as replication; synchronous vs asynchronous; lag, failover, the lost tail, and quorum. |
+| # | Title | Highlights |
+|---|-------|------------|
+| 01 | **Why Databases Are Special** | Races, torn writes, broken invariants, lying disks — by abusing a JSON file until it breaks. Five scenes + Python sandboxes. |
+| 02 | **The Transaction** | Build a write-ahead log, the commit record, and crash recovery by hand in Python. |
+| 03 | **Isolation Levels** | The ANSI anomalies + write skew, each staged in real SQLite. Ends on SSI. |
+| 04 | **Where Data Actually Lives** | Pages, heaps, and B-trees from first principles — then the same machinery inside SQLite. |
+| 05 | **The Buffer Pool** | Frames, the page table, pinning, the dirty bit, and eviction — LRU, the scan that wrecks it, clock, LRU-K. |
+| 06 | **Query Execution** | Compile SQL into an operator tree; the Volcano model; nested-loop, hash, and sort-merge joins. |
+| 07 | **The Query Optimizer** | Cost model, cardinality estimation, index-vs-scan crossover, and the join-order search. |
+| 08 | **Locking & Concurrency** | Shared/exclusive locks, two-phase locking, the lock manager, and deadlock via wait-for graphs. |
+| 09 | **MVCC & Snapshot Isolation** | Row versions (xmin/xmax), snapshots, first-committer-wins, write skew, and vacuum. |
+| 10 | **Group Commit & Log-Structured Storage** | Group commit, then a working LSM-tree — memtable, SSTables, compaction, and amplification. |
+| 11 | **Recovery & ARIES** | WAL with LSN chains, fuzzy checkpoints, the three passes (Analysis/Redo/Undo), and CLRs. |
+| 12 | **Distributed Transactions & Two-Phase Commit** | 2PC as a recovery protocol, the blocking problem, 3PC, and the road to consensus. |
+| 13 | **Replication** | Log shipping as replication; synchronous vs asynchronous; lag, failover, the lost tail, and quorum. |
 
 Each chapter ends with a curated *Sources & further reading* section linking
 back to the primary literature — Gray, Mohan, Stonebraker, Kleppmann, and

@@ -2,7 +2,6 @@
 title: Query Execution
 chapterNumber: 6
 summary: "You can fetch any page fast now — but a SELECT names a result, not a procedure. Build the executor by hand in Python: compile a query into a tree of operators, drive it with the Volcano iterator model, stack scan/filter/project, then join two tables three different ways — nested-loop, hash, sort-merge — and finish on the blocking operators that stall a pipeline. Who picks the plan is the next chapter."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';

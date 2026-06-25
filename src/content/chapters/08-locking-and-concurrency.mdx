@@ -2,7 +2,6 @@
 title: Locking & Concurrency
 chapterNumber: 8
 summary: "Chapter 01 lost an update on a flat file and promised a real database's locking subsystem would fix it; Chapter 03 named every anomaly that overlapping transactions can cause and named — but did not build — the mechanism that prevents them. This is the build. A lock is a way to make one transaction wait so another can finish: correctness bought with waiting. Construct the machine by hand in Python — shared and exclusive locks and the compatibility matrix, two-phase locking that turns lock discipline into serializability, the lock manager as a hash table of granted sets and wait queues, and the dramatic failure where two transactions wait on each other forever — the deadlock — detected by a cycle in a wait-for graph and broken by aborting a victim."
-status: draft
 ---
 
 import ChapterReader from '@/components/scene/ChapterReader.astro';
