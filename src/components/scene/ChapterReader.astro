@@ -6,43 +6,6 @@ const { chapterId } = Astro.props;
 ---
 
 <div class="reader-shell" data-chapter-id={chapterId}>
-  {/* Sticky progress bar */}
-  <div
-    class="sticky top-0 z-30 -mx-6 mb-10 border-b border-[color:var(--color-rule)] px-6 py-3 backdrop-blur"
-    style="background: color-mix(in srgb, var(--color-page) 95%, transparent);"
-  >
-    <div class="page-column flex items-center gap-3 sm:gap-4">
-      <button
-        type="button"
-        data-toc-toggle
-        class="lg:hidden flex-shrink-0 -ml-1 p-1.5 rounded-md text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)] hover:bg-[color:var(--color-rule)]/50 transition-colors"
-        aria-label="Open table of contents"
-      >
-        <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
-          <line x1="3" y1="5" x2="15" y2="5" />
-          <line x1="3" y1="9" x2="15" y2="9" />
-          <line x1="3" y1="13" x2="15" y2="13" />
-        </svg>
-      </button>
-      <div class="font-sans text-[11px] text-[color:var(--color-ink-soft)] tabular-nums whitespace-nowrap font-medium">
-        <span class="text-[color:var(--color-accent)] font-semibold" data-progress-count>0</span>
-        <span class="opacity-50"> / <span data-progress-total>0</span><span class="hidden sm:inline"> checkpoints</span></span>
-      </div>
-      <div class="flex-1 h-1.5 bg-[color:var(--color-rule)] rounded-full overflow-hidden">
-        <div
-          class="h-full transition-all duration-500"
-          style="width: 0%; background: var(--color-accent);"
-          data-progress-bar
-        ></div>
-      </div>
-      <div
-        class="font-sans text-[11px] font-semibold tabular-nums w-10 text-right"
-        style="color: var(--color-accent);"
-        data-progress-pct
-      >0%</div>
-    </div>
-  </div>
-
   {/* Mobile TOC drawer */}
   <div
     class="fixed inset-0 z-40 lg:hidden"
@@ -230,7 +193,7 @@ const { chapterId } = Astro.props;
     const tocList = $<HTMLOListElement>('[data-reader-toc]');
     const tocListMobile = $<HTMLOListElement>('[data-reader-toc-mobile]');
     const tocDrawer = $<HTMLDivElement>('[data-toc-drawer]');
-    const tocToggle = $<HTMLButtonElement>('[data-toc-toggle]');
+    const tocToggle = document.querySelector<HTMLButtonElement>('[data-global-toc-toggle]');
     const tocClose = $<HTMLButtonElement>('[data-toc-close]');
     const tocBackdrop = $<HTMLDivElement>('[data-toc-backdrop]');
 
@@ -308,18 +271,12 @@ const { chapterId } = Astro.props;
 
     /* Progress bar */
     const trophyEl = $<HTMLDivElement>('[data-reader-trophy]');
-    const progressCount = $<HTMLSpanElement>('[data-progress-count]');
-    const progressTotal = $<HTMLSpanElement>('[data-progress-total]');
-    const progressBar = $<HTMLDivElement>('[data-progress-bar]');
-    const progressPct = $<HTMLDivElement>('[data-progress-pct]');
-    if (progressTotal) progressTotal.textContent = String(total);
+    const progressBar = document.querySelector<HTMLDivElement>('[data-progress-bar]');
 
     const updateProgress = () => {
       const count = completed.size;
       const pct = Math.round((count / total) * 100);
-      if (progressCount) progressCount.textContent = String(count);
       if (progressBar) progressBar.style.width = pct + '%';
-      if (progressPct) progressPct.textContent = pct + '%';
       if (trophyEl) {
         if (count === total) trophyEl.classList.remove('hidden');
         else trophyEl.classList.add('hidden');
@@ -347,18 +304,18 @@ const { chapterId } = Astro.props;
           const isLast = i === total - 1;
           const isComplete = completed.has(s.id);
           ctaBtn.disabled = false;
-          ctaBtn.style.background = 'var(--color-accent)';
+          ctaBtn.style.background = 'transparent';
           if (isComplete && !isLast) {
-            ctaBtn.textContent = 'Next checkpoint →';
+            ctaBtn.textContent = 'Continue →';
           } else if (isComplete && isLast) {
-            ctaBtn.textContent = 'Chapter complete ✓';
+            ctaBtn.textContent = 'Chapter complete';
             ctaBtn.disabled = true;
           } else if (s.quiz) {
-            ctaBtn.textContent = 'Mark complete & continue →';
+            ctaBtn.textContent = 'Answer checkpoint →';
           } else if (isLast) {
             ctaBtn.textContent = 'Finish chapter';
           } else {
-            ctaBtn.textContent = 'Mark complete & continue →';
+            ctaBtn.textContent = 'Continue →';
           }
         }
       });

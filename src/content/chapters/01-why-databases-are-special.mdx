@@ -17,6 +17,11 @@ import { PythonSandbox } from '@/components/PythonSandbox';
 <Section
   id="premise"
   title="The premise"
+  brief={{
+    problem: "A file can store bytes, but it does not know which failures would make those bytes untrustworthy.",
+    mechanism: "This chapter breaks a JSON file four ways so each database guarantee has a concrete job.",
+    takeaway: "A database is not a smarter file; it is a machine for preserving guarantees.",
+  }}
   quiz={{
     question: "By the end of this chapter, you should be able to describe a database as...",
     options: [
@@ -46,6 +51,12 @@ The names of those four failures will emerge as we go. You may already know the 
 <Section
   id="race"
   title="The race"
+  brief={{
+    problem: "Two writers read the same old file, compute different futures, and the last whole-file write wins.",
+    mechanism: "Isolation serializes conflicting work or makes one transaction retry instead of silently clobbering the other.",
+    cost: "Coordination means waiting, aborting, or maintaining version machinery.",
+    takeaway: "A successful write is not enough; conflicting writers need an ordering.",
+  }}
   quiz={{
     question: "Why is the Ada record lost when two processes write users.json?",
     options: [
@@ -285,6 +296,12 @@ For now: this is what *Isolation* buys you. The word will mean more when we've s
 <Section
   id="tear"
   title="The tear"
+  brief={{
+    problem: "A crash can interrupt a physical write and leave bytes from neither the old nor the new complete record.",
+    mechanism: "Write-ahead logging records the intended change first, then recovery replays or ignores it after a crash.",
+    cost: "Every durable write now pays for log I/O before data I/O.",
+    takeaway: "Atomicity turns a sequence of physical writes into one logical act.",
+  }}
   quiz={{
     question: "Why is a half-written page on disk dangerous even though it's 'just' a few wrong bytes?",
     options: [
@@ -351,6 +368,12 @@ This is what *Atomicity* buys you. "The write" becomes a single act — either t
 <Section
   id="invariant"
   title="The invariant"
+  brief={{
+    problem: "Correct individual writes can still violate the meaning of the data when only half a unit of work survives.",
+    mechanism: "Transactions group related writes and constraints declare the invariants the database must protect.",
+    cost: "The database can enforce only the rules you model accurately.",
+    takeaway: "Consistency is about preserving application meaning, not replica agreement.",
+  }}
   quiz={{
     question: "What does 'Consistency' mean in ACID (not in CAP)?",
     options: [
@@ -422,6 +445,12 @@ Atomicity is the tool. Consistency is the property it protects.
 <Section
   id="lie"
   title="The lie"
+  brief={{
+    problem: "`write()` can return before bytes reach durable storage, so an early success message may be false.",
+    mechanism: "`fsync` forces dirty data through the cache layers before the database acknowledges commit.",
+    cost: "The syscall is expensive enough that databases batch it with techniques like group commit.",
+    takeaway: "Durability is the gap between acknowledged and actually persisted.",
+  }}
   quiz={{
     question: "Your app calls write() and prints 'saved!'. Without fsync, what's true?",
     options: [
@@ -497,6 +526,12 @@ This is what *Durability* buys you. The gap between "acknowledged" and "persiste
 <Section
   id="contract"
   title="The contract"
+  brief={{
+    problem: "Lost updates, torn writes, broken invariants, and false acknowledgements look unrelated until named together.",
+    mechanism: "ACID names the contract: isolation, atomicity, consistency, and durability.",
+    cost: "Each guarantee spends something different: coordination, log I/O, modeling discipline, or flush latency.",
+    takeaway: "The rest of the book opens the machine that pays those costs.",
+  }}
   quiz={{
     question: "ACID is most usefully understood as...",
     options: [
@@ -547,6 +582,12 @@ A database, then, is a machine for paying these costs on your behalf, in exchang
 <Section
   id="sandbox"
   title="Do it yourself"
+  brief={{
+    problem: "A bank transfer exposes the intermediate broken state unless the two updates are treated as one unit.",
+    mechanism: "`BEGIN`, `COMMIT`, `ROLLBACK`, and constraints give the contract a SQL surface.",
+    cost: "The simple syntax hides logging, visibility rules, and recovery work underneath.",
+    takeaway: "The guarantees are not abstract; you can watch them change query results.",
+  }}
   quiz={{
     question: "What does wrapping the two UPDATEs in BEGIN/COMMIT actually guarantee?",
     options: [
@@ -608,6 +649,11 @@ The transaction aborts. The invariant — "no negative balances" — was declare
 <Section
   id="whats-next"
   title="What's next"
+  brief={{
+    problem: "You now know what a database promises, but not how the whole engine keeps those promises.",
+    mechanism: "The remaining chapters build the machinery layer by layer: log, pages, cache, executor, optimizer, concurrency, recovery, and replication.",
+    takeaway: "The book now turns from why databases matter to how they work.",
+  }}
 >
 
 ACID describes what a database *promises*. It doesn't describe how those promises are implemented, or what your data looks like at rest, or how the database finds a specific row among millions without scanning everything.

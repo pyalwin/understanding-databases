@@ -1,28 +1,28 @@
 @import "tailwindcss";
 
 @theme {
-  /* Page palette (cream / O'Reilly) */
-  --color-page: #faf7f0;
-  --color-ink: #1c1917;
-  --color-ink-soft: #57534e;
-  --color-rule: #d6d3c4;
-  --color-accent: #b45309;
-  --color-accent-soft: #fef3c7;
-  --color-code-bg: #f1ede2;
+  /* Monochrome book palette */
+  --color-page: #fdfdfb;
+  --color-ink: #111111;
+  --color-ink-soft: #5b5b56;
+  --color-rule: #deded8;
+  --color-accent: #111111;
+  --color-accent-soft: #f1f1ee;
+  --color-code-bg: #f4f4f1;
 
-  --color-callout-note: #eef4f8;
-  --color-callout-tip: #effaf0;
-  --color-callout-warning: #fdf6e3;
-  --color-callout-danger: #fdecea;
+  --color-callout-note: #f7f7f4;
+  --color-callout-tip: #f6f6f3;
+  --color-callout-warning: #f5f5f2;
+  --color-callout-danger: #f3f3f0;
 
-  /* Figure (light) palette — soft card on the cream page */
-  --color-fig-bg: #f3ecd8;      /* warmer than page, sets the card apart */
-  --color-fig-fg: #1c1917;      /* same ink as body */
-  --color-fig-muted: #78706a;
-  --color-fig-blue: #1e4fa5;
-  --color-fig-orange: #b04a14;
-  --color-fig-green: #2f6b3a;
-  --color-fig-red: #a91e1e;
+  /* Figure palette — semantic roles mapped to grayscale */
+  --color-fig-bg: #f5f5f2;
+  --color-fig-fg: #111111;
+  --color-fig-muted: #74746f;
+  --color-fig-blue: #1a1a1a;
+  --color-fig-orange: #555550;
+  --color-fig-green: #2f2f2b;
+  --color-fig-red: #050505;
 
   /* Typography */
   --font-serif: 'Source Serif 4', 'Charter', 'Iowan Old Style', 'Source Serif Pro', Georgia, serif;
@@ -110,7 +110,7 @@
   background: var(--color-fig-blue);
   border: 2px solid var(--color-fig-bg);
   cursor: grab;
-  box-shadow: 0 0 0 1px rgba(30, 79, 165, 0.45);
+  box-shadow: 0 0 0 1px rgba(17, 17, 17, 0.35);
   transition: transform 120ms ease;
 }
 .figure-surface input[type="range"]::-webkit-slider-thumb:hover {
@@ -126,7 +126,7 @@
   background: var(--color-fig-blue);
   border: 2px solid var(--color-fig-bg);
   cursor: grab;
-  box-shadow: 0 0 0 1px rgba(30, 79, 165, 0.45);
+  box-shadow: 0 0 0 1px rgba(17, 17, 17, 0.35);
 }
 .figure-surface input[type="range"]::-moz-range-track {
   height: 4px;
@@ -164,17 +164,17 @@
   border-color: var(--color-fig-blue);
 }
 .figure-surface .fig-btn-primary:hover:not(:disabled) {
-  background: #173d80;
-  border-color: #173d80;
+  background: #000;
+  border-color: #000;
 }
 .figure-surface .fig-btn-danger {
-  background: rgba(169, 30, 30, 0.08);
+  background: rgba(0, 0, 0, 0.06);
   color: var(--color-fig-red);
-  border-color: rgba(169, 30, 30, 0.30);
+  border-color: rgba(0, 0, 0, 0.24);
 }
 .figure-surface .fig-btn-danger:hover:not(:disabled) {
-  background: rgba(169, 30, 30, 0.14);
-  border-color: rgba(169, 30, 30, 0.50);
+  background: rgba(0, 0, 0, 0.10);
+  border-color: rgba(0, 0, 0, 0.42);
 }
 
 /* Inner card surfaces inside figure cards (panes used by scenes) */

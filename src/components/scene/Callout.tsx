@@ -4,10 +4,10 @@ import type { ReactNode } from 'react';
 type CalloutType = 'note' | 'tip' | 'warning' | 'danger';
 
 const config: Record<CalloutType, { label: string; bg: string; rail: string; icon: string }> = {
-  note:    { label: 'Note',    bg: 'var(--color-callout-note)',    rail: '#2c6e8f', icon: 'i' },
-  tip:     { label: 'Tip',     bg: 'var(--color-callout-tip)',     rail: '#2e7d4f', icon: '★' },
-  warning: { label: 'Warning', bg: 'var(--color-callout-warning)', rail: '#b8860b', icon: '!' },
-  danger:  { label: 'Danger',  bg: 'var(--color-callout-danger)',  rail: '#a23030', icon: '✕' },
+  note:    { label: 'Note',    bg: 'var(--color-callout-note)',    rail: '#4a4a46', icon: 'i' },
+  tip:     { label: 'Tip',     bg: 'var(--color-callout-tip)',     rail: '#111111', icon: '★' },
+  warning: { label: 'Warning', bg: 'var(--color-callout-warning)', rail: '#6a6a64', icon: '!' },
+  danger:  { label: 'Danger',  bg: 'var(--color-callout-danger)',  rail: '#000000', icon: '✕' },
 };
 
 interface Props {

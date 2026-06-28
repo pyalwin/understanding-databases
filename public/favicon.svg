@@ -1,11 +1,9 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Understanding Databases">
-  <rect width="128" height="128" rx="28" fill="#b45309" />
-  <g fill="none" stroke="#faf7f0" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
-    <ellipse cx="64" cy="40" rx="30" ry="11" />
-    <path d="M34 40 V88" />
-    <path d="M94 40 V88" />
-    <path d="M34 88 C 38 96, 50 99, 64 99 C 78 99, 90 96, 94 88" />
-    <path d="M34 56 C 38 64, 50 67, 64 67 C 78 67, 90 64, 94 56" />
-    <path d="M34 72 C 38 80, 50 83, 64 83 C 78 83, 90 80, 94 72" />
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Databases: Under the Hood">
+  <rect width="128" height="128" rx="28" fill="#111111" />
+  <g fill="none" stroke="#fdfdfb" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M31 78 L48 48 H80 L97 78" />
+    <path d="M39 78 H89" />
+    <path d="M49 94 H79" />
+    <path d="M56 62 H72" />
   </g>
 </svg>

@@ -1,29 +1,32 @@
 ---
 import '../styles/global.css';
+import BrandLogo from '@/components/BrandLogo.astro';
 
 interface Props {
   title?: string;
   description?: string;
   type?: 'website' | 'article';
+  headerLabel?: string;
 }
 
-const SITE_NAME = 'Understanding Databases';
+const SITE_NAME = 'Databases: Under the Hood';
 const DEFAULT_DESC =
-  'An interactive deep-dive into how databases actually work — read in the page, run the experiments in your browser, break things on purpose.';
+  'Databases, the first Under the Hood book: an interactive deep-dive into how databases actually work. Read in the page, run the experiments, break things on purpose.';
 
 const {
   title,
   description = DEFAULT_DESC,
   type = 'website',
+  headerLabel,
 } = Astro.props;
 
-// Full <title>: chapter pages get a "— Understanding Databases" suffix;
+// Full <title>: chapter pages get a "— Databases: Under the Hood" suffix;
 // the home page (title === SITE_NAME or unset) stands alone.
 const pageTitle = title && title !== SITE_NAME ? `${title} — ${SITE_NAME}` : SITE_NAME;
 
 // Astro.site comes from `site` in astro.config.mjs; canonical strips any trailing slash.
 const canonical = new URL(Astro.url.pathname, Astro.site).href.replace(/\/$/, '');
-const ogImage = new URL('/og-image.png', Astro.site).href;
+const ogImage = new URL('/og-image.svg', Astro.site).href;
 ---
 
 <html lang="en">
@@ -64,15 +67,45 @@ const ogImage = new URL('/og-image.png', Astro.site).href;
     />
   </head>
   <body class="min-h-screen">
-    <header class="border-b border-[color:var(--color-rule)] bg-[color:var(--color-page)]">
-      <div class="page-column px-6 py-4 flex items-center justify-between">
-        <a class="font-sans text-sm font-semibold tracking-wide" href="/">
-          Understanding Databases
-        </a>
-        <nav class="font-sans text-sm text-[color:var(--color-ink-soft)] flex gap-5">
-          <a class="hover:text-[color:var(--color-accent)]" href="/chapters">Chapters</a>
-        </nav>
+    <header class="sticky top-0 z-30 border-b border-[color:var(--color-rule)] bg-[color:var(--color-page)]/95 backdrop-blur relative">
+      <div class="page-column px-6 py-3.5 flex items-center justify-between gap-4 min-w-0">
+        <div class="flex items-center gap-3 min-w-0">
+          {headerLabel && (
+            <button
+              type="button"
+              data-global-toc-toggle
+              class="lg:hidden flex-shrink-0 -ml-1 p-1.5 rounded-md text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)] hover:bg-[color:var(--color-rule)]/50 transition-colors"
+              aria-label="Open table of contents"
+            >
+              <svg width="18" height="18" viewBox="0 0 18 18" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round">
+                <line x1="3" y1="5" x2="15" y2="5" />
+                <line x1="3" y1="9" x2="15" y2="9" />
+                <line x1="3" y1="13" x2="15" y2="13" />
+              </svg>
+            </button>
+          )}
+          <BrandLogo />
+        </div>
+        <div class="flex items-center justify-end gap-3 min-w-0 flex-1">
+          {headerLabel && (
+            <div
+              class="font-sans text-[12px] sm:text-[13px] text-[color:var(--color-ink-soft)] truncate text-right min-w-0"
+              title={headerLabel}
+            >
+              {headerLabel}
+            </div>
+          )}
+        </div>
       </div>
+      {headerLabel && (
+        <div class="absolute inset-x-0 -bottom-px h-px bg-transparent" aria-hidden="true">
+          <div
+            class="h-full bg-[color:var(--color-ink)] transition-all duration-500"
+            style="width: 0%;"
+            data-progress-bar
+          ></div>
+        </div>
+      )}
     </header>
     <main>
       <slot />

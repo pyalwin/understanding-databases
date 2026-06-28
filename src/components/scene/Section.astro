@@ -6,12 +6,25 @@ interface QuizOption {
 interface Props {
   id: string;
   title: string;
+  brief?: {
+    problem?: string;
+    mechanism?: string;
+    cost?: string;
+    takeaway?: string;
+  };
   quiz?: {
     question: string;
     options: QuizOption[];
   };
 }
-const { id, title, quiz } = Astro.props;
+const { id, title, brief, quiz } = Astro.props;
+
+const briefItems = [
+  ['Problem', brief?.problem],
+  ['Mechanism', brief?.mechanism],
+  ['Cost', brief?.cost],
+  ['Takeaway', brief?.takeaway],
+].filter(([, value]) => Boolean(value));
 ---
 <section
   class="chapter-section"
@@ -24,23 +37,38 @@ const { id, title, quiz } = Astro.props;
     Checkpoint <span data-section-num>1</span> of <span data-section-total>1</span>
     <span class="ml-2 opacity-75 hidden" data-section-complete-tag>✓ completed</span>
   </p>
-  <h2 class="text-3xl font-semibold mb-8 leading-tight">{title}</h2>
+  <h2 class:list={['text-3xl font-semibold leading-tight', briefItems.length > 0 ? 'mb-5' : 'mb-8']}>{title}</h2>
+  {briefItems.length > 0 && (
+    <div class="mb-8 border-y border-[color:var(--color-rule)] py-4">
+      <dl class="grid gap-x-5 gap-y-3 sm:grid-cols-2">
+        {briefItems.map(([label, value]) => (
+          <div>
+            <dt class="font-sans text-[10px] uppercase tracking-[0.16em] font-semibold text-[color:var(--color-accent)]">
+              {label}
+            </dt>
+            <dd class="mt-1 font-sans text-[13.5px] leading-snug text-[color:var(--color-ink-soft)]">
+              {value}
+            </dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  )}
   <div class="space-y-5 text-[18px]">
     <slot />
   </div>
-  <div class="mt-14 pt-6 border-t border-[color:var(--color-rule)] flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4">
+  <div class="mt-10 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
     <button
       type="button"
       data-prev-checkpoint
-      class="font-sans text-sm text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)] disabled:opacity-30 disabled:cursor-not-allowed text-left"
+      class="font-sans text-[13px] text-[color:var(--color-ink-soft)] hover:text-[color:var(--color-ink)] disabled:opacity-25 disabled:cursor-not-allowed text-left"
     >
       ← Previous checkpoint
     </button>
     <button
       type="button"
       data-primary-cta
-      class="px-6 py-3 text-sm font-sans font-semibold rounded-md text-white transition-opacity disabled:opacity-50 disabled:cursor-default"
-      style="background: var(--color-accent);"
+      class="self-start sm:self-auto font-sans text-[13px] font-semibold text-[color:var(--color-ink)] underline decoration-[color:var(--color-rule)] underline-offset-4 hover:decoration-[color:var(--color-ink)] disabled:opacity-45 disabled:cursor-default transition-colors"
     >
       Mark complete & continue →
     </button>

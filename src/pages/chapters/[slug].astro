@@ -10,15 +10,7 @@ export async function getStaticPaths() {
 const { entry } = Astro.props;
 const { Content } = await render(entry);
 const num = String(entry.data.chapterNumber).padStart(2, '0');
-
-const ordered = (await getCollection('chapters'))
-  .filter((c) => c.id !== '_test')
-  .sort((a, b) => a.data.chapterNumber - b.data.chapterNumber);
-const idx = ordered.findIndex((c) => c.id === entry.id);
-const prev = idx > 0 ? ordered[idx - 1] : null;
-const next = idx >= 0 && idx < ordered.length - 1 ? ordered[idx + 1] : null;
-const label = (c: (typeof ordered)[number]) =>
-  `Chapter ${String(c.data.chapterNumber).padStart(2, '0')}`;
+const headerLabel = `Chapter ${num} · ${entry.data.title}`;
 
 // Meta descriptions read best around ~155 chars; trim the long summary at a word boundary.
 function metaDescription(text: string, max = 155): string {
@@ -30,44 +22,8 @@ function metaDescription(text: string, max = 155): string {
 const description = metaDescription(entry.data.summary);
 ---
 
-<Layout title={entry.data.title} description={description} type="article">
-  <article class="page-column px-6 pt-12 pb-24">
-    <header class="prose-column mb-10 sm:mb-12 text-center">
-      <p class="font-sans text-[11px] sm:text-xs tracking-[0.18em] uppercase text-[color:var(--color-accent)] mb-3">
-        Chapter {num}
-      </p>
-      <h1 class="text-[30px] sm:text-[38px] lg:text-[44px] font-semibold leading-[1.1] sm:leading-[1.05] mb-4">{entry.data.title}</h1>
-      <p class="text-[color:var(--color-ink-soft)] text-[16px] sm:text-[18px] leading-relaxed italic">
-        {entry.data.summary}
-      </p>
-    </header>
+<Layout title={entry.data.title} description={description} type="article" headerLabel={headerLabel}>
+  <article class="page-column px-6 pt-6 sm:pt-8 pb-24">
     <Content />
-
-    <nav class="prose-column mt-16 sm:mt-20 pt-8 border-t border-[color:var(--color-rule)] flex gap-4 justify-between">
-      {prev ? (
-        <a class="group flex-1 max-w-[48%]" href={`/chapters/${prev.id}`}>
-          <span class="block font-sans text-[11px] tracking-[0.16em] uppercase text-[color:var(--color-ink-soft)] mb-1">
-            &larr; {label(prev)}
-          </span>
-          <span class="block font-serif italic text-[15px] sm:text-[17px] leading-snug group-hover:text-[color:var(--color-accent)]">
-            {prev.data.title}
-          </span>
-        </a>
-      ) : (
-        <span class="flex-1 max-w-[48%]"></span>
-      )}
-      {next ? (
-        <a class="group flex-1 max-w-[48%] text-right" href={`/chapters/${next.id}`}>
-          <span class="block font-sans text-[11px] tracking-[0.16em] uppercase text-[color:var(--color-ink-soft)] mb-1">
-            {label(next)} &rarr;
-          </span>
-          <span class="block font-serif italic text-[15px] sm:text-[17px] leading-snug group-hover:text-[color:var(--color-accent)]">
-            {next.data.title}
-          </span>
-        </a>
-      ) : (
-        <span class="flex-1 max-w-[48%]"></span>
-      )}
-    </nav>
   </article>
 </Layout>

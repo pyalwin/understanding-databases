@@ -1,0 +1,96 @@
+---
+interface Props {
+  href?: string;
+  showBook?: boolean;
+  size?: 'header' | 'display';
+  label?: string;
+}
+
+const {
+  href = '/',
+  showBook = true,
+  size = 'header',
+  label = 'Databases: Under the Hood',
+} = Astro.props;
+---
+
+<a class={`brand-logo brand-logo--${size}`} href={href} aria-label={label}>
+  <svg class="brand-mark" viewBox="0 0 64 64" role="img" aria-hidden="true">
+    <rect x="4" y="4" width="56" height="56" rx="14" />
+    <path d="M17 39 L25 24 H39 L47 39" />
+    <path d="M21 39 H43" />
+    <path d="M25 47 H39" />
+    <path d="M28 31 H36" />
+  </svg>
+  <span class="brand-text">
+    <span class="brand-title">Databases</span>
+    {showBook && <span class="brand-subtitle">Under the Hood</span>}
+  </span>
+</a>
+
+<style>
+  .brand-logo {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.65rem;
+    color: var(--color-ink);
+    text-decoration: none;
+    min-width: 0;
+  }
+
+  .brand-mark {
+    flex: 0 0 auto;
+    width: 2rem;
+    height: 2rem;
+  }
+  .brand-mark rect {
+    fill: var(--color-ink);
+  }
+  .brand-mark path {
+    fill: none;
+    stroke: var(--color-page);
+    stroke-width: 3.5;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+  }
+
+  .brand-text {
+    display: flex;
+    flex-direction: column;
+    gap: 0.16rem;
+    min-width: 0;
+  }
+  .brand-title {
+    font-family: var(--font-serif);
+    font-size: 1.05rem;
+    font-weight: 700;
+    line-height: 0.9;
+    letter-spacing: 0;
+    white-space: nowrap;
+  }
+  .brand-subtitle {
+    font-family: var(--font-sans);
+    font-size: 0.52rem;
+    font-weight: 600;
+    line-height: 1;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--color-ink-soft);
+    white-space: nowrap;
+  }
+
+  .brand-logo--display {
+    gap: 1rem;
+  }
+  .brand-logo--display .brand-mark {
+    width: 3rem;
+    height: 3rem;
+  }
+  .brand-logo--display .brand-title {
+    font-size: 1.55rem;
+  }
+  .brand-logo--display .brand-subtitle {
+    font-size: 0.62rem;
+    letter-spacing: 0.24em;
+  }
+</style>
