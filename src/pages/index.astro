@@ -1,6 +1,5 @@
 ---
 import Layout from '@/layouts/Layout.astro';
-import BrandLogo from '@/components/BrandLogo.astro';
 import { getCollection } from 'astro:content';
 
 const chapters = (await getCollection('chapters'))
@@ -15,13 +14,9 @@ const chapters = (await getCollection('chapters'))
 const firstReadable = chapters[0];
 ---
 
-<Layout title="Databases: Under the Hood">
+<Layout title="Databases: Under the Hood" hideHeader>
   <article class="spread">
     <section class="title-page">
-      <div class="cover-brand">
-        <BrandLogo size="display" />
-      </div>
-
       <h1 class="title">
         <span class="title-word title-word--accent">Databases</span>
         <span class="title-word title-word--series">Under the Hood</span>
@@ -126,10 +121,6 @@ const firstReadable = chapters[0];
     margin: 0 0 2.25rem;
   }
   .eyebrow--right { margin-bottom: 1.75rem; }
-
-  .cover-brand {
-    margin: 0 0 2.2rem;
-  }
 
   .title {
     font-family: var(--font-serif);
